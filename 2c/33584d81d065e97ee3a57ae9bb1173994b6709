@@ -1,0 +1,43 @@
+src/git/repo_state.rs
+  s_d7e4433d0b9829::t_795c56689b5443 475-477
+  s_d7e4433d0b9829::t_6d8d35a109fe6b 465,472-474,478-497
+src/daemon.rs
+  s_d7e4433d0b9829::t_945a41e63dba2b 956
+  s_d7e4433d0b9829::t_ded7b697dbde11 6324,6327-6332
+  s_d7e4433d0b9829::t_51ff2679becdfc 21-22,2986-2993
+  s_d7e4433d0b9829::t_5ce47f8529198f 6571-6582,6589,6656-6661
+  s_d7e4433d0b9829::t_de88fb9f65c529 6872-6878
+src/git/rewrite_log.rs
+  s_d7e4433d0b9829::t_55ce6ff1becd23 21-23,94-99,276-295
+tests/integration/main.rs
+  s_82160c6f671cc4::t_ecd48e789ff57a 102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.9",
+  "base_commit_sha": "2c33584d81d065e97ee3a57ae9bb1173994b6709",
+  "prompts": {},
+  "humans": {
+    "h_ad404ca4b5c06a": {
+      "author": "congziqi <congziqi@lixiang.com>"
+    }
+  },
+  "sessions": {
+    "s_82160c6f671cc4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e8211-9b89-7621-a253-552d23392c1b",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_d7e4433d0b9829": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e80ee-a835-7c83-9422-033d986ed735",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
