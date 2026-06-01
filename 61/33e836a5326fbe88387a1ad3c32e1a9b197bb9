@@ -1,0 +1,40 @@
+.github/workflows/release-s3.yml
+  s_d7e4433d0b9829::t_cfbf5c07df82c6 1-312
+install.sh
+  s_d7e4433d0b9829::t_1fcbcac81880fa 62-65,266-271
+scripts/release-s3-local.sh
+  s_d7e4433d0b9829::t_f161f4bb2762bf 304
+  s_d7e4433d0b9829::t_e0a586cdaffa08 22,25,230-245
+  s_d7e4433d0b9829::t_486ea0eef98749 28-30,91-153,218,223-225,257-259,261-263,266-269,271-274,276-288,290-293,295,308-313
+  s_d7e4433d0b9829::t_445017e689d7ce 1-20,23-24,26-27,31-90,214-216,226-229,246-256,260,264-265,270,275,289,294,296-297,318-328,333-336,344-347,352-354,360-362
+  s_d7e4433d0b9829::t_6cfb7f6ab72733 21,154-213,298-303,305-307,314-317,329-332,337-343,348-351,355-359,363-367
+  s_d7e4433d0b9829::t_003a7bd622ab48 217,219-222
+s3-release-packaging-guide.md
+  s_d7e4433d0b9829::t_ec54aba6caacee 1-74,83-92,107-133,147-165,172-173,180-189,202-257,300-311,316-343,493-532
+  s_d7e4433d0b9829::t_084917fede234b 106,146,174-179,196-201,264-281
+  s_d7e4433d0b9829::t_abc367faa363c3 75-82,93-105,134-145,166-171,190-195,258-263,282-299
+  s_d7e4433d0b9829::t_cf2f4f0ab662a5 312-315,344-492
+install.ps1
+  s_d7e4433d0b9829::t_51b5849b7afd6d 233-236,416-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.9",
+  "base_commit_sha": "6133e836a5326fbe88387a1ad3c32e1a9b197bb9",
+  "prompts": {},
+  "humans": {
+    "h_ad404ca4b5c06a": {
+      "author": "congziqi <congziqi@lixiang.com>"
+    }
+  },
+  "sessions": {
+    "s_d7e4433d0b9829": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e80ee-a835-7c83-9422-033d986ed735",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
