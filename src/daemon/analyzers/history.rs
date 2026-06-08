@@ -29,7 +29,22 @@ impl CommandAnalyzer for HistoryAnalyzer {
                 let amend = args.iter().any(|arg| arg == "--amend");
                 let post_head =
                     non_empty_opt(cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()));
+                trace_history_debug(&format!(
+                    "history analyzer commit input sid={} argv={:?} args={:?} amend={} exit={} pre_head={:?} post_head={:?} ref_changes_len={}",
+                    cmd.root_sid,
+                    cmd.raw_argv,
+                    args,
+                    amend,
+                    cmd.exit_code,
+                    cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    post_head,
+                    cmd.ref_changes.len()
+                ));
                 if let Some((mut old_head, new_head)) = head_change(cmd, state.refs) {
+                    trace_history_debug(&format!(
+                        "history analyzer commit head_change sid={} old_head={} new_head={}",
+                        cmd.root_sid, old_head, new_head
+                    ));
                     if amend
                         && (!is_valid_git_oid(&old_head) || is_zero_oid(&old_head))
                         && let Some(pre_head) =
@@ -51,6 +66,12 @@ impl CommandAnalyzer for HistoryAnalyzer {
                 } else if cmd.exit_code == 0
                     && let Some(new_head) = post_head
                 {
+                    trace_history_debug(&format!(
+                        "history analyzer commit fallback sid={} new_head={} base_hint={:?}",
+                        cmd.root_sid,
+                        new_head,
+                        commit_base_hint(cmd, state.refs, &new_head)
+                    ));
                     if amend {
                         let old_head = commit_base_hint(cmd, state.refs, &new_head);
                         if let Some(old_head) = old_head {
@@ -65,6 +86,13 @@ impl CommandAnalyzer for HistoryAnalyzer {
                         let base = commit_base_hint(cmd, state.refs, &new_head);
                         events.push(SemanticEvent::CommitCreated { base, new_head });
                     }
+                } else {
+                    trace_history_debug(&format!(
+                        "history analyzer commit produced no event before opaque sid={} exit={} post_head={:?}",
+                        cmd.root_sid,
+                        cmd.exit_code,
+                        cmd.post_repo.as_ref().and_then(|repo| repo.head.clone())
+                    ));
                 }
             }
             "reset" => {
@@ -149,6 +177,17 @@ impl CommandAnalyzer for HistoryAnalyzer {
         if events.is_empty() {
             events.push(SemanticEvent::OpaqueCommand);
         }
+        trace_history_debug(&format!(
+            "history analyzer result sid={} primary={} events={:?} confidence={:?}",
+            cmd.root_sid,
+            name,
+            events,
+            if cmd.exit_code == 0 {
+                Confidence::High
+            } else {
+                Confidence::Low
+            }
+        ));
 
         Ok(AnalysisResult {
             class: CommandClass::HistoryRewrite,
@@ -160,6 +199,10 @@ impl CommandAnalyzer for HistoryAnalyzer {
             },
         })
     }
+}
+
+fn trace_history_debug(message: &str) {
+    tracing::info!(message = %message, "history analyzer diagnostic");
 }
 
 fn merge_source_ref(args: &[String]) -> Option<String> {

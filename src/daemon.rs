@@ -6977,6 +6977,19 @@ impl ActorDaemonCoordinator {
         let parsed_invocation = parsed_invocation_for_normalized_command(cmd);
 
         let primary = cmd.primary_command.as_deref().unwrap_or("unknown");
+        tracing::info!(
+            seq = applied.seq,
+            sid = %cmd.root_sid,
+            primary = primary,
+            argv = ?cmd.raw_argv,
+            exit = cmd.exit_code,
+            family = ?family,
+            pre_head = ?cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+            post_head = ?cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+            ref_changes_len = cmd.ref_changes.len(),
+            events = ?events,
+            "side-effect applied diagnostic"
+        );
         let is_write_op = matches!(
             primary,
             "commit"
@@ -7450,6 +7463,15 @@ impl ActorDaemonCoordinator {
                             "async completion log write failed"
                         );
                     }
+                } else {
+                    tracing::info!(
+                        seq = applied.seq,
+                        sid = %applied.command.root_sid,
+                        primary = ?applied.command.primary_command,
+                        argv = ?applied.command.raw_argv,
+                        scope = ?applied.command.scope,
+                        "trace applied without family diagnostic"
+                    );
                 }
             }
         }

@@ -135,6 +135,14 @@ impl<B: GitBackend> TraceNormalizer<B> {
         let pending_roots = self.state.pending.keys().cloned().collect::<Vec<_>>();
         for root_sid in pending_roots {
             if let Some(pending) = self.remove_pending_root(&root_sid) {
+                trace_debug_lifecycle(&format!(
+                    "trace normalizer orphan pending sid={} argv={:?} root_cmd={:?} worktree={:?} family={:?}",
+                    root_sid,
+                    pending.raw_argv,
+                    pending.root_cmd_name,
+                    pending.worktree,
+                    pending.family_key
+                ));
                 removed.push(OrphanTraceRoot {
                     root_sid,
                     raw_argv: pending.raw_argv,
@@ -154,6 +162,10 @@ impl<B: GitBackend> TraceNormalizer<B> {
             let _ = self.state.sid_to_worktree.remove(&root_sid);
             let _ = self.state.sid_to_family.remove(&root_sid);
             let _ = self.state.prestart_root_cmd_names.remove(&root_sid);
+            trace_debug_lifecycle(&format!(
+                "trace normalizer orphan deferred-exit sid={}",
+                root_sid
+            ));
             removed.push(OrphanTraceRoot {
                 root_sid,
                 raw_argv: Vec::new(),
@@ -355,7 +367,21 @@ impl<B: GitBackend> TraceNormalizer<B> {
             .and_then(Value::as_str)
             .ok_or_else(|| GitAiError::Generic("trace payload missing sid".to_string()))?;
         let root_sid = root_sid(sid).to_string();
+        if matches!(event, "start" | "cmd_name" | "def_repo" | "exit" | "atexit") {
+            trace_debug_lifecycle(&format!(
+                "trace normalizer payload event={} sid={} root_sid={} name={:?} argv={:?}",
+                event,
+                sid,
+                root_sid,
+                payload.get("name").and_then(Value::as_str),
+                payload.get("argv")
+            ));
+        }
         if self.is_completed_root(&root_sid) {
+            trace_debug_lifecycle(&format!(
+                "trace normalizer ignoring completed root sid={} event={}",
+                root_sid, event
+            ));
             return Ok(None);
         }
         let ts = payload_timestamp_ns(payload)?;
@@ -497,17 +523,36 @@ impl<B: GitBackend> TraceNormalizer<B> {
             rebase_original_head_hint,
         };
         trace_debug_lifecycle(&format!(
-            "trace normalizer start sid={} argv={:?} worktree={:?}",
-            root_sid, pending.raw_argv, pending.worktree
+            "trace normalizer start sid={} argv={:?} worktree={:?} family={:?} primary_hint={:?} pre_head={:?}",
+            root_sid,
+            pending.raw_argv,
+            pending.worktree,
+            pending.family_key,
+            primary_hint,
+            pending.pre_repo.as_ref().and_then(|repo| repo.head.clone())
         ));
         self.state.pending.insert(root_sid.to_string(), pending);
         if let Some(prestart_cmd_name) = self.state.prestart_root_cmd_names.remove(root_sid)
             && let Some(pending) = self.state.pending.get_mut(root_sid)
             && pending.root_cmd_name.is_none()
         {
+            trace_debug_lifecycle(&format!(
+                "trace normalizer applied prestart cmd_name sid={} name={}",
+                root_sid, prestart_cmd_name
+            ));
             pending.root_cmd_name = Some(prestart_cmd_name);
         }
         if let Some(deferred) = self.state.deferred_exits.remove(root_sid) {
+            trace_debug_lifecycle(&format!(
+                "trace normalizer matched deferred exit sid={} code={} post_head={:?} ref_changes_len={}",
+                root_sid,
+                deferred.exit_code,
+                deferred
+                    .post_repo
+                    .as_ref()
+                    .and_then(|repo| repo.head.clone()),
+                deferred.captured_ref_changes.len()
+            ));
             if let Some(pre_repo) = deferred.pre_repo
                 && let Some(pending) = self.state.pending.get_mut(root_sid)
                 && pending.pre_repo.is_none()
@@ -670,8 +715,16 @@ impl<B: GitBackend> TraceNormalizer<B> {
 
         if sid == root_sid {
             if let Some(pending) = self.state.pending.get_mut(root_sid) {
+                trace_debug_lifecycle(&format!(
+                    "trace normalizer root cmd_name sid={} name={} previous={:?}",
+                    root_sid, cmd, pending.root_cmd_name
+                ));
                 pending.root_cmd_name = Some(cmd);
             } else {
+                trace_debug_lifecycle(&format!(
+                    "trace normalizer prestart root cmd_name sid={} name={}",
+                    root_sid, cmd
+                ));
                 self.state
                     .prestart_root_cmd_names
                     .insert(root_sid.to_string(), cmd);
@@ -682,6 +735,10 @@ impl<B: GitBackend> TraceNormalizer<B> {
         }
 
         if let Some(pending) = self.state.pending.get_mut(root_sid) {
+            trace_debug_lifecycle(&format!(
+                "trace normalizer child cmd_name sid={} root_sid={} name={}",
+                sid, root_sid, cmd
+            ));
             pending.observed_child_commands.push(cmd);
         }
         self.refresh_pending_mutation_capture(root_sid)?;
@@ -786,8 +843,14 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 }
             }
             trace_debug_lifecycle(&format!(
-                "trace normalizer deferred exit sid={} code={} (start not seen yet)",
-                root_sid, exit_code
+                "trace normalizer deferred exit sid={} code={} post_head={:?} ref_changes_len={} (start not seen yet)",
+                root_sid,
+                exit_code,
+                deferred
+                    .post_repo
+                    .as_ref()
+                    .and_then(|repo| repo.head.clone()),
+                deferred.captured_ref_changes.len()
             ));
             return Ok(None);
         }
@@ -1029,9 +1092,25 @@ impl<B: GitBackend> TraceNormalizer<B> {
         };
 
         trace_debug_lifecycle(&format!(
-            "trace normalizer finalized sid={} primary={:?} pending_after_finalize={}",
+            "trace normalizer finalized sid={} primary={:?} invoked={:?} argv={:?} worktree={:?} family={:?} exit={} pre_head={:?} post_head={:?} ref_changes_len={} wrapper_id={:?} observed_children={:?} pending_after_finalize={}",
             root_sid,
             normalized.primary_command,
+            normalized.invoked_command,
+            normalized.raw_argv,
+            normalized.worktree,
+            normalized.family_key,
+            normalized.exit_code,
+            normalized
+                .pre_repo
+                .as_ref()
+                .and_then(|repo| repo.head.clone()),
+            normalized
+                .post_repo
+                .as_ref()
+                .and_then(|repo| repo.head.clone()),
+            normalized.ref_changes.len(),
+            normalized.wrapper_invocation_id,
+            normalized.observed_child_commands,
             self.state.pending.len()
         ));
         self.mark_completed_root(root_sid);
@@ -1044,9 +1123,7 @@ impl<B: GitBackend> TraceNormalizer<B> {
 }
 
 fn trace_debug_lifecycle(message: &str) {
-    if std::env::var("GIT_AI_DEBUG_DAEMON_TRACE").is_ok() {
-        eprintln!("\u{1b}[1;33m[git-ai]\u{1b}[0m {}", message);
-    }
+    tracing::info!(message = %message, "daemon trace diagnostic");
 }
 
 fn is_valid_oid(value: &str) -> bool {
