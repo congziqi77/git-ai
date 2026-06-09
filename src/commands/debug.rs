@@ -1,12 +1,11 @@
 use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
 use crate::config;
+use crate::daemon::{DaemonConfig, diagnostics};
 use crate::git::find_repository_in_path;
 use std::env;
 use std::fmt::Write as _;
-use std::process::Command;
-
-#[cfg(target_os = "linux")]
 use std::fs;
+use std::process::Command;
 
 pub fn handle_debug(args: &[String]) {
     if args
@@ -46,6 +45,7 @@ fn build_debug_report() -> String {
     let repository_info = collect_repository_info();
     let auth_info = collect_auth_status();
     let env_overrides = collect_git_ai_env_overrides();
+    let daemon_diagnostics = collect_daemon_diagnostics_info();
 
     let mut out = String::new();
     let _ = writeln!(out, "git-ai debug report");
@@ -282,6 +282,48 @@ fn build_debug_report() -> String {
             let _ = writeln!(out, "  {}", entry);
         }
     }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "== Daemon Diagnostics ==");
+    match daemon_diagnostics {
+        Ok(info) => {
+            let _ = writeln!(out, "Internal dir: {}", info.internal_dir);
+            let _ = writeln!(out, "Lock path: {}", info.lock_path);
+            let _ = writeln!(out, "Trace socket path: {}", info.trace_socket_path);
+            let _ = writeln!(out, "Control socket path: {}", info.control_socket_path);
+            let _ = writeln!(
+                out,
+                "Raw trace2 diagnostics enabled: {}",
+                info.raw_trace2_enabled
+            );
+            let _ = writeln!(
+                out,
+                "GIT_AI_TRACE2_DIAGNOSTICS: {}",
+                env_value_or_unset("GIT_AI_TRACE2_DIAGNOSTICS")
+            );
+            let _ = writeln!(
+                out,
+                "GIT_AI_RAW_TRACE2_LOG: {}",
+                env_value_or_unset("GIT_AI_RAW_TRACE2_LOG")
+            );
+            let _ = writeln!(
+                out,
+                "GIT_AI_TRACE2_DIAGNOSTICS_MAX_BYTES: {}",
+                env_value_or_unset("GIT_AI_TRACE2_DIAGNOSTICS_MAX_BYTES")
+            );
+            let _ = writeln!(out, "Raw trace2 log: {}", info.raw_trace2_log);
+            let _ = writeln!(out, "Raw trace2 log status: {}", info.raw_trace2_status);
+            let _ = writeln!(out, "Raw trace2 rotated log: {}", info.raw_trace2_rotated_log);
+            let _ = writeln!(
+                out,
+                "Raw trace2 rotated log status: {}",
+                info.raw_trace2_rotated_status
+            );
+        }
+        Err(err) => {
+            let _ = writeln!(out, "<error: {}>", err);
+        }
+    }
 
     out
 }
@@ -471,6 +513,70 @@ fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{:.2} {} ({} bytes)", value, UNITS[unit], bytes)
+}
+
+struct DaemonDiagnosticsInfo {
+    internal_dir: String,
+    lock_path: String,
+    trace_socket_path: String,
+    control_socket_path: String,
+    raw_trace2_enabled: bool,
+    raw_trace2_log: String,
+    raw_trace2_status: String,
+    raw_trace2_rotated_log: String,
+    raw_trace2_rotated_status: String,
+}
+
+fn collect_daemon_diagnostics_info() -> Result<DaemonDiagnosticsInfo, String> {
+    let config = DaemonConfig::from_env_or_default_paths().map_err(|e| e.to_string())?;
+    let raw_trace2_log = diagnostics::raw_trace2_log_path().map_err(|e| e.to_string())?;
+    let raw_trace2_rotated_log = raw_trace2_log.with_extension("jsonl.1");
+
+    Ok(DaemonDiagnosticsInfo {
+        internal_dir: config.internal_dir.display().to_string(),
+        lock_path: config.lock_path.display().to_string(),
+        trace_socket_path: config.trace_socket_path.display().to_string(),
+        control_socket_path: config.control_socket_path.display().to_string(),
+        raw_trace2_enabled: raw_trace2_diagnostics_enabled(),
+        raw_trace2_status: describe_file_status(&raw_trace2_log),
+        raw_trace2_log: raw_trace2_log.display().to_string(),
+        raw_trace2_rotated_status: describe_file_status(&raw_trace2_rotated_log),
+        raw_trace2_rotated_log: raw_trace2_rotated_log.display().to_string(),
+    })
+}
+
+fn env_value_or_unset(name: &str) -> String {
+    env::var(name).unwrap_or_else(|_| "<unset>".to_string())
+}
+
+fn raw_trace2_diagnostics_enabled() -> bool {
+    if let Some(enabled) = env_flag("GIT_AI_RAW_TRACE2_LOG") {
+        return enabled;
+    }
+    if let Some(enabled) = env_flag("GIT_AI_TRACE2_DIAGNOSTICS") {
+        return enabled;
+    }
+    true
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn describe_file_status(path: &std::path::Path) -> String {
+    match fs::metadata(path) {
+        Ok(metadata) => format!(
+            "exists=true bytes={} readonly={}",
+            metadata.len(),
+            metadata.permissions().readonly()
+        ),
+        Err(err) => format!("exists=false error={}", err),
+    }
 }
 
 struct RepositoryInfo {

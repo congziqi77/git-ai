@@ -96,15 +96,44 @@ impl CommandAnalyzer for HistoryAnalyzer {
                 }
             }
             "reset" => {
+                trace_history_debug(&format!(
+                    "history analyzer reset input sid={} argv={:?} args={:?} exit={} pre_head={:?} post_head={:?} ref_changes={:?}",
+                    cmd.root_sid,
+                    cmd.raw_argv,
+                    args,
+                    cmd.exit_code,
+                    cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.ref_changes
+                ));
                 if let Some((old_head, new_head)) = head_change(cmd, state.refs) {
                     events.push(SemanticEvent::Reset {
                         kind: infer_reset_kind(&args),
                         old_head,
                         new_head,
                     });
+                } else {
+                    trace_history_debug(&format!(
+                        "history analyzer reset produced no head change sid={} refs_tracked={} ref_changes_len={}",
+                        cmd.root_sid,
+                        state.refs.len(),
+                        cmd.ref_changes.len()
+                    ));
                 }
             }
             "rebase" => {
+                trace_history_debug(&format!(
+                    "history analyzer rebase input sid={} argv={:?} args={:?} exit={} pre_head={:?} post_head={:?} inflight_original={:?} ref_changes={:?} refs_tracked={}",
+                    cmd.root_sid,
+                    cmd.raw_argv,
+                    args,
+                    cmd.exit_code,
+                    cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.inflight_rebase_original_head,
+                    cmd.ref_changes,
+                    state.refs.len()
+                ));
                 if args.iter().any(|arg| arg == "--abort") {
                     events.push(SemanticEvent::RebaseAbort {
                         head: cmd
@@ -119,9 +148,30 @@ impl CommandAnalyzer for HistoryAnalyzer {
                         new_head,
                         interactive: args.iter().any(|arg| arg == "-i" || arg == "--interactive"),
                     });
+                } else {
+                    trace_history_debug(&format!(
+                        "history analyzer rebase produced no rebase_change sid={} exit={} pre_head={:?} post_head={:?} inflight_original={:?} ref_changes_len={} refs_tracked={}",
+                        cmd.root_sid,
+                        cmd.exit_code,
+                        cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+                        cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+                        cmd.inflight_rebase_original_head,
+                        cmd.ref_changes.len(),
+                        state.refs.len()
+                    ));
                 }
             }
             "cherry-pick" => {
+                trace_history_debug(&format!(
+                    "history analyzer cherry-pick input sid={} argv={:?} args={:?} exit={} pre_head={:?} post_head={:?} ref_changes={:?}",
+                    cmd.root_sid,
+                    cmd.raw_argv,
+                    args,
+                    cmd.exit_code,
+                    cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+                    cmd.ref_changes
+                ));
                 if args.iter().any(|arg| arg == "--abort") {
                     events.push(SemanticEvent::CherryPickAbort {
                         head: cmd
@@ -135,6 +185,13 @@ impl CommandAnalyzer for HistoryAnalyzer {
                         original_head: old_head,
                         new_head,
                     });
+                } else {
+                    trace_history_debug(&format!(
+                        "history analyzer cherry-pick produced no head change sid={} refs_tracked={} ref_changes_len={}",
+                        cmd.root_sid,
+                        state.refs.len(),
+                        cmd.ref_changes.len()
+                    ));
                 }
             }
             "merge" => {

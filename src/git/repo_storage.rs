@@ -206,8 +206,34 @@ impl RepoStorage {
         &self,
         event: RewriteLogEvent,
     ) -> Result<Vec<RewriteLogEvent>, GitAiError> {
-        append_event_to_file(&self.rewrite_log, event)?;
-        self.read_rewrite_events()
+        tracing::info!(
+            rewrite_log = %self.rewrite_log.display(),
+            event = ?event,
+            "rewrite_log append start"
+        );
+        append_event_to_file(&self.rewrite_log, event.clone()).map_err(|error| {
+            tracing::error!(
+                rewrite_log = %self.rewrite_log.display(),
+                event = ?event,
+                %error,
+                "rewrite_log append failed"
+            );
+            error
+        })?;
+        let events = self.read_rewrite_events().map_err(|error| {
+            tracing::error!(
+                rewrite_log = %self.rewrite_log.display(),
+                %error,
+                "rewrite_log read after append failed"
+            );
+            error
+        })?;
+        tracing::info!(
+            rewrite_log = %self.rewrite_log.display(),
+            events_len = events.len(),
+            "rewrite_log append complete"
+        );
+        Ok(events)
     }
 
     /// Read all rewrite events from the rewrite log file

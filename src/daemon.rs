@@ -70,6 +70,7 @@ pub mod bash_sessions;
 pub mod checkpoint;
 pub mod control_api;
 pub mod coordinator;
+pub mod diagnostics;
 pub mod domain;
 pub mod family_actor;
 pub mod git_backend;
@@ -2691,8 +2692,24 @@ fn apply_rewrite_side_effect(
     carryover_snapshot: Option<&HashMap<String, String>>,
     reset_pathspecs: Option<&[String]>,
 ) -> Result<(), GitAiError> {
+    tracing::info!(
+        ?family,
+        %worktree,
+        event = ?rewrite_event,
+        has_carryover_snapshot = carryover_snapshot.is_some(),
+        reset_pathspecs = ?reset_pathspecs,
+        "rewrite side-effect start"
+    );
     let mut repo = find_repository_in_path(worktree)?;
     let author = repo.git_author_identity().formatted_or_unknown();
+    tracing::info!(
+        ?family,
+        %worktree,
+        git_common_dir = %repo.common_dir().display(),
+        author = %author,
+        event = ?rewrite_event,
+        "rewrite side-effect repository resolved"
+    );
     ensure_rewrite_prerequisites(
         coordinator,
         &repo,
@@ -2730,7 +2747,22 @@ fn apply_rewrite_side_effect(
             },
         )?;
     }
-    if !rewrite_event_needs_authorship_processing(&repo, &rewrite_event)? {
+    let needs_authorship = rewrite_event_needs_authorship_processing(&repo, &rewrite_event)?;
+    tracing::info!(
+        ?family,
+        %worktree,
+        event = ?rewrite_event,
+        needs_authorship,
+        "rewrite side-effect authorship decision"
+    );
+    if !needs_authorship {
+        tracing::info!(
+            ?family,
+            %worktree,
+            event = ?rewrite_event,
+            rewrite_log = %repo.storage.rewrite_log.display(),
+            "rewrite side-effect append without authorship"
+        );
         repo.storage.append_rewrite_event(rewrite_event)?;
         return Ok(());
     }
@@ -2790,6 +2822,13 @@ fn apply_rewrite_side_effect(
     // succeeds — this prevents a failed rewrite from being permanently marked
     // as processed (fix for non-conflict rebase note loss).
     let pre_append_log = repo.storage.read_rewrite_events()?;
+    tracing::info!(
+        ?family,
+        %worktree,
+        event = ?rewrite_event,
+        pre_append_log_len = pre_append_log.len(),
+        "rewrite side-effect authorship processing start"
+    );
     match &rewrite_event {
         RewriteLogEvent::Commit { commit } => {
             let final_state_override =
@@ -2802,6 +2841,13 @@ fn apply_rewrite_side_effect(
                 true,
                 final_state_override,
             )?;
+            tracing::info!(
+                ?family,
+                %worktree,
+                base_commit = ?commit.base_commit,
+                commit_sha = %commit.commit_sha,
+                "rewrite side-effect post-commit authorship complete"
+            );
         }
         RewriteLogEvent::CommitAmend { commit_amend } => {
             let final_state_override =
@@ -2813,6 +2859,13 @@ fn apply_rewrite_side_effect(
                 author.clone(),
                 final_state_override,
             )?;
+            tracing::info!(
+                ?family,
+                %worktree,
+                original_commit = %commit_amend.original_commit,
+                amended_commit = %commit_amend.amended_commit_sha,
+                "rewrite side-effect amend authorship complete"
+            );
         }
         _ => {
             rewrite_authorship_if_needed(
@@ -2822,12 +2875,32 @@ fn apply_rewrite_side_effect(
                 &pre_append_log,
                 true,
             )?;
+            tracing::info!(
+                ?family,
+                %worktree,
+                event = ?rewrite_event,
+                "rewrite side-effect rewrite authorship complete"
+            );
         }
     }
     // Append the event AFTER authorship processing succeeds.  If the
     // processing above errored, the event is not recorded and the daemon
     // can retry on the next cycle.
+    tracing::info!(
+        ?family,
+        %worktree,
+        event = ?rewrite_event,
+        rewrite_log = %repo.storage.rewrite_log.display(),
+        "rewrite side-effect appending processed event"
+    );
     repo.storage.append_rewrite_event(rewrite_event.clone())?;
+    tracing::info!(
+        ?family,
+        %worktree,
+        event = ?rewrite_event,
+        rewrite_log = %repo.storage.rewrite_log.display(),
+        "rewrite side-effect complete"
+    );
     if let Some((target_commit, carried_va, final_state)) = deferred_commit_carryover {
         restore_virtual_attribution_carryover(&repo, &target_commit, carried_va, final_state)?;
     }
@@ -6472,6 +6545,16 @@ impl ActorDaemonCoordinator {
         cmd: &crate::daemon::domain::NormalizedCommand,
         events: &[crate::daemon::domain::SemanticEvent],
     ) -> Result<Vec<RewriteLogEvent>, GitAiError> {
+        tracing::info!(
+            sid = %cmd.root_sid,
+            primary = ?cmd.primary_command,
+            worktree = ?cmd.worktree,
+            events = ?events,
+            pre_head = ?cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+            post_head = ?cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+            ref_changes = ?cmd.ref_changes,
+            "rewrite synthesis input"
+        );
         let mut out = Vec::new();
         let mut implicit_merge_squash = if events.iter().any(|event| {
             matches!(
@@ -6954,6 +7037,12 @@ impl ActorDaemonCoordinator {
             out.push(RewriteLogEvent::merge_squash(merge_squash));
         }
 
+        tracing::info!(
+            sid = %cmd.root_sid,
+            primary = ?cmd.primary_command,
+            rewrite_events = ?out,
+            "rewrite synthesis output"
+        );
         Ok(out)
     }
 
@@ -7373,6 +7462,7 @@ impl ActorDaemonCoordinator {
         &self,
         payload: Value,
     ) -> Result<TracePayloadApplyOutcome, GitAiError> {
+        crate::daemon::diagnostics::maybe_append_raw_trace2_payload(&payload);
         self.maybe_append_pending_root_from_trace_payload(&payload)?;
         let payload_root_sid = Self::trace_payload_root_sid(&payload);
         let event = payload
@@ -7385,6 +7475,12 @@ impl ActorDaemonCoordinator {
             normalizer.ingest_payload(&payload)?
         };
         let Some(command) = emitted else {
+            tracing::info!(
+                event = %event,
+                root_sid = ?payload_root_sid,
+                payload = %crate::daemon::diagnostics::trace2_summary(&payload),
+                "trace payload consumed without normalized command"
+            );
             if is_terminal_root_trace_event(
                 &event,
                 payload
@@ -7399,11 +7495,30 @@ impl ActorDaemonCoordinator {
             {
                 self.clear_trace_root_tracking(root_sid)?;
                 let _ = family;
+                tracing::warn!(
+                    %root_sid,
+                    event = %event,
+                    "terminal trace event canceled pending root before normalized command"
+                );
                 return Ok(TracePayloadApplyOutcome::QueuedFamily);
             }
             return Ok(TracePayloadApplyOutcome::None);
         };
         let root_sid = command.root_sid.clone();
+        tracing::info!(
+            sid = %command.root_sid,
+            primary = ?command.primary_command,
+            invoked = ?command.invoked_command,
+            argv = ?command.raw_argv,
+            worktree = ?command.worktree,
+            family = ?command.family_key,
+            exit = command.exit_code,
+            pre_head = ?command.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+            post_head = ?command.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+            ref_changes_len = command.ref_changes.len(),
+            wrapper_id = ?command.wrapper_invocation_id,
+            "trace payload normalized command"
+        );
 
         let outcome = if let Some(family) = self
             .replace_pending_root_entry(

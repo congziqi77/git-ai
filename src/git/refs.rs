@@ -177,6 +177,13 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
     if entries.is_empty() {
         return Ok(());
     }
+    let requested_commits: Vec<&str> = entries.iter().map(|(sha, _)| sha.as_str()).collect();
+    tracing::info!(
+        entries = entries.len(),
+        commits = ?requested_commits,
+        global_args = ?repo.global_args_for_exec(),
+        "git notes batch add start"
+    );
 
     let mut args = repo.global_args_for_exec();
     args.push("rev-parse".to_string());
@@ -190,6 +197,12 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
         | Err(GitAiError::GitCliError { code: Some(1), .. }) => None,
         Err(e) => return Err(e),
     };
+    tracing::info!(
+        existing_notes_tip = ?existing_notes_tip,
+        entries = entries.len(),
+        commits = ?requested_commits,
+        "git notes batch add existing tip resolved"
+    );
 
     let mut deduped_entries: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
@@ -199,6 +212,10 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
         }
     }
     deduped_entries.reverse();
+    let deduped_commits: Vec<&str> = deduped_entries
+        .iter()
+        .map(|(sha, _)| sha.as_str())
+        .collect();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -236,7 +253,27 @@ pub fn notes_add_batch(repo: &Repository, entries: &[(String, String)]) -> Resul
     let mut fast_import_args = repo.global_args_for_exec();
     fast_import_args.push("fast-import".to_string());
     fast_import_args.push("--quiet".to_string());
-    exec_git_stdin(&fast_import_args, &script)?;
+    tracing::info!(
+        deduped_entries = deduped_entries.len(),
+        deduped_commits = ?deduped_commits,
+        script_size = script.len(),
+        fast_import_args = ?fast_import_args,
+        "git notes batch fast-import start"
+    );
+    exec_git_stdin(&fast_import_args, &script).map_err(|error| {
+        tracing::error!(
+            deduped_entries = deduped_entries.len(),
+            deduped_commits = ?deduped_commits,
+            %error,
+            "git notes batch fast-import failed"
+        );
+        error
+    })?;
+    tracing::info!(
+        deduped_entries = deduped_entries.len(),
+        deduped_commits = ?deduped_commits,
+        "git notes batch fast-import complete"
+    );
     crate::authorship::git_ai_hooks::post_notes_updated(repo, &deduped_entries);
 
     Ok(())

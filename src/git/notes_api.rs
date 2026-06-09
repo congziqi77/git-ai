@@ -19,10 +19,31 @@ pub use crate::git::refs::CommitAuthorship;
 // --- Writes ---
 
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), GitAiError> {
-    match Config::get().notes_backend_kind() {
+    let backend = Config::get().notes_backend_kind();
+    tracing::info!(
+        commit_sha = %commit_sha,
+        note_size = content.len(),
+        backend = ?backend,
+        "authorship note write start"
+    );
+    let result = match backend {
         NotesBackendKind::Http => http_write_note(commit_sha, content),
         NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
+    };
+    match &result {
+        Ok(()) => tracing::info!(
+            commit_sha = %commit_sha,
+            backend = ?backend,
+            "authorship note write complete"
+        ),
+        Err(error) => tracing::error!(
+            commit_sha = %commit_sha,
+            backend = ?backend,
+            %error,
+            "authorship note write failed"
+        ),
     }
+    result
 }
 
 pub fn write_notes_batch(
@@ -32,10 +53,36 @@ pub fn write_notes_batch(
     if entries.is_empty() {
         return Ok(());
     }
-    match Config::get().notes_backend_kind() {
+    let backend = Config::get().notes_backend_kind();
+    let commits: Vec<&str> = entries.iter().map(|(sha, _)| sha.as_str()).collect();
+    let total_note_size: usize = entries.iter().map(|(_, content)| content.len()).sum();
+    tracing::info!(
+        entries = entries.len(),
+        commits = ?commits,
+        total_note_size,
+        backend = ?backend,
+        "authorship notes batch write start"
+    );
+    let result = match backend {
         NotesBackendKind::Http => http_write_batch(entries),
         NotesBackendKind::GitNotes => crate::git::refs::notes_add_batch(repo, entries),
+    };
+    match &result {
+        Ok(()) => tracing::info!(
+            entries = entries.len(),
+            commits = ?commits,
+            backend = ?backend,
+            "authorship notes batch write complete"
+        ),
+        Err(error) => tracing::error!(
+            entries = entries.len(),
+            commits = ?commits,
+            backend = ?backend,
+            %error,
+            "authorship notes batch write failed"
+        ),
     }
+    result
 }
 
 // --- Reads ---

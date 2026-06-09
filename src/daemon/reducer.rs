@@ -10,6 +10,21 @@ pub fn reduce_family_command(
     cmd: NormalizedCommand,
     analyzers: &AnalyzerRegistry,
 ) -> Result<(AppliedCommand, AnalysisResult), GitAiError> {
+    tracing::info!(
+        sid = %cmd.root_sid,
+        family = %state.family_key,
+        primary = ?cmd.primary_command,
+        invoked = ?cmd.invoked_command,
+        argv = ?cmd.raw_argv,
+        worktree = ?cmd.worktree,
+        exit = cmd.exit_code,
+        pre_head = ?cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+        post_head = ?cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+        ref_changes = ?cmd.ref_changes,
+        wrapper_id = ?cmd.wrapper_invocation_id,
+        refs_tracked = state.refs.len(),
+        "daemon reducer family input"
+    );
     // Analyze against pre-command state so history/ref analyzers can infer old->new correctly.
     let analysis = analyzers.analyze(&cmd, AnalysisView { refs: &state.refs })?;
     apply_ref_changes(state, &cmd);
@@ -23,6 +38,16 @@ pub fn reduce_family_command(
         command: cmd,
         analysis: analysis.clone(),
     };
+    tracing::info!(
+        sid = %applied.command.root_sid,
+        family = %state.family_key,
+        seq = applied.seq,
+        class = ?analysis.class,
+        events = ?analysis.events,
+        confidence = ?analysis.confidence,
+        refs_tracked = state.refs.len(),
+        "daemon reducer family output"
+    );
     Ok((applied, analysis))
 }
 
@@ -31,6 +56,19 @@ pub fn reduce_global_command(
     cmd: NormalizedCommand,
     analyzers: &AnalyzerRegistry,
 ) -> Result<(AppliedCommand, AnalysisResult), GitAiError> {
+    tracing::info!(
+        sid = %cmd.root_sid,
+        primary = ?cmd.primary_command,
+        invoked = ?cmd.invoked_command,
+        argv = ?cmd.raw_argv,
+        worktree = ?cmd.worktree,
+        exit = cmd.exit_code,
+        pre_head = ?cmd.pre_repo.as_ref().and_then(|repo| repo.head.clone()),
+        post_head = ?cmd.post_repo.as_ref().and_then(|repo| repo.head.clone()),
+        ref_changes = ?cmd.ref_changes,
+        wrapper_id = ?cmd.wrapper_invocation_id,
+        "daemon reducer global input"
+    );
     let empty_refs = std::collections::HashMap::new();
     let analysis = analyzers.analyze(&cmd, AnalysisView { refs: &empty_refs })?;
     state.applied_seq = state.applied_seq.saturating_add(1);
@@ -39,6 +77,14 @@ pub fn reduce_global_command(
         command: cmd,
         analysis: analysis.clone(),
     };
+    tracing::info!(
+        sid = %applied.command.root_sid,
+        seq = applied.seq,
+        class = ?analysis.class,
+        events = ?analysis.events,
+        confidence = ?analysis.confidence,
+        "daemon reducer global output"
+    );
     Ok((applied, analysis))
 }
 
