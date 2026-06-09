@@ -1,0 +1,56 @@
+Cargo.toml
+  s_f8e742ee4e5c23::t_8481c315f54059 3
+src/daemon/reducer.rs
+  s_af002e6747a91f::t_1ce4113364272c 13-27,41-50,59-71,80-87
+src/git/repo_storage.rs
+  s_af002e6747a91f::t_e36984b2807ec3 209-236
+src/daemon/analyzers/history.rs
+  s_af002e6747a91f::t_d2ce2a06ccf02c 99-108,115-121,125-136,151-161,165-174,188-194
+src/daemon/diagnostics.rs
+  s_af002e6747a91f::t_25a7d2c792fb00 25,45-51,54-55
+  s_af002e6747a91f::t_44ec05d1e33f72 56-59
+  s_af002e6747a91f::t_186c9d8614e547 1-24,26-44,52-53,60-94
+src/daemon.rs
+  s_f8e742ee4e5c23::t_a26797fee49965 2847
+  s_af002e6747a91f::t_79b39e9f8bab50 73
+  s_af002e6747a91f::t_974bdb1f6651e4 7465,7478-7483,7498-7502,7508-7521
+  s_af002e6747a91f::t_69342cfa4b787b 2695-2702,2705-2707,2709-2712,2750-2765,2825-2831,2844-2846,2848-2850,2862-2868,2878-2883,2889-2895,2897-2903
+  s_af002e6747a91f::t_f6aa9870e0ad55 2708
+  s_af002e6747a91f::t_44fa7493d82870 6548-6557,7040-7045
+flake.nix
+  s_f8e742ee4e5c23::t_8481c315f54059 39
+src/git/refs.rs
+  s_af002e6747a91f::t_6607dad6dd8d04 180-186,200-205,215-218,256-276
+src/git/notes_api.rs
+  s_af002e6747a91f::t_62e6bcbf79f3ac 22-29,32-44,46,56-66,69-83,85
+src/git/sync_authorship.rs
+  s_af002e6747a91f::t_2bb3e6b5187f6e 175-179
+  s_af002e6747a91f::t_4ae32cc7573c45 102-107,113,120-124,126-134,138-142,157,183-185,189-190,197,203,214,220,223,228,234,239
+src/commands/debug.rs
+  s_af002e6747a91f::t_2763ca2c7aa13d 3,8,48,285-326,518-539,541-551,564-579
+  s_af002e6747a91f::t_5e201d3cdc28a7 540,552-563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6-ep",
+  "base_commit_sha": "04c0b737860cf38d69e357818d877ab17f47bb39",
+  "prompts": {},
+  "sessions": {
+    "s_af002e6747a91f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eaaba-97fd-7592-b777-8b315c4fb817",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_f8e742ee4e5c23": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eab77-bfef-71a2-90b8-26b96801131f",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
