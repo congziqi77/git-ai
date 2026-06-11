@@ -1,0 +1,37 @@
+tests/daemon_mode.rs
+  s_52cccb20dea4bd::t_57bd073d543986 3070,3072
+  s_52cccb20dea4bd::t_6ed7b63dcc8fe7 3146-3151
+  s_52cccb20dea4bd::t_bef7f3c3005206 3184
+  s_52cccb20dea4bd::t_7028aefd125a44 3074-3092,3094-3098,3178-3182,3194-3199
+  s_52cccb20dea4bd::t_c8c9a3513e511d 3049-3069,3071,3073,3093,3099-3145,3152-3177,3183,3185-3193,3200-3202
+flake.nix
+  s_0894c95d1e14e5::t_50cc0b00d58a49 39
+src/daemon.rs
+  s_52cccb20dea4bd::t_6c0fe588e76a84 6951-6963,6970
+Cargo.toml
+  s_0894c95d1e14e5::t_50cc0b00d58a49 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7-ep",
+  "base_commit_sha": "00224639b50399ae2937e0b6d64911459b792aea",
+  "prompts": {},
+  "sessions": {
+    "s_0894c95d1e14e5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb436-247f-7223-b298-4ee763d4d626",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_52cccb20dea4bd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eb0e6-a508-7692-8559-f7f7cf531e70",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
