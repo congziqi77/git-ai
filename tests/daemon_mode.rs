@@ -3046,6 +3046,162 @@ fn daemon_pure_trace_socket_pull_rebase_tracks_pull_and_rebase_completion() {
 
 #[test]
 #[serial]
+fn daemon_pure_trace_socket_pull_rebase_config_tracks_rebase_completion() {
+    let repo =
+        TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);
+    let default_branch = repo.current_branch();
+
+    let run_git = |args: &[&str]| -> String {
+        let output = Command::new(real_git_executable())
+            .args(args)
+            .output()
+            .expect("git command should execute");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    fs::write(repo.path().join("pull-rebase-config-base.txt"), "base\n")
+        .expect("failed to write base");
+    repo.git_og(&["add", "pull-rebase-config-base.txt"])
+        .expect("add should succeed");
+    repo.git_og(&["commit", "-m", "base"])
+        .expect("base commit should succeed");
+
+    repo.git_og(&["checkout", "-b", "stale-rebase-base"])
+        .expect("checkout stale base branch should succeed");
+    fs::write(repo.path().join("stale-base.txt"), "stale base\n")
+        .expect("failed to write stale base");
+    repo.git_og(&["add", "stale-base.txt"])
+        .expect("add stale base should succeed");
+    repo.git_og(&["commit", "-m", "stale base"])
+        .expect("stale base commit should succeed");
+    repo.git_og(&["checkout", default_branch.as_str()])
+        .expect("checkout default branch should succeed");
+    fs::write(repo.path().join("stale-local.txt"), "stale local\n")
+        .expect("failed to write stale local");
+    repo.git_og(&["add", "stale-local.txt"])
+        .expect("add stale local should succeed");
+    repo.git_og(&["commit", "-m", "stale local"])
+        .expect("stale local commit should succeed");
+    repo.git_og(&["rebase", "stale-rebase-base"])
+        .expect("stale rebase should succeed");
+
+    let _daemon = DaemonGuard::start(&repo);
+    let trace_socket = daemon_trace_socket_path(&repo);
+    let env = git_trace_env(&trace_socket);
+    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
+
+    let root = repo
+        .path()
+        .parent()
+        .expect("test repo path should have parent")
+        .to_path_buf();
+    let bare_remote = root.join("origin-rebase-config.git");
+    let remote_clone = root.join("origin-rebase-config-work");
+    let bare_remote_str = bare_remote.to_string_lossy().to_string();
+    let remote_clone_str = remote_clone.to_string_lossy().to_string();
+    let _ = fs::remove_dir_all(&bare_remote);
+    let _ = fs::remove_dir_all(&remote_clone);
+
+    run_git(&["init", "--bare", bare_remote_str.as_str()]);
+    repo.git_og_with_env(
+        &["remote", "add", "origin", bare_remote_str.as_str()],
+        &env_refs,
+    )
+    .expect("adding origin remote should succeed");
+    repo.git_og_with_env(
+        &["push", "-u", "origin", default_branch.as_str()],
+        &env_refs,
+    )
+    .expect("pushing base branch should succeed");
+
+    run_git(&[
+        "clone",
+        "--branch",
+        default_branch.as_str(),
+        bare_remote_str.as_str(),
+        remote_clone_str.as_str(),
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "config",
+        "user.name",
+        "Test User",
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "config",
+        "user.email",
+        "test@example.com",
+    ]);
+    fs::write(remote_clone.join("remote-config-only.txt"), "remote\n")
+        .expect("failed to write remote file");
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "add",
+        "remote-config-only.txt",
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "commit",
+        "-m",
+        "remote commit",
+    ]);
+    run_git(&[
+        "-C",
+        remote_clone_str.as_str(),
+        "push",
+        "origin",
+        format!("HEAD:{}", default_branch).as_str(),
+    ]);
+
+    fs::write(repo.path().join("local-config-only.txt"), "local\n")
+        .expect("failed to write local file");
+    repo.git_og_with_env(&["add", "local-config-only.txt"], &env_refs)
+        .expect("local add should succeed");
+    repo.git_og_with_env(&["commit", "-m", "local commit"], &env_refs)
+        .expect("local commit should succeed");
+
+    repo.git_og_with_env(&["config", "pull.rebase", "true"], &env_refs)
+        .expect("set pull.rebase should succeed");
+    repo.git_og_with_env(&["pull", "origin", default_branch.as_str()], &env_refs)
+        .expect("config-based pull --rebase should succeed");
+    let post_pull_head = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .expect("rev-parse HEAD should succeed")
+        .trim()
+        .to_string();
+
+    wait_for_expected_top_level_completions(&repo, 0, 6);
+
+    let pull_entries = completion_entries_for_command(&repo, "pull");
+    let saw_pull_success = pull_entries.iter().any(|entry| entry.exit_code == Some(0));
+    assert!(saw_pull_success, "plain pull success should be tracked");
+
+    let rebase_complete_events = wait_for_rewrite_event_count(&repo, "\"rebase_complete\"", 1);
+    assert!(
+        rebase_complete_events >= 1,
+        "config-based pull rebase should result in a rebase_complete rewrite signal"
+    );
+    let rewrite_log = fs::read_to_string(rewrite_log_path(&repo))
+        .expect("rewrite log should exist after pull rebase");
+    assert!(
+        rewrite_log.contains(&post_pull_head),
+        "rewrite log should include the current pull rebase head {post_pull_head}, got: {rewrite_log}"
+    );
+}
+
+#[test]
+#[serial]
 fn daemon_pure_trace_socket_pull_autostash_preserves_local_changes_and_tracks_command() {
     let repo =
         TestRepo::new_with_mode_and_daemon_scope(GitTestMode::Daemon, DaemonTestScope::NoDaemon);

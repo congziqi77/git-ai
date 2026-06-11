@@ -6948,13 +6948,26 @@ impl ActorDaemonCoordinator {
                         })?;
                         let repository =
                             repository_for_rewrite_context(cmd, "pull_rebase_complete")?;
+                        let (old_head, new_head) = Self::resolve_heads_for_command(cmd);
+                        let semantic_heads = if !old_head.is_empty()
+                            && !new_head.is_empty()
+                            && old_head != new_head
+                            && is_valid_oid(&old_head)
+                            && !is_zero_oid(&old_head)
+                            && is_valid_oid(&new_head)
+                            && !is_zero_oid(&new_head)
+                        {
+                            Some((old_head.as_str(), new_head.as_str()))
+                        } else {
+                            None
+                        };
                         let Some((mapping_old_head, new_head, onto_head)) =
                             Self::stable_rebase_heads_from_worktree(
                                 &repository,
                                 worktree,
                                 &cmd.raw_argv,
                                 None,
-                                None,
+                                semantic_heads,
                             )?
                         else {
                             tracing::debug!(
