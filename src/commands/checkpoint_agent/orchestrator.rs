@@ -2,7 +2,7 @@ use crate::authorship::authorship_log_serialization::generate_trace_id;
 use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands::checkpoint_agent::presets::{
     KnownHumanEdit, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    TranscriptSource, UntrackedEdit,
+    StreamSource, UntrackedEdit,
 };
 use crate::config;
 use crate::daemon::checkpoint::PreparedPathRole;
@@ -38,7 +38,7 @@ pub struct CheckpointRequest {
     pub agent_id: Option<AgentId>,
     pub files: Vec<CheckpointFile>,
     pub path_role: PreparedPathRole,
-    pub transcript_source: Option<TranscriptSource>,
+    pub stream_source: Option<StreamSource>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -328,7 +328,7 @@ fn split_files_into_requests(
     checkpoint_kind: CheckpointKind,
     agent_id: Option<AgentId>,
     path_role: PreparedPathRole,
-    transcript_source: Option<TranscriptSource>,
+    stream_source: Option<StreamSource>,
     metadata: HashMap<String, String>,
 ) -> Vec<CheckpointRequest> {
     let mut by_repo: HashMap<PathBuf, Vec<CheckpointFile>> = HashMap::new();
@@ -344,7 +344,7 @@ fn split_files_into_requests(
             agent_id: agent_id.clone(),
             files,
             path_role,
-            transcript_source: transcript_source.clone(),
+            stream_source: stream_source.clone(),
             metadata: metadata.clone(),
         })
         .collect()
@@ -403,7 +403,7 @@ fn execute_post_file_edit(
         checkpoint_kind,
         Some(e.context.agent_id),
         PreparedPathRole::Edited,
-        e.transcript_source,
+        e.stream_source,
         metadata,
     ))
 }
@@ -529,7 +529,7 @@ fn execute_post_bash_call(e: PostBashCall) -> Result<Vec<CheckpointRequest>, Git
         CheckpointKind::AiAgent,
         Some(e.context.agent_id),
         PreparedPathRole::Edited,
-        e.transcript_source,
+        e.stream_source,
         metadata,
     ))
 }

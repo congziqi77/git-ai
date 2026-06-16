@@ -1401,7 +1401,7 @@ fn output_json_format(
         .map(|creds| !creds.is_refresh_token_expired())
         .unwrap_or(false);
 
-    let current_user = repo.git_author_identity().formatted();
+    let current_user = repo.effective_author_identity().formatted();
 
     let output = JsonBlameOutput {
         lines: lines_map,

@@ -583,6 +583,9 @@ fn handle_restart(args: &[String]) -> Result<(), String> {
     // Only attempt shutdown if daemon appears to be running.
     let was_running = daemon_is_up(&config) || daemon_startup_is_blocked(&config);
     if was_running {
+        // Read the PID before shutdown so we can verify the process actually dies.
+        let old_pid = read_daemon_pid(&config).ok();
+
         if hard {
             hard_kill_daemon(&config)?;
         } else {
@@ -592,6 +595,12 @@ fn handle_restart(args: &[String]) -> Result<(), String> {
                 eprintln!("graceful shutdown timed out, force-killing daemon");
                 hard_kill_daemon(&config)?;
             }
+        }
+
+        // Even after lock+sockets are gone, the process may still be alive
+        // (e.g. tokio runtime draining blocking tasks). Verify and force-kill.
+        if let Some(pid) = old_pid {
+            wait_for_process_exit(pid, Duration::from_secs(2));
         }
     }
 
@@ -666,6 +675,35 @@ fn wait_for_daemon_dead(config: &DaemonConfig, timeout: Duration) -> bool {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Wait for a process to exit, force-killing it if it doesn't die within timeout.
+/// This handles the case where the daemon lock/sockets are gone but the process
+/// is still alive (e.g. tokio runtime draining blocking tasks).
+///
+/// Note: relies on PID liveness only. Theoretically susceptible to PID reuse if
+/// the process is reaped and the PID recycled within the timeout window, but on
+/// macOS/Linux with ~100k PID space this is not a realistic concern.
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret != 0 {
+            return; // Process is dead
+        }
+        if Instant::now() >= deadline {
+            // Process still alive after timeout — force kill
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(_pid: u32, _timeout: Duration) {
+    // On Windows, hard_kill_daemon uses taskkill /F which is synchronous.
 }
 
 /// Shut down the running daemon (soft then hard) and wait for it to fully exit.

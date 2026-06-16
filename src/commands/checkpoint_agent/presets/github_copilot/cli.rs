@@ -1,13 +1,13 @@
 use super::super::parse;
 use super::super::{
     ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit, PresetContext,
-    TranscriptFormat, TranscriptSource,
+    StreamFormat, StreamSource,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::ToolClass;
 use crate::error::GitAiError;
-use crate::transcripts::model_extraction;
+use crate::streams::model_extraction;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ pub(super) fn parse_cli_hooks(
                 .and_then(|path| {
                     model_extraction::extract_model(
                         path,
-                        crate::transcripts::sweep::TranscriptFormat::CopilotEventStreamJsonl,
+                        crate::streams::sweep::StreamFormat::CopilotEventStreamJsonl,
                         None,
                     )
                     .ok()
@@ -77,9 +77,9 @@ pub(super) fn parse_cli_hooks(
         metadata,
     };
 
-    let transcript_source = session_state_path.map(|path| TranscriptSource {
+    let stream_source = session_state_path.map(|path| StreamSource {
         path,
-        format: TranscriptFormat::CopilotEventStreamJsonl,
+        format: StreamFormat::CopilotEventStreamJsonl,
         session_id: generate_session_id(&session_id, "github-copilot-cli"),
         external_session_id: session_id.clone(),
         external_parent_session_id: None,
@@ -93,7 +93,7 @@ pub(super) fn parse_cli_hooks(
         ("PostToolUse", ToolClass::Bash) => Ok(vec![ParsedHookEvent::PostBashCall(PostBashCall {
             context,
             tool_use_id,
-            transcript_source,
+            stream_source,
         })]),
         ("PreToolUse", ToolClass::FileEdit) => {
             // `create` PreToolUse: synthesize empty dirty_files for the new path
@@ -139,7 +139,7 @@ pub(super) fn parse_cli_hooks(
                 context,
                 file_paths: extracted_paths,
                 dirty_files,
-                transcript_source,
+                stream_source,
                 tool_use_id: Some(tool_use_id),
             })])
         }
@@ -224,7 +224,7 @@ mod tests {
             .unwrap();
         match &events[0] {
             ParsedHookEvent::PostBashCall(e) => {
-                assert!(e.transcript_source.is_none());
+                assert!(e.stream_source.is_none());
                 assert_eq!(e.tool_use_id, "cli-sess-cli-bash");
             }
             other => panic!("Expected PostBashCall, got {:?}", other),
@@ -288,7 +288,7 @@ mod tests {
                     e.file_paths,
                     vec![PathBuf::from("/Users/a/project/very_fun.md")]
                 );
-                assert!(e.transcript_source.is_none());
+                assert!(e.stream_source.is_none());
             }
             other => panic!("Expected PostFileEdit, got {:?}", other),
         }

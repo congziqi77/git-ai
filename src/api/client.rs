@@ -1,7 +1,7 @@
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::GitAiError;
-use crate::git::repository::{exec_git, parse_git_var_identity};
+use crate::git::repository::{current_git_committer_identity_resolution, parse_git_var_identity};
 use crate::http;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -61,22 +61,25 @@ fn try_load_auth_token() -> Option<String> {
     // Mutex guard is automatically released when _guard is dropped
 }
 
-/// Resolve the git author identity without requiring a Repository instance.
+/// Resolve the git-ai effective author identity without requiring a Repository instance.
 ///
-/// Runs `git var GIT_COMMITTER_IDENT` to get the current user's identity,
-/// respecting the full git precedence chain (env vars > config > system defaults).
+/// Uses the shared git identity helper to get the current user's identity,
+/// respecting the full git precedence chain (env vars > config > system defaults),
+/// then overlays any configured git-ai author fields.
 /// Falls back to the system hostname if git identity is unavailable.
 fn resolve_git_identity() -> Option<String> {
-    let args = vec!["var".to_string(), "GIT_COMMITTER_IDENT".to_string()];
-    if let Ok(output) = exec_git(&args)
-        && let Ok(stdout) = String::from_utf8(output.stdout)
-    {
-        let identity = parse_git_var_identity(&stdout);
-        if let Some(formatted) = identity.formatted() {
-            return Some(encode_for_header(&formatted));
-        }
+    let author_config = config::Config::fresh_author_cached();
+    let identity = current_git_committer_identity_resolution()
+        .identity
+        .with_author_config(&author_config);
+    if let Some(formatted) = identity.formatted() {
+        return Some(encode_for_header(&formatted));
     }
-    resolve_fallback_identity().map(|id| encode_for_header(&id))
+
+    resolve_fallback_identity()
+        .map(|id| parse_git_var_identity(&id).with_author_config(&author_config))
+        .and_then(|identity| identity.formatted())
+        .map(|id| encode_for_header(&id))
 }
 
 /// Build a fallback identity matching git's format: `"Username <username@hostname>"`.

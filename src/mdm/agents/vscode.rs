@@ -174,11 +174,13 @@ impl HookInstaller for VSCodeInstaller {
                 }
             }
         } else {
-            results.push(InstallResult {
-                changed: false,
-                diff: None,
-                message: "VS Code: Unable to automatically install extension. Please cmd+click on the following link to install: vscode:extension/git-ai.git-ai-vscode (or navigate to https://marketplace.visualstudio.com/items?itemName=git-ai.git-ai-vscode in your browser)".to_string(),
-            });
+            // resolve_editor_cli returned None -- the only way to reach this
+            // branch. VS Code was detected only from its config dotfiles
+            // (~/.vscode) and isn't actually installed, so there's nothing to
+            // install the extension into. Don't emit a misleading "unable to
+            // install" nag here; genuine install/check failures are already
+            // reported by the match arms above. (The chat-hook settings below are
+            // configured independently of the editor CLI and still run.)
         }
 
         for settings_path in Self::settings_targets() {
@@ -275,6 +277,28 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].changed);
         assert!(results[0].message.contains("manually"));
+    }
+
+    #[test]
+    fn test_install_extras_does_not_nag_when_cli_absent() {
+        // Regression: when the `code` CLI isn't resolvable (e.g. only the
+        // ~/.vscode dotfiles exist), install_extras must not emit the misleading
+        // "Unable to automatically install extension" message. dry_run=true means
+        // no real install is attempted.
+        let params = HookInstallerParams {
+            binary_path: std::path::PathBuf::from("/usr/local/bin/git-ai"),
+        };
+        let results = VSCodeInstaller.install_extras(&params, true).unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|r| !r.message.contains("Unable to automatically install")),
+            "unexpected extension nag: {:?}",
+            results
+                .iter()
+                .map(|r| r.message.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

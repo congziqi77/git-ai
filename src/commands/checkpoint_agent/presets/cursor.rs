@@ -1,7 +1,7 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, TranscriptFormat, TranscriptSource,
+    PresetContext, StreamFormat, StreamSource,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
@@ -111,9 +111,9 @@ impl AgentPreset for CursorPreset {
             metadata,
         };
 
-        let transcript_source = transcript_path.map(|tp| TranscriptSource {
+        let stream_source = transcript_path.map(|tp| StreamSource {
             path: PathBuf::from(tp),
-            format: TranscriptFormat::CursorJsonl,
+            format: StreamFormat::CursorJsonl,
             session_id: generate_session_id(&conversation_id, "cursor"),
             external_session_id: conversation_id.clone(),
             external_parent_session_id: None,
@@ -132,7 +132,7 @@ impl AgentPreset for CursorPreset {
             (ToolClass::Bash, false) => ParsedHookEvent::PostBashCall(PostBashCall {
                 context,
                 tool_use_id,
-                transcript_source,
+                stream_source,
             }),
             (ToolClass::FileEdit, true) => ParsedHookEvent::PreFileEdit(PreFileEdit {
                 context,
@@ -144,7 +144,7 @@ impl AgentPreset for CursorPreset {
                 context,
                 file_paths,
                 dirty_files: None,
-                transcript_source,
+                stream_source,
                 tool_use_id: Some(tool_use_id),
             }),
             (ToolClass::Skip, _) => unreachable!("Skip handled above"),
@@ -265,9 +265,9 @@ mod tests {
                     e.file_paths,
                     vec![PathBuf::from("/home/user/project/src/main.rs")]
                 );
-                assert!(e.transcript_source.is_some());
-                if let Some(ts) = &e.transcript_source {
-                    assert_eq!(ts.format, TranscriptFormat::CursorJsonl);
+                assert!(e.stream_source.is_some());
+                if let Some(ts) = &e.stream_source {
+                    assert_eq!(ts.format, StreamFormat::CursorJsonl);
                     assert_eq!(ts.session_id, generate_session_id("conv-123", "cursor"));
                     assert_eq!(ts.external_session_id, "conv-123");
                 }
@@ -397,7 +397,7 @@ mod tests {
         let events = CursorPreset.parse(&input, "t_test123456789a").unwrap();
         match &events[0] {
             ParsedHookEvent::PostFileEdit(e) => {
-                assert!(e.transcript_source.is_none());
+                assert!(e.stream_source.is_none());
             }
             _ => panic!("Expected PostFileEdit"),
         }

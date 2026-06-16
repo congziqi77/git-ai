@@ -1,6 +1,7 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
+use git_ai::config::AuthorConfig;
 use std::fs;
 
 fn configure_diff_settings(repo: &TestRepo, settings: &[(&str, &str)]) {
@@ -1916,6 +1917,158 @@ fn test_session_record_human_author_includes_email() {
         assert_eq!(
             author, "Test User <test@example.com>",
             "SessionRecord.human_author should be the full git identity"
+        );
+    }
+}
+
+#[test]
+fn test_author_config_cli_set_get_unset() {
+    let repo = TestRepo::new();
+
+    repo.git_ai(&["config", "set", "author.name", "Config User"])
+        .unwrap();
+    repo.git_ai(&["config", "set", "author.email", "config@example.com"])
+        .unwrap();
+
+    let name = repo.git_ai(&["config", "author.name"]).unwrap();
+    assert_eq!(name.trim(), "\"Config User\"");
+
+    let author = repo.git_ai(&["config", "author"]).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(author.trim()).expect("author config should be JSON");
+    assert_eq!(value["name"], "Config User");
+    assert_eq!(value["email"], "config@example.com");
+
+    repo.git_ai(&["config", "unset", "author.name"]).unwrap();
+    let author = repo.git_ai(&["config", "author"]).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(author.trim()).expect("author config should be JSON");
+    assert!(value.get("name").is_none());
+    assert_eq!(value["email"], "config@example.com");
+
+    repo.git_ai(&["config", "unset", "author"]).unwrap();
+    let author = repo.git_ai(&["config", "author"]).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(author.trim()).expect("author config should be JSON");
+    assert_eq!(value.as_object().unwrap().len(), 0);
+}
+
+#[test]
+fn test_author_config_overrides_session_and_known_human_records() {
+    let mut repo = TestRepo::new();
+    repo.patch_git_ai_config(|patch| {
+        patch.author = Some(AuthorConfig {
+            name: Some("Config User".to_string()),
+            email: Some("config@example.com".to_string()),
+        });
+    });
+
+    let file_path = repo.path().join("author_config.rs");
+    repo.git_ai(&["checkpoint", "human", "author_config.rs"])
+        .unwrap();
+    fs::write(&file_path, "fn ai() {}\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "author_config.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("AI commit with author config")
+        .unwrap();
+
+    let sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let note = repo
+        .read_authorship_note(&sha)
+        .expect("AI commit should have authorship note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
+    assert!(!log.metadata.sessions.is_empty());
+    for session in log.metadata.sessions.values() {
+        assert_eq!(
+            session.human_author.as_deref(),
+            Some("Config User <config@example.com>")
+        );
+    }
+
+    fs::write(&file_path, "fn ai() {}\nfn human() {}\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "author_config.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("Known human commit with author config")
+        .unwrap();
+
+    let sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let note = repo
+        .read_authorship_note(&sha)
+        .expect("known-human commit should have authorship note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
+    assert!(!log.metadata.humans.is_empty());
+    for human in log.metadata.humans.values() {
+        assert_eq!(human.author, "Config User <config@example.com>");
+    }
+}
+
+#[test]
+fn test_author_config_partial_overrides_fall_back_to_git_committer_identity() {
+    let mut name_repo = TestRepo::new();
+    name_repo.patch_git_ai_config(|patch| {
+        patch.author = Some(AuthorConfig {
+            name: Some("Config Name".to_string()),
+            email: None,
+        });
+    });
+    let file_path = name_repo.path().join("partial_name.rs");
+    name_repo
+        .git_ai(&["checkpoint", "human", "partial_name.rs"])
+        .unwrap();
+    fs::write(&file_path, "fn ai() {}\n").unwrap();
+    name_repo
+        .git_ai(&["checkpoint", "mock_ai", "partial_name.rs"])
+        .unwrap();
+    name_repo
+        .stage_all_and_commit("AI commit with author name override")
+        .unwrap();
+    let sha = name_repo
+        .git(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let note = name_repo
+        .read_authorship_note(&sha)
+        .expect("AI commit should have note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
+    for session in log.metadata.sessions.values() {
+        assert_eq!(
+            session.human_author.as_deref(),
+            Some("Config Name <test@example.com>")
+        );
+    }
+
+    let mut email_repo = TestRepo::new();
+    email_repo.patch_git_ai_config(|patch| {
+        patch.author = Some(AuthorConfig {
+            name: None,
+            email: Some("configured-email@example.com".to_string()),
+        });
+    });
+    let file_path = email_repo.path().join("partial_email.rs");
+    email_repo
+        .git_ai(&["checkpoint", "human", "partial_email.rs"])
+        .unwrap();
+    fs::write(&file_path, "fn ai() {}\n").unwrap();
+    email_repo
+        .git_ai(&["checkpoint", "mock_ai", "partial_email.rs"])
+        .unwrap();
+    email_repo
+        .stage_all_and_commit("AI commit with author email override")
+        .unwrap();
+    let sha = email_repo
+        .git(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let note = email_repo
+        .read_authorship_note(&sha)
+        .expect("AI commit should have note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("parse note");
+    for session in log.metadata.sessions.values() {
+        assert_eq!(
+            session.human_author.as_deref(),
+            Some("Test User <configured-email@example.com>")
         );
     }
 }

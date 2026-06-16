@@ -31,7 +31,7 @@ use crate::{
         restore_working_log_carryover, rewrite_authorship_after_commit_amend_with_snapshot,
         rewrite_authorship_if_needed,
     },
-    authorship::working_log::CheckpointKind,
+    authorship::working_log::{AgentId, CheckpointKind},
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
     commands::hooks::{push_hooks, stash_hooks},
     daemon::checkpoint::PreparedPathRole,
@@ -47,6 +47,7 @@ use interprocess::{
 use named_pipe::{
     ConnectingServer as WindowsConnectingServer, OpenMode as WindowsPipeOpenMode,
     PipeClient as WindowsPipeClient, PipeOptions as WindowsPipeOptions,
+    PipeServer as WindowsPipeServer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,13 +78,13 @@ pub mod git_backend;
 pub mod global_actor;
 pub mod reducer;
 pub mod sentry_layer;
+pub mod stream_worker;
 pub mod sweep_coordinator;
 pub mod telemetry_handle;
 pub mod telemetry_worker;
 pub mod test_sync;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
-pub mod transcript_worker;
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
@@ -666,7 +667,7 @@ fn trace_invocation_is_definitely_read_only(
             // Only parse the subcommand for commands that need it; parsing is
             // cheap but this avoids it for the majority of clearly-read-only
             // commands like status, diff, show, etc.
-            let subcommand = if matches!(cmd, "stash" | "worktree") {
+            let subcommand = if matches!(cmd, "notes" | "stash" | "worktree") {
                 trace_argv_subcommand(argv)
             } else {
                 None
@@ -1377,7 +1378,7 @@ fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiE
             return Err(e);
         }
     };
-    let author = repo.git_author_identity().formatted_or_unknown();
+    let author = repo.effective_author_identity().formatted_or_unknown();
 
     if request.checkpoint_kind.is_ai()
         && let Some(ref agent_id) = request.agent_id
@@ -1566,6 +1567,33 @@ fn apply_push_side_effect(
     Ok(())
 }
 
+fn transcript_sweep_triggers_for_events(
+    events: &[crate::daemon::domain::SemanticEvent],
+) -> Vec<crate::daemon::stream_worker::SweepTrigger> {
+    let mut triggers = Vec::new();
+
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            crate::daemon::domain::SemanticEvent::CommitCreated { .. }
+                | crate::daemon::domain::SemanticEvent::CommitAmended { .. }
+        )
+    }) {
+        triggers.push(crate::daemon::stream_worker::SweepTrigger::PostCommit);
+    }
+
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            crate::daemon::domain::SemanticEvent::PushCompleted { .. }
+        )
+    }) {
+        triggers.push(crate::daemon::stream_worker::SweepTrigger::PostPush);
+    }
+
+    triggers
+}
+
 fn apply_pull_notes_sync_side_effect(
     worktree: &str,
     command: Option<&str>,
@@ -1745,7 +1773,7 @@ fn apply_checkout_switch_working_log_side_effect(
                     &old_head,
                     &new_head,
                     clean_snapshot,
-                    Some(repo.git_author_identity().formatted_or_unknown()),
+                    Some(repo.effective_author_identity().formatted_or_unknown()),
                 )?;
             }
             repo.storage.delete_working_log_for_base_commit(&old_head)?;
@@ -1897,6 +1925,26 @@ fn build_human_replay_checkpoint_request(
     files: Vec<String>,
     dirty_files: HashMap<String, String>,
 ) -> CheckpointRequest {
+    build_replay_checkpoint_request(
+        repo_work_dir,
+        files,
+        dirty_files,
+        CheckpointKind::Human,
+        None,
+        PreparedPathRole::WillEdit,
+        HashMap::new(),
+    )
+}
+
+fn build_replay_checkpoint_request(
+    repo_work_dir: &str,
+    files: Vec<String>,
+    dirty_files: HashMap<String, String>,
+    checkpoint_kind: CheckpointKind,
+    agent_id: Option<AgentId>,
+    path_role: PreparedPathRole,
+    metadata: HashMap<String, String>,
+) -> CheckpointRequest {
     let base_commit = crate::commands::checkpoint_agent::orchestrator::BaseCommit::Initial;
     let repo_work_dir_path = std::path::PathBuf::from(repo_work_dir);
 
@@ -1916,12 +1964,12 @@ fn build_human_replay_checkpoint_request(
 
     CheckpointRequest {
         trace_id: crate::authorship::authorship_log_serialization::generate_trace_id(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: None,
+        checkpoint_kind,
+        agent_id,
         files: checkpoint_files,
-        path_role: PreparedPathRole::WillEdit,
-        transcript_source: None,
-        metadata: std::collections::HashMap::new(),
+        path_role,
+        stream_source: None,
+        metadata,
     }
 }
 
@@ -2651,17 +2699,34 @@ fn sync_pre_commit_checkpoint_for_daemon_commit(
         return Ok(());
     }
 
-    let replay_checkpoint_request = build_human_replay_checkpoint_request(
-        &repo_workdir,
-        changed_files.clone(),
-        dirty_files.clone(),
-    );
-
-    let checkpoint_kind = if active_bash.is_some() {
-        CheckpointKind::AiAgent
-    } else {
-        CheckpointKind::Human
-    };
+    let (checkpoint_kind, replay_checkpoint_request) =
+        if let Some((agent_id, metadata)) = active_bash {
+            let mut metadata = metadata.clone();
+            metadata
+                .entry("edit_kind".to_string())
+                .or_insert_with(|| "bash".to_string());
+            (
+                CheckpointKind::AiAgent,
+                build_replay_checkpoint_request(
+                    &repo_workdir,
+                    changed_files.clone(),
+                    dirty_files.clone(),
+                    CheckpointKind::AiAgent,
+                    Some(agent_id.clone()),
+                    PreparedPathRole::Edited,
+                    metadata,
+                ),
+            )
+        } else {
+            (
+                CheckpointKind::Human,
+                build_human_replay_checkpoint_request(
+                    &repo_workdir,
+                    changed_files.clone(),
+                    dirty_files.clone(),
+                ),
+            )
+        };
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2701,7 +2766,7 @@ fn apply_rewrite_side_effect(
         "rewrite side-effect start"
     );
     let mut repo = find_repository_in_path(worktree)?;
-    let author = repo.git_author_identity().formatted_or_unknown();
+    let author = repo.effective_author_identity().formatted_or_unknown();
     tracing::info!(
         ?family,
         %worktree,
@@ -3983,9 +4048,9 @@ pub struct ActorDaemonCoordinator {
     // exits via the shutdown select! arm instead of relying on channel closure.
     trace_ingest_tx: std::sync::OnceLock<mpsc::Sender<Value>>,
     telemetry_worker: Option<crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle>,
-    transcript_worker: Option<crate::daemon::transcript_worker::TranscriptWorkerHandle>,
+    stream_worker: Option<crate::daemon::stream_worker::StreamWorkerHandle>,
     transcript_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    transcripts_db: Option<Arc<crate::transcripts::db::TranscriptsDatabase>>,
+    streams_db: Option<Arc<crate::streams::db::StreamsDatabase>>,
     next_trace_ingest_seq: AtomicUsize,
     next_carryover_snapshot_id: AtomicUsize,
     queued_trace_payloads: AtomicUsize,
@@ -4082,9 +4147,9 @@ impl ActorDaemonCoordinator {
             test_completion_log_lock: Mutex::new(()),
             trace_ingest_tx: std::sync::OnceLock::new(),
             telemetry_worker: None,
-            transcript_worker: None,
+            stream_worker: None,
             transcript_shutdown_notify: std::sync::OnceLock::new(),
-            transcripts_db: None,
+            streams_db: None,
             next_trace_ingest_seq: AtomicUsize::new(0),
             next_carryover_snapshot_id: AtomicUsize::new(0),
             queued_trace_payloads: AtomicUsize::new(0),
@@ -4106,6 +4171,19 @@ impl ActorDaemonCoordinator {
         // Acquire pairs with the Release store in request_shutdown so all
         // writes made before shutdown is requested are visible to the caller.
         self.shutting_down.load(Ordering::Acquire)
+    }
+
+    fn trigger_transcript_sweep(&self, trigger: crate::daemon::stream_worker::SweepTrigger) {
+        let Some(worker) = &self.stream_worker else {
+            tracing::debug!(trigger = %trigger, "transcript sweep trigger skipped; worker is not running");
+            return;
+        };
+
+        if worker.trigger_sweep(trigger) {
+            tracing::info!(trigger = %trigger, "transcript sweep trigger enqueued");
+        } else {
+            tracing::debug!(trigger = %trigger, "transcript sweep trigger not enqueued");
+        }
     }
 
     fn request_shutdown(&self) {
@@ -7194,7 +7272,7 @@ impl ActorDaemonCoordinator {
                         let carried_va = crate::authorship::virtual_attribution::VirtualAttributions::from_persisted_working_log(
                             repo.clone(),
                             old_head.clone(),
-                            Some(repo.git_author_identity().formatted_or_unknown()),
+                            Some(repo.effective_author_identity().formatted_or_unknown()),
                         )?;
                         Some((new_head, carried_va, snapshot.clone()))
                     }
@@ -7468,6 +7546,16 @@ impl ActorDaemonCoordinator {
             }
         }
 
+        for trigger in transcript_sweep_triggers_for_events(events) {
+            if trigger == crate::daemon::stream_worker::SweepTrigger::PostPush
+                && crate::git::cli_parser::is_dry_run(&parsed_invocation.command_args)
+            {
+                tracing::debug!("transcript sweep trigger skipped for dry-run push");
+                continue;
+            }
+            self.trigger_transcript_sweep(trigger);
+        }
+
         Ok(())
     }
 
@@ -7655,10 +7743,10 @@ impl ActorDaemonCoordinator {
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::CheckpointRun { request } => {
-                if let Some(worker) = &self.transcript_worker
-                    && let Some(transcript_source) = &request.transcript_source
+                if let Some(worker) = &self.stream_worker
+                    && let Some(stream_source) = &request.stream_source
                 {
-                    let session_id = transcript_source.session_id.clone();
+                    let session_id = stream_source.session_id.clone();
                     let tool = request
                         .agent_id
                         .as_ref()
@@ -7669,25 +7757,15 @@ impl ActorDaemonCoordinator {
 
                     let repo_work_dir = request.files.first().map(|f| f.repo_work_dir.clone());
 
-                    if let Some(db) = &self.transcripts_db
-                        && let Err(e) = Self::ensure_session_exists(
-                            db,
-                            &session_id,
-                            &tool,
-                            transcript_source,
-                            repo_work_dir.as_deref(),
-                        )
-                    {
-                        tracing::warn!(session_id = %session_id, error = %e, "failed to ensure session exists");
-                    }
-
                     worker.notify_checkpoint(
                         session_id,
                         tool,
                         trace_id,
                         tool_use_id,
-                        transcript_source.path.clone(),
+                        stream_source.path.clone(),
                         repo_work_dir,
+                        stream_source.external_session_id.clone(),
+                        stream_source.external_parent_session_id.clone(),
                     );
                 }
 
@@ -7838,69 +7916,6 @@ impl ActorDaemonCoordinator {
         }
     }
 
-    fn ensure_session_exists(
-        db: &crate::transcripts::db::TranscriptsDatabase,
-        session_id: &str,
-        tool: &str,
-        transcript_source: &crate::commands::checkpoint_agent::presets::TranscriptSource,
-        repo_work_dir: Option<&std::path::Path>,
-    ) -> Result<(), String> {
-        // Check if session exists
-        if db
-            .get_session(session_id)
-            .map_err(|e| e.to_string())?
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        // Create new session record
-        let now = chrono::Utc::now().timestamp();
-
-        let watermark_type = transcript_source.format.watermark_type();
-
-        let initial_watermark = match watermark_type {
-            crate::transcripts::watermark::WatermarkType::ByteOffset => {
-                Box::new(crate::transcripts::watermark::ByteOffsetWatermark::new(0))
-                    as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::RecordIndex => {
-                Box::new(crate::transcripts::watermark::RecordIndexWatermark::new(0))
-                    as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::Timestamp => {
-                Box::new(crate::transcripts::watermark::TimestampWatermark::new(
-                    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-                )) as Box<dyn crate::transcripts::watermark::WatermarkStrategy>
-            }
-            crate::transcripts::watermark::WatermarkType::Hybrid => Box::new(
-                crate::transcripts::watermark::HybridWatermark::new(0, 0, None),
-            )
-                as Box<dyn crate::transcripts::watermark::WatermarkStrategy>,
-        };
-
-        let record = crate::transcripts::db::SessionRecord {
-            session_id: session_id.to_string(),
-            tool: tool.to_string(),
-            transcript_path: transcript_source.path.display().to_string(),
-            transcript_format: format!("{:?}", transcript_source.format),
-            watermark_type: format!("{:?}", watermark_type),
-            watermark_value: initial_watermark.serialize(),
-            external_session_id: transcript_source.external_session_id.clone(),
-            external_parent_session_id: transcript_source.external_parent_session_id.clone(),
-            first_seen_at: now,
-            last_processed_at: 0,
-            last_known_size: 0,
-            last_modified: None,
-            processing_errors: 0,
-            last_error: None,
-            repo_work_dir: repo_work_dir.map(|p| p.display().to_string()),
-        };
-
-        db.insert_session(&record).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     fn store_wrapper_state(
         &self,
         invocation_id: &str,
@@ -8042,6 +8057,7 @@ fn control_listener_loop_actor(
     #[cfg(windows)]
     {
         let mut workers = Vec::new();
+        let worker_count = windows_control_pipe_worker_count();
         let first_connecting = windows_pipe_connecting_server(&control_socket_path, true)?;
         {
             let path = control_socket_path.clone();
@@ -8057,7 +8073,7 @@ fn control_listener_loop_actor(
                 result
             }));
         }
-        for _ in 1..WINDOWS_CONTROL_PIPE_WORKERS {
+        for _ in 1..worker_count {
             let path = control_socket_path.clone();
             let coord = coordinator.clone();
             let handle = runtime_handle.clone();
@@ -8077,7 +8093,7 @@ fn control_listener_loop_actor(
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        wake_windows_pipe_workers(&control_socket_path, WINDOWS_CONTROL_PIPE_WORKERS);
+        wake_windows_pipe_workers(&control_socket_path, worker_count);
 
         for worker in workers {
             let result = worker
@@ -8109,6 +8125,19 @@ fn windows_pipe_connecting_server(
 }
 
 #[cfg(windows)]
+fn windows_control_pipe_worker_count() -> usize {
+    #[cfg(feature = "test-support")]
+    if let Ok(raw) = std::env::var("GIT_AI_TEST_WINDOWS_CONTROL_PIPE_WORKERS")
+        && let Ok(count) = raw.parse::<usize>()
+        && count > 0
+    {
+        return count;
+    }
+
+    WINDOWS_CONTROL_PIPE_WORKERS
+}
+
+#[cfg(windows)]
 fn wake_windows_pipe_workers(pipe_path: &Path, worker_count: usize) {
     for _ in 0..worker_count {
         let _ = WindowsPipeClient::connect_ms(pipe_path.as_os_str(), 100);
@@ -8123,7 +8152,7 @@ fn windows_control_pipe_worker_loop(
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), GitAiError> {
     loop {
-        let mut server = connecting.wait().map_err(|e| {
+        let server = connecting.wait().map_err(|e| {
             GitAiError::Generic(format!(
                 "failed accepting control pipe {}: {}",
                 control_socket_path.display(),
@@ -8136,27 +8165,37 @@ fn windows_control_pipe_worker_loop(
             break;
         }
 
-        {
-            let mut reader = BufReader::new(&mut server);
-            if let Err(e) = handle_control_connection_actor_reader(
-                &mut reader,
-                coordinator.clone(),
-                runtime_handle.clone(),
-            ) {
-                tracing::debug!(%e, "control connection error");
-            }
-        }
+        connecting = windows_pipe_connecting_server(&control_socket_path, false)?;
 
-        connecting = server.disconnect().map_err(|e| {
-            GitAiError::Generic(format!(
-                "failed recycling control pipe {}: {}",
-                control_socket_path.display(),
-                e
-            ))
-        })?;
+        let coord = coordinator.clone();
+        let handle = runtime_handle.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                handle_windows_control_pipe_connection(server, coord, handle);
+            })
+            .map_err(|e| {
+                GitAiError::Generic(format!(
+                    "failed spawning control pipe handler for {}: {}",
+                    control_socket_path.display(),
+                    e
+                ))
+            })?;
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn handle_windows_control_pipe_connection(
+    mut server: WindowsPipeServer,
+    coordinator: Arc<ActorDaemonCoordinator>,
+    runtime_handle: tokio::runtime::Handle,
+) {
+    let mut reader = BufReader::new(&mut server);
+    if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
+    {
+        tracing::debug!(%e, "control connection error");
+    }
 }
 
 #[cfg(not(windows))]
@@ -8723,18 +8762,20 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
         .get_feature_flags()
         .transcript_streaming
     {
-        let transcripts_db_path = config.internal_dir.join("transcripts-db");
-        match crate::transcripts::db::TranscriptsDatabase::open(&transcripts_db_path) {
-            Ok(transcripts_db) => {
-                let transcripts_db = std::sync::Arc::new(transcripts_db);
+        // Named "transcripts-db" for backwards compatibility with existing installations.
+        // TODO: rename to "streams-db" with a migration that moves the file.
+        let streams_db_path = config.internal_dir.join("transcripts-db");
+        match crate::streams::db::StreamsDatabase::open(&streams_db_path) {
+            Ok(streams_db) => {
+                let streams_db = std::sync::Arc::new(streams_db);
                 let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-                let transcript_handle = crate::daemon::transcript_worker::spawn_transcript_worker(
-                    transcripts_db.clone(),
+                let transcript_handle = crate::daemon::stream_worker::spawn_stream_worker(
+                    streams_db.clone(),
                     telemetry_handle.clone(),
                     shutdown_notify.clone(),
                 );
-                coordinator_inner.transcripts_db = Some(transcripts_db);
-                coordinator_inner.transcript_worker = Some(transcript_handle);
+                coordinator_inner.streams_db = Some(streams_db);
+                coordinator_inner.stream_worker = Some(transcript_handle);
                 let _ = coordinator_inner
                     .transcript_shutdown_notify
                     .set(shutdown_notify);
@@ -9135,7 +9176,7 @@ pub fn send_control_request_fire_and_forget(
 }
 
 #[cfg(test)]
-mod transcript_worker_tests;
+mod stream_worker_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9205,10 +9246,54 @@ mod tests {
                     base_commit: BaseCommit::Initial,
                 }],
                 path_role: PreparedPathRole::WillEdit,
-                transcript_source: None,
+                stream_source: None,
                 metadata: std::collections::HashMap::new(),
             }),
         }
+    }
+
+    #[test]
+    fn human_replay_checkpoint_request_has_no_agent_identity() {
+        let request = build_human_replay_checkpoint_request(
+            "/repo",
+            vec!["src/main.rs".to_string()],
+            HashMap::from([("src/main.rs".to_string(), "fn main() {}\n".to_string())]),
+        );
+
+        assert_eq!(request.checkpoint_kind, CheckpointKind::Human);
+        assert_eq!(request.agent_id, None);
+        assert_eq!(request.path_role, PreparedPathRole::WillEdit);
+        assert_eq!(request.files.len(), 1);
+        assert_eq!(
+            request.files[0].path,
+            std::path::PathBuf::from("src/main.rs")
+        );
+        assert_eq!(request.files[0].content.as_deref(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn ai_replay_checkpoint_request_preserves_active_bash_agent_identity() {
+        let agent_id = AgentId {
+            tool: "claude".to_string(),
+            id: "session-123".to_string(),
+            model: "opus-4".to_string(),
+        };
+        let metadata = HashMap::from([("edit_kind".to_string(), "bash".to_string())]);
+
+        let request = build_replay_checkpoint_request(
+            "/repo",
+            vec!["src/main.rs".to_string()],
+            HashMap::from([("src/main.rs".to_string(), "fn main() {}\n".to_string())]),
+            CheckpointKind::AiAgent,
+            Some(agent_id.clone()),
+            PreparedPathRole::Edited,
+            metadata.clone(),
+        );
+
+        assert_eq!(request.checkpoint_kind, CheckpointKind::AiAgent);
+        assert_eq!(request.agent_id, Some(agent_id));
+        assert_eq!(request.path_role, PreparedPathRole::Edited);
+        assert_eq!(request.metadata, metadata);
     }
 
     #[test]
@@ -9224,6 +9309,45 @@ mod tests {
         assert_eq!(
             checkpoint_control_response_timeout(&sample_checkpoint_request(), false),
             DAEMON_CONTROL_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn transcript_sweep_triggers_for_commit_amend_and_push_events() {
+        use crate::daemon::domain::SemanticEvent;
+        use crate::daemon::stream_worker::SweepTrigger;
+
+        assert_eq!(
+            transcript_sweep_triggers_for_events(&[SemanticEvent::CommitCreated {
+                base: Some("base".to_string()),
+                new_head: "new".to_string(),
+            }]),
+            vec![SweepTrigger::PostCommit]
+        );
+        assert_eq!(
+            transcript_sweep_triggers_for_events(&[SemanticEvent::CommitAmended {
+                old_head: "old".to_string(),
+                new_head: "new".to_string(),
+            }]),
+            vec![SweepTrigger::PostCommit]
+        );
+        assert_eq!(
+            transcript_sweep_triggers_for_events(&[SemanticEvent::PushCompleted {
+                remote: Some("origin".to_string()),
+            }]),
+            vec![SweepTrigger::PostPush]
+        );
+        assert_eq!(
+            transcript_sweep_triggers_for_events(&[
+                SemanticEvent::CommitCreated {
+                    base: Some("base".to_string()),
+                    new_head: "new".to_string(),
+                },
+                SemanticEvent::PushCompleted {
+                    remote: Some("origin".to_string()),
+                },
+            ]),
+            vec![SweepTrigger::PostCommit, SweepTrigger::PostPush]
         );
     }
 

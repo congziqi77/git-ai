@@ -17,7 +17,7 @@ use regex::Regex;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(windows)]
@@ -914,7 +914,7 @@ impl<'a> Iterator for References<'a> {
     }
 }
 
-/// The effective git author identity (name + email) for the current repository.
+/// A Git identity (name + email) for the current repository.
 ///
 /// Resolved via `git var GIT_COMMITTER_IDENT` which respects the full git precedence
 /// chain (env vars > config > system defaults), unlike a raw `git config user.name`
@@ -927,6 +927,14 @@ pub struct GitAuthorIdentity {
 }
 
 impl GitAuthorIdentity {
+    /// Apply git-ai's optional author config as a partial override.
+    pub fn with_author_config(&self, author: &config::AuthorConfig) -> Self {
+        GitAuthorIdentity {
+            name: author.name.clone().or_else(|| self.name.clone()),
+            email: author.email.clone().or_else(|| self.email.clone()),
+        }
+    }
+
     /// Format as `"Name <email>"`, `"Name"`, `"<email>"`, or `None`.
     pub fn formatted(&self) -> Option<String> {
         match (&self.name, &self.email) {
@@ -941,6 +949,19 @@ impl GitAuthorIdentity {
     pub fn formatted_or_unknown(&self) -> String {
         self.formatted().unwrap_or_else(|| "unknown".to_string())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GitIdentityResolution {
+    pub raw_git_var: Option<String>,
+    pub identity: GitAuthorIdentity,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GitConfigIdentityResolution {
+    pub raw_name: Option<String>,
+    pub raw_email: Option<String>,
+    pub identity: GitAuthorIdentity,
 }
 
 /// Parse `git var GIT_COMMITTER_IDENT` output into name and email.
@@ -981,6 +1002,74 @@ pub fn parse_git_var_identity(output: &str) -> GitAuthorIdentity {
                 email: None,
             }
         }
+    }
+}
+
+pub fn global_git_config_committer_identity() -> Result<GitAuthorIdentity, GitAiError> {
+    Ok(global_git_config_identity_resolution()?.identity)
+}
+
+pub fn global_git_config_identity_resolution() -> Result<GitConfigIdentityResolution, GitAiError> {
+    let config =
+        gix_config::File::from_globals().map_err(|e| GitAiError::GixError(e.to_string()))?;
+    Ok(git_config_identity_resolution_from_config(&config))
+}
+
+pub fn current_git_committer_identity_resolution() -> GitIdentityResolution {
+    resolve_git_var_identity_with_args(Vec::new(), "GIT_COMMITTER_IDENT", || {
+        global_git_config_committer_identity().unwrap_or_default()
+    })
+}
+
+fn git_config_identity_resolution_from_config(
+    config: &gix_config::File<'_>,
+) -> GitConfigIdentityResolution {
+    let raw_name = config.string("user.name").map(|cow| cow.to_string());
+    let raw_email = config.string("user.email").map(|cow| cow.to_string());
+    let name = raw_name
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+    let email = raw_email
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+
+    GitConfigIdentityResolution {
+        raw_name,
+        raw_email,
+        identity: GitAuthorIdentity { name, email },
+    }
+}
+
+fn resolve_git_var_identity_with_args<F>(
+    mut args: Vec<String>,
+    git_var: &str,
+    fallback_identity: F,
+) -> GitIdentityResolution
+where
+    F: FnOnce() -> GitAuthorIdentity,
+{
+    args.push("var".to_string());
+    args.push(git_var.to_string());
+
+    if let Ok(output) = exec_git(&args)
+        && let Ok(stdout) = String::from_utf8(output.stdout)
+    {
+        let identity = parse_git_var_identity(&stdout);
+        if identity.name.is_some() || identity.email.is_some() {
+            return GitIdentityResolution {
+                raw_git_var: Some(stdout.trim().to_string()),
+                identity,
+            };
+        }
+    }
+
+    GitIdentityResolution {
+        raw_git_var: None,
+        identity: fallback_identity(),
     }
 }
 
@@ -1268,7 +1357,7 @@ impl Repository {
             .map(|cfg| cfg.string(key).map(|cow| cow.to_string()))
     }
 
-    /// Get the effective git user identity for this repository.
+    /// Get the effective raw Git user identity for this repository.
     ///
     /// Uses `git var GIT_COMMITTER_IDENT` which respects the full git identity precedence:
     /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars > `user.name`/`user.email` config >
@@ -1277,11 +1366,24 @@ impl Repository {
     /// Falls back to `git config user.name` / `user.email` if `git var` fails.
     /// The result is cached per Repository instance for performance.
     ///
-    /// Use this for "who is the current user" lookups (blame, status, prompts, etc.).
-    /// For commit authorship specifically, use [`Self::git_commit_author_identity`] instead.
+    /// For git-ai authorship metadata, use [`Self::effective_author_identity`] so the
+    /// git-ai author config can override this raw Git identity.
     pub fn git_author_identity(&self) -> &GitAuthorIdentity {
         self.cached_author_identity
             .get_or_init(|| self.resolve_git_var_identity("GIT_COMMITTER_IDENT"))
+    }
+
+    pub fn git_author_identity_resolution(&self) -> GitIdentityResolution {
+        self.resolve_git_var_identity_resolution("GIT_COMMITTER_IDENT")
+    }
+
+    /// Get the git-ai effective author identity for metadata and display.
+    ///
+    /// This starts from Git's effective committer identity, then overlays any
+    /// configured `author.name` and/or `author.email` from git-ai config.
+    pub fn effective_author_identity(&self) -> GitAuthorIdentity {
+        self.git_author_identity()
+            .with_author_config(&config::Config::fresh_author_cached())
     }
 
     /// Get the effective git commit author identity for this repository.
@@ -1300,34 +1402,16 @@ impl Repository {
 
     /// Internal: resolve git identity via the specified `git var` variable.
     fn resolve_git_var_identity(&self, git_var: &str) -> GitAuthorIdentity {
-        let mut args = self.global_args_for_exec();
-        args.push("var".to_string());
-        args.push(git_var.to_string());
+        self.resolve_git_var_identity_resolution(git_var).identity
+    }
 
-        if let Ok(output) = exec_git(&args)
-            && let Ok(stdout) = String::from_utf8(output.stdout)
-        {
-            let identity = parse_git_var_identity(&stdout);
-            if identity.name.is_some() || identity.email.is_some() {
-                return identity;
-            }
-        }
-
-        // Fall back to git config user.name / user.email
-        let name = self
-            .config_get_str("user.name")
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
-        let email = self
-            .config_get_str("user.email")
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
-
-        GitAuthorIdentity { name, email }
+    fn resolve_git_var_identity_resolution(&self, git_var: &str) -> GitIdentityResolution {
+        resolve_git_var_identity_with_args(self.global_args_for_exec(), git_var, || {
+            self.get_git_config_file()
+                .ok()
+                .map(|config| git_config_identity_resolution_from_config(&config).identity)
+                .unwrap_or_default()
+        })
     }
 
     /// Get all config values matching a regex pattern.
@@ -2633,6 +2717,60 @@ pub fn exec_git_allow_nonzero_with_profile(
     cmd.output().map_err(GitAiError::IoError)
 }
 
+/// Spawn a git command with stdout piped and stderr inherited.
+///
+/// This is used by streaming consumers that cannot call `exec_git*` without
+/// buffering all stdout in memory.
+pub fn spawn_git_stdout(args: &[String]) -> Result<Child, GitAiError> {
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    cmd.env_remove("GIT_EXTERNAL_DIFF");
+    cmd.env_remove("GIT_DIFF_OPTS");
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    cmd.spawn().map_err(GitAiError::IoError)
+}
+
+/// Spawn a git command with stdin/stdout/stderr inherited from git-ai.
+///
+/// This is used when a command intentionally delegates rendering and paging
+/// behavior to git instead of consuming output internally.
+pub fn spawn_git_passthrough(args: &[String]) -> Result<Child, GitAiError> {
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    cmd.env_remove("GIT_EXTERNAL_DIFF");
+    cmd.env_remove("GIT_DIFF_OPTS");
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    cmd.spawn().map_err(GitAiError::IoError)
+}
+
 /// Helper to execute a git command with an explicit internal profile.
 pub fn exec_git_with_profile(
     args: &[String],
@@ -2938,6 +3076,58 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<u32>, bool, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_config_overlays_full_identity() {
+        let git_identity = GitAuthorIdentity {
+            name: Some("Git User".to_string()),
+            email: Some("git@example.com".to_string()),
+        };
+        let author = config::AuthorConfig {
+            name: Some("Config User".to_string()),
+            email: Some("config@example.com".to_string()),
+        };
+
+        assert_eq!(
+            git_identity
+                .with_author_config(&author)
+                .formatted()
+                .as_deref(),
+            Some("Config User <config@example.com>")
+        );
+    }
+
+    #[test]
+    fn author_config_supports_partial_overrides() {
+        let git_identity = GitAuthorIdentity {
+            name: Some("Git User".to_string()),
+            email: Some("git@example.com".to_string()),
+        };
+
+        let name_only = config::AuthorConfig {
+            name: Some("Config User".to_string()),
+            email: None,
+        };
+        assert_eq!(
+            git_identity
+                .with_author_config(&name_only)
+                .formatted()
+                .as_deref(),
+            Some("Config User <git@example.com>")
+        );
+
+        let email_only = config::AuthorConfig {
+            name: None,
+            email: Some("config@example.com".to_string()),
+        };
+        assert_eq!(
+            git_identity
+                .with_author_config(&email_only)
+                .formatted()
+                .as_deref(),
+            Some("Git User <config@example.com>")
+        );
+    }
 
     #[test]
     fn test_parse_git_version_standard() {

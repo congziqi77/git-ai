@@ -191,6 +191,12 @@ fn execute_resolved_checkpoint(
     resolved: ResolvedCheckpointExecution,
     checkpoint_start: Instant,
 ) -> Result<(usize, usize, usize), GitAiError> {
+    if kind.is_ai() && checkpoint_request.agent_id.is_none() {
+        return Err(GitAiError::Generic(
+            "AI checkpoint is missing agent_id".to_string(),
+        ));
+    }
+
     let mut working_log = repo
         .storage
         .working_log_for_base_commit(&resolved.base_commit)?;

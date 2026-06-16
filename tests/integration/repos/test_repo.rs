@@ -371,7 +371,7 @@ impl DaemonProcess {
             .arg(repo_path)
             .arg("-c")
             .arg(format!("core.hooksPath={}", null_hooks))
-            .args(["notes", "--ref=ai", "list"])
+            .args(["config", "--local", "git-ai.test-readiness-probe", "1"])
             .env(
                 "GIT_TRACE2_EVENT",
                 DaemonConfig::trace2_event_target_for_path(&self.trace_socket_path),
@@ -380,14 +380,11 @@ impl DaemonProcess {
         configure_test_home_env(&mut command, &self.daemon_home);
 
         let output = command.output().map_err(|error| {
-            format!(
-                "failed to run daemon readiness probe git notes list: {}",
-                error
-            )
+            format!("failed to run daemon readiness probe git config: {}", error)
         })?;
         if !output.status.success() {
             return Err(format!(
-                "daemon readiness probe git notes list failed:\nstdout: {}\nstderr: {}",
+                "daemon readiness probe git config failed:\nstdout: {}\nstderr: {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
@@ -1038,6 +1035,12 @@ impl TestRepo {
             config.insert(
                 "custom_attributes".to_string(),
                 serde_json::Value::Object(attrs_map),
+            );
+        }
+        if let Some(author) = &patch.author {
+            config.insert(
+                "author".to_string(),
+                serde_json::to_value(author).expect("failed to serialize test author config"),
             );
         }
         if let Some(feature_flags) = &patch.feature_flags {

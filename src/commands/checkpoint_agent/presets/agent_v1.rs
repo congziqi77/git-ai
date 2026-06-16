@@ -103,7 +103,7 @@ impl AgentPreset for AgentV1Preset {
                     },
                     file_paths,
                     dirty_files: dirty,
-                    transcript_source: None,
+                    stream_source: None,
                     tool_use_id: None,
                 })
             }
@@ -170,7 +170,7 @@ mod tests {
                     e.file_paths,
                     vec![PathBuf::from("/home/user/project/src/lib.rs")]
                 );
-                assert!(e.transcript_source.is_none());
+                assert!(e.stream_source.is_none());
             }
             _ => panic!("Expected PostFileEdit"),
         }

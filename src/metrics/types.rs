@@ -21,6 +21,7 @@ pub enum MetricEventId {
     InstallHooks = 3,
     Checkpoint = 4,
     SessionEvent = 5,
+    OtelTrace = 6,
 }
 
 /// Trait for event-specific values.

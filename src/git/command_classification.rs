@@ -44,6 +44,8 @@ pub fn is_definitely_read_only_command(command: &str) -> bool {
 /// - `git stash pop` / `git stash apply` are not
 /// - `git worktree list` is read-only
 /// - `git worktree add` / `git worktree remove` are not
+/// - `git notes show` / `git notes list` / `git notes get-ref` are read-only
+/// - `git notes add` / `git notes append` / `git notes remove` are not
 ///
 /// IDEs like Zed issue thousands of `stash list` and `worktree list` calls
 /// per minute for their git panel UI. These must be identified as read-only
@@ -53,6 +55,7 @@ pub fn is_definitely_read_only_invocation(command: &str, subcommand: Option<&str
         return true;
     }
     match command {
+        "notes" => matches!(subcommand, Some("show" | "list" | "get-ref")),
         "stash" => matches!(subcommand, Some("list" | "show")),
         "worktree" => matches!(subcommand, Some("list")),
         _ => false,
@@ -146,6 +149,32 @@ mod tests {
             Some("prune")
         ));
         assert!(!is_definitely_read_only_invocation("worktree", None));
+    }
+
+    #[test]
+    fn notes_read_only_subcommands_are_read_only_invocations() {
+        assert!(is_definitely_read_only_invocation("notes", Some("show")));
+        assert!(is_definitely_read_only_invocation("notes", Some("list")));
+        assert!(is_definitely_read_only_invocation("notes", Some("get-ref")));
+    }
+
+    #[test]
+    fn notes_mutating_subcommands_are_not_read_only_invocations() {
+        for subcommand in &[
+            None,
+            Some("add"),
+            Some("append"),
+            Some("copy"),
+            Some("edit"),
+            Some("merge"),
+            Some("prune"),
+            Some("remove"),
+        ] {
+            assert!(
+                !is_definitely_read_only_invocation("notes", *subcommand),
+                "git notes {subcommand:?} should not be read-only"
+            );
+        }
     }
 
     #[test]
