@@ -1,0 +1,28 @@
+Cargo.toml
+  s_2d7c331c6309b4::t_088b034407adc8 3
+flake.nix
+  s_2d7c331c6309b4::t_088b034407adc8 39
+Cargo.lock
+  ai_agent 1022
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.71-ep",
+  "base_commit_sha": "1291ca5ce216a4613d8d2a5a159fb09d52a6124c",
+  "prompts": {},
+  "humans": {
+    "h_ad404ca4b5c06a": {
+      "author": "congziqi <congziqi@lixiang.com>"
+    }
+  },
+  "sessions": {
+    "s_2d7c331c6309b4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f1754-48ca-7421-b313-808e00841b0f",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
