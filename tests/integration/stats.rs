@@ -21,6 +21,59 @@ fn stats_from_args(repo: &TestRepo, args: &[&str]) -> CommitStats {
     serde_json::from_str(&json).expect("valid stats json")
 }
 
+fn stats_json_from_args(repo: &TestRepo, args: &[&str]) -> serde_json::Value {
+    let raw = repo.git_ai(args).expect("git-ai stats should succeed");
+    serde_json::from_str(&extract_json_object(&raw)).expect("valid stats json")
+}
+
+#[test]
+fn test_stats_json_includes_file_stats() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "base.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
+        .unwrap();
+    fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
+        .unwrap();
+    fs::write(repo.path().join("src/human.rs"), "human\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "src/human.rs"])
+        .unwrap();
+    fs::write(repo.path().join("src/unknown.rs"), "unknown\n").unwrap();
+    repo.stage_all_and_commit("mixed files").unwrap();
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    assert_eq!(json["file_stats"]["src/ai.rs"]["ai_accepted"], 2);
+    assert_eq!(
+        json["file_stats"]["src/human.rs"]["unknown_additions"],
+        0
+    );
+    assert_eq!(
+        json["file_stats"]["src/unknown.rs"]["unknown_additions"],
+        1
+    );
+    assert!(json.get("summary").is_none());
+}
+
+#[test]
+fn test_status_json_does_not_include_file_stats() {
+    let repo = TestRepo::new();
+    repo.filename("README.md")
+        .set_contents(crate::lines!["base"]);
+    repo.stage_all_and_commit("base").unwrap();
+    let raw = repo.git_ai(&["status", "--json"]).unwrap();
+    let json = extract_json_object(&raw);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["stats"]
+            .get("file_stats")
+            .is_none()
+    );
+}
+
 fn run_git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)

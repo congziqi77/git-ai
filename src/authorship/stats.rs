@@ -89,12 +89,12 @@ pub fn stats_command(
         refname
     );
 
-    let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
-
     if json {
+        let stats = stats_for_commit_detailed(repo, &target, ignore_patterns)?;
         let json_str = serde_json::to_string(&stats)?;
         println!("{}", json_str);
     } else {
+        let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
         write_stats_to_terminal(&stats, true);
     }
 
