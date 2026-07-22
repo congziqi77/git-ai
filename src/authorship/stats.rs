@@ -531,44 +531,22 @@ fn accepted_counts_from_attestations(
         return counts;
     };
 
-    let mut human_lines_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
-    for file_attestation in &log.attestations {
+    let mut claimed_lines_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
+    for file_attestation in log.attestations.iter().rev() {
         let Some(added_lines) = added_lines_by_file.get(&file_attestation.file_path) else {
             continue;
         };
-
-        let human_lines = human_lines_by_file
-            .entry(file_attestation.file_path.clone())
-            .or_default();
-        for entry in file_attestation
-            .entries
-            .iter()
-            .filter(|entry| entry.hash.starts_with("h_"))
-        {
-            for line_range in &entry.line_ranges {
-                for line in overlapping_added_lines(line_range, added_lines) {
-                    human_lines.insert(*line);
-                }
-            }
-        }
-    }
-
-    let mut ai_lines_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
-    for file_attestation in &log.attestations {
-        let Some(added_lines) = added_lines_by_file.get(&file_attestation.file_path) else {
-            continue;
-        };
-        let human_lines = human_lines_by_file.get(&file_attestation.file_path);
-        let ai_lines = ai_lines_by_file
+        let claimed_lines = claimed_lines_by_file
             .entry(file_attestation.file_path.clone())
             .or_default();
 
-        for entry in file_attestation
-            .entries
-            .iter()
-            .filter(|entry| !entry.hash.starts_with("h_"))
-        {
-            let tool_model = if entry.hash.starts_with("s_") {
+        // Match get_line_attribution: entries are oldest-to-newest, so the
+        // reverse traversal lets the latest attestation claim each line.
+        for entry in file_attestation.entries.iter().rev() {
+            let is_human = entry.hash.starts_with("h_");
+            let tool_model = if is_human {
+                None
+            } else if entry.hash.starts_with("s_") {
                 let session_key = entry.hash.split("::").next().unwrap_or(&entry.hash);
                 log.metadata
                     .sessions
@@ -591,38 +569,30 @@ fn accepted_counts_from_attestations(
             let mut accepted_for_entry = 0u32;
             for line_range in &entry.line_ranges {
                 for line in overlapping_added_lines(line_range, added_lines) {
-                    if !human_lines.is_some_and(|lines| lines.contains(line))
-                        && ai_lines.insert(*line)
-                    {
+                    if claimed_lines.insert(*line) {
                         accepted_for_entry += 1;
                     }
                 }
             }
-            if let Some(tool_model) = tool_model
-                && accepted_for_entry > 0
-            {
+            if accepted_for_entry == 0 {
+                continue;
+            }
+
+            let file_counts = counts
+                .by_file
+                .entry(file_attestation.file_path.clone())
+                .or_default();
+            if is_human {
+                counts.known_human_accepted += accepted_for_entry;
+                file_counts.known_human_accepted += accepted_for_entry;
+                continue;
+            }
+
+            counts.ai_accepted += accepted_for_entry;
+            file_counts.ai_accepted += accepted_for_entry;
+            if let Some(tool_model) = tool_model {
                 *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted_for_entry;
             }
-        }
-    }
-
-    for file_path in added_lines_by_file.keys() {
-        let known_human_accepted = human_lines_by_file
-            .get(file_path)
-            .map_or(0, |lines| lines.len() as u32);
-        let ai_accepted = ai_lines_by_file
-            .get(file_path)
-            .map_or(0, |lines| lines.len() as u32);
-        counts.known_human_accepted += known_human_accepted;
-        counts.ai_accepted += ai_accepted;
-        if known_human_accepted > 0 || ai_accepted > 0 {
-            counts.by_file.insert(
-                file_path.clone(),
-                FileAcceptedCounts {
-                    ai_accepted,
-                    known_human_accepted,
-                },
-            );
         }
     }
 
@@ -808,22 +778,67 @@ mod tests {
 
     #[test]
     fn detailed_stats_classify_overlapping_attestations_once() {
+        use crate::authorship::authorship_log::PromptRecord;
         use crate::authorship::authorship_log_serialization::{
             AttestationEntry, AuthorshipLog, FileAttestation,
         };
+        use crate::authorship::working_log::AgentId;
         use crate::commands::diff::DiffHunk;
 
         let mut log = AuthorshipLog::new();
-        let mut file = FileAttestation::new("a.rs".to_string());
-        file.add_entry(AttestationEntry::new(
-            "ai_one".to_string(),
+        let prompt = |tool: &str| PromptRecord {
+            agent_id: AgentId {
+                tool: tool.to_string(),
+                id: format!("{tool}_session"),
+                model: "model".to_string(),
+            },
+            human_author: None,
+            messages_url: None,
+            total_additions: 1,
+            total_deletions: 0,
+            accepted_lines: 1,
+            overriden_lines: 0,
+            custom_attributes: None,
+        };
+        log.metadata
+            .prompts
+            .insert("ai_old".to_string(), prompt("old"));
+        log.metadata
+            .prompts
+            .insert("ai_new".to_string(), prompt("new"));
+
+        let mut latest_human = FileAttestation::new("latest_human.rs".to_string());
+        latest_human.add_entry(AttestationEntry::new(
+            "ai_old".to_string(),
             vec![LineRange::Single(1)],
         ));
-        file.add_entry(AttestationEntry::new(
-            "ai_two".to_string(),
+        latest_human.add_entry(AttestationEntry::new(
+            "h_new".to_string(),
             vec![LineRange::Single(1)],
         ));
-        log.attestations.push(file);
+        log.attestations.push(latest_human);
+
+        let mut latest_ai = FileAttestation::new("latest_ai.rs".to_string());
+        latest_ai.add_entry(AttestationEntry::new(
+            "h_old".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        latest_ai.add_entry(AttestationEntry::new(
+            "ai_new".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        log.attestations.push(latest_ai);
+
+        let mut latest_ai_tool = FileAttestation::new("latest_ai_tool.rs".to_string());
+        latest_ai_tool.add_entry(AttestationEntry::new(
+            "ai_old".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        latest_ai_tool.add_entry(AttestationEntry::new(
+            "ai_new".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        log.attestations.push(latest_ai_tool);
 
         let hunk = |file_path: &str| DiffHunk {
             file_path: file_path.to_string(),
@@ -839,15 +854,25 @@ mod tests {
         };
         let detailed = detailed_stats_from_hunks_with_merge_flag(
             &[],
-            &[hunk("a.rs"), hunk("b.rs")],
+            &[
+                hunk("latest_human.rs"),
+                hunk("latest_ai.rs"),
+                hunk("latest_ai_tool.rs"),
+                hunk("unknown.rs"),
+            ],
             Some(&log),
             false,
         );
 
-        assert_eq!(detailed.ai_accepted, 1);
+        assert_eq!(detailed.ai_accepted, 2);
+        assert_eq!(detailed.human_additions, 1);
         assert_eq!(detailed.unknown_additions, 1);
-        assert_eq!(detailed.file_stats["a.rs"].ai_accepted, 1);
-        assert_eq!(detailed.file_stats["b.rs"].unknown_additions, 1);
+        assert_eq!(detailed.file_stats["latest_human.rs"].ai_accepted, 0);
+        assert_eq!(detailed.file_stats["latest_ai.rs"].ai_accepted, 1);
+        assert_eq!(detailed.file_stats["latest_ai_tool.rs"].ai_accepted, 1);
+        assert_eq!(detailed.file_stats["unknown.rs"].unknown_additions, 1);
+        assert_eq!(detailed.tool_model_breakdown["new::model"].ai_accepted, 2);
+        assert!(detailed.tool_model_breakdown.get("old::model").is_none());
         assert_eq!(
             detailed.unknown_additions,
             detailed
