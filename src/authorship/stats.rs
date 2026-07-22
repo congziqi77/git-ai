@@ -4,7 +4,7 @@ use crate::error::GitAiError;
 use crate::git::notes_api::read_authorship;
 use crate::git::repository::Repository;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolModelHeadlineStats {
@@ -531,68 +531,116 @@ fn accepted_counts_from_attestations(
         return counts;
     };
 
+    let mut human_lines_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
     for file_attestation in &log.attestations {
         let Some(added_lines) = added_lines_by_file.get(&file_attestation.file_path) else {
             continue;
         };
 
-        for entry in &file_attestation.entries {
-            // KnownHuman entries (h_ prefix): count as known-human-attested lines.
-            if entry.hash.starts_with("h_") {
-                let accepted = entry
-                    .line_ranges
-                    .iter()
-                    .map(|line_range| line_range_overlap_len(line_range, added_lines))
-                    .sum::<u32>();
-                if accepted > 0 {
-                    counts.known_human_accepted += accepted;
-                    counts
-                        .by_file
-                        .entry(file_attestation.file_path.clone())
-                        .or_default()
-                        .known_human_accepted += accepted;
+        let human_lines = human_lines_by_file
+            .entry(file_attestation.file_path.clone())
+            .or_default();
+        for entry in file_attestation
+            .entries
+            .iter()
+            .filter(|entry| entry.hash.starts_with("h_"))
+        {
+            for line_range in &entry.line_ranges {
+                for line in overlapping_added_lines(line_range, added_lines) {
+                    human_lines.insert(*line);
                 }
-                continue;
-            }
-
-            let accepted = entry
-                .line_ranges
-                .iter()
-                .map(|line_range| line_range_overlap_len(line_range, added_lines))
-                .sum::<u32>();
-
-            if accepted == 0 {
-                continue;
-            }
-
-            counts.ai_accepted += accepted;
-            counts
-                .by_file
-                .entry(file_attestation.file_path.clone())
-                .or_default()
-                .ai_accepted += accepted;
-
-            // Session entries (s_ prefix): look up in sessions map
-            if entry.hash.starts_with("s_") {
-                let session_key = entry.hash.split("::").next().unwrap_or(&entry.hash);
-                if let Some(session_record) = log.metadata.sessions.get(session_key) {
-                    let tool_model = format!(
-                        "{}::{}",
-                        session_record.agent_id.tool, session_record.agent_id.model
-                    );
-                    *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted;
-                }
-            } else if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {
-                let tool_model = format!(
-                    "{}::{}",
-                    prompt_record.agent_id.tool, prompt_record.agent_id.model
-                );
-                *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted;
             }
         }
     }
 
+    let mut ai_lines_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
+    for file_attestation in &log.attestations {
+        let Some(added_lines) = added_lines_by_file.get(&file_attestation.file_path) else {
+            continue;
+        };
+        let human_lines = human_lines_by_file.get(&file_attestation.file_path);
+        let ai_lines = ai_lines_by_file
+            .entry(file_attestation.file_path.clone())
+            .or_default();
+
+        for entry in file_attestation
+            .entries
+            .iter()
+            .filter(|entry| !entry.hash.starts_with("h_"))
+        {
+            let tool_model = if entry.hash.starts_with("s_") {
+                let session_key = entry.hash.split("::").next().unwrap_or(&entry.hash);
+                log.metadata
+                    .sessions
+                    .get(session_key)
+                    .map(|session_record| {
+                        format!(
+                            "{}::{}",
+                            session_record.agent_id.tool, session_record.agent_id.model
+                        )
+                    })
+            } else {
+                log.metadata.prompts.get(&entry.hash).map(|prompt_record| {
+                    format!(
+                        "{}::{}",
+                        prompt_record.agent_id.tool, prompt_record.agent_id.model
+                    )
+                })
+            };
+
+            let mut accepted_for_entry = 0u32;
+            for line_range in &entry.line_ranges {
+                for line in overlapping_added_lines(line_range, added_lines) {
+                    if !human_lines.is_some_and(|lines| lines.contains(line))
+                        && ai_lines.insert(*line)
+                    {
+                        accepted_for_entry += 1;
+                    }
+                }
+            }
+            if let Some(tool_model) = tool_model
+                && accepted_for_entry > 0
+            {
+                *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted_for_entry;
+            }
+        }
+    }
+
+    for file_path in added_lines_by_file.keys() {
+        let known_human_accepted = human_lines_by_file
+            .get(file_path)
+            .map_or(0, |lines| lines.len() as u32);
+        let ai_accepted = ai_lines_by_file
+            .get(file_path)
+            .map_or(0, |lines| lines.len() as u32);
+        counts.known_human_accepted += known_human_accepted;
+        counts.ai_accepted += ai_accepted;
+        if known_human_accepted > 0 || ai_accepted > 0 {
+            counts.by_file.insert(
+                file_path.clone(),
+                FileAcceptedCounts {
+                    ai_accepted,
+                    known_human_accepted,
+                },
+            );
+        }
+    }
+
     counts
+}
+
+fn overlapping_added_lines<'a>(range: &LineRange, added_lines: &'a [u32]) -> &'a [u32] {
+    match range {
+        LineRange::Single(line) => match added_lines.binary_search(line) {
+            Ok(index) => &added_lines[index..index + 1],
+            Err(_) => &added_lines[0..0],
+        },
+        LineRange::Range(start, end) => {
+            let start_idx = added_lines.partition_point(|line| *line < *start);
+            let end_idx = added_lines.partition_point(|line| *line <= *end);
+            &added_lines[start_idx..end_idx]
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -757,6 +805,58 @@ pub fn get_git_diff_stats(
 mod tests {
     use super::*;
     use insta::assert_debug_snapshot;
+
+    #[test]
+    fn detailed_stats_classify_overlapping_attestations_once() {
+        use crate::authorship::authorship_log_serialization::{
+            AttestationEntry, AuthorshipLog, FileAttestation,
+        };
+        use crate::commands::diff::DiffHunk;
+
+        let mut log = AuthorshipLog::new();
+        let mut file = FileAttestation::new("a.rs".to_string());
+        file.add_entry(AttestationEntry::new(
+            "ai_one".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        file.add_entry(AttestationEntry::new(
+            "ai_two".to_string(),
+            vec![LineRange::Single(1)],
+        ));
+        log.attestations.push(file);
+
+        let hunk = |file_path: &str| DiffHunk {
+            file_path: file_path.to_string(),
+            old_file_path: None,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            deleted_lines: Vec::new(),
+            added_lines: vec![1],
+            deleted_contents: Vec::new(),
+            added_contents: vec!["line".to_string()],
+        };
+        let detailed = detailed_stats_from_hunks_with_merge_flag(
+            &[],
+            &[hunk("a.rs"), hunk("b.rs")],
+            Some(&log),
+            false,
+        );
+
+        assert_eq!(detailed.ai_accepted, 1);
+        assert_eq!(detailed.unknown_additions, 1);
+        assert_eq!(detailed.file_stats["a.rs"].ai_accepted, 1);
+        assert_eq!(detailed.file_stats["b.rs"].unknown_additions, 1);
+        assert_eq!(
+            detailed.unknown_additions,
+            detailed
+                .file_stats
+                .values()
+                .map(|stats| stats.unknown_additions)
+                .sum::<u32>()
+        );
+    }
 
     #[test]
     fn test_terminal_stats_display() {

@@ -410,10 +410,15 @@ fn calculate_range_stats_direct(
     }
 
     // Step 1: Get git diff stats between start and end
-    let (git_diff_added_lines, git_diff_deleted_lines) =
+    let (_, git_diff_deleted_lines) =
         get_git_diff_stats_for_range(repo, &start_sha, &end_sha, ignore_patterns)?;
 
     let diff_ai_stats = diff_ai_accepted_stats(repo, &start_sha, &end_sha, None, ignore_patterns)?;
+    let git_diff_added_lines = diff_ai_stats
+        .per_file
+        .values()
+        .map(|file| file.added_lines)
+        .sum();
 
     // Step 2: Create in-memory authorship log for the range, filtered to only commits in the range
     let authorship_log =

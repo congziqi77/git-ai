@@ -93,6 +93,24 @@ fn test_stats_range_json_includes_file_stats() {
 }
 
 #[test]
+fn test_stats_range_utf8_ignore_keeps_aggregate_file_invariant() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    let base = repo.stage_all_and_commit("base").unwrap();
+    fs::write(repo.path().join("keep.rs"), "keep\n").unwrap();
+    fs::write(repo.path().join("忽.rs"), "ignored\n").unwrap();
+    let end = repo.stage_all_and_commit("range utf8 files").unwrap();
+
+    let range = format!("{}..{}", base.commit_sha, end.commit_sha);
+    let json = stats_json_from_args(&repo, &["stats", &range, "--json", "--ignore", "忽.rs"]);
+    let range_stats = &json["range_stats"];
+    assert!(range_stats["file_stats"].get("忽.rs").is_none());
+    assert_eq!(range_stats["file_stats"]["keep.rs"]["unknown_additions"], 1);
+    assert_eq!(range_stats["git_diff_added_lines"], 1);
+    assert_eq!(range_stats["unknown_additions"], 1);
+}
+
+#[test]
 fn test_status_json_does_not_include_file_stats() {
     let repo = TestRepo::new();
     repo.filename("README.md")
