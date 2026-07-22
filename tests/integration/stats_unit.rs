@@ -12,6 +12,51 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 #[test]
+fn test_detailed_commit_stats_serializes_flat_file_stats() {
+    let summary = CommitStats {
+        ai_accepted: 2,
+        ai_additions: 2,
+        unknown_additions: 1,
+        git_diff_added_lines: 3,
+        ..CommitStats::default()
+    };
+    let detailed = DetailedCommitStats {
+        summary,
+        file_stats: BTreeMap::from([
+            (
+                "src/a.rs".to_string(),
+                FileStats {
+                    ai_accepted: 2,
+                    unknown_additions: 0,
+                },
+            ),
+            (
+                "src/b.rs".to_string(),
+                FileStats {
+                    ai_accepted: 0,
+                    unknown_additions: 1,
+                },
+            ),
+        ]),
+    };
+
+    let json = serde_json::to_value(&detailed).unwrap();
+    assert_eq!(json["ai_accepted"], 2);
+    assert_eq!(json["file_stats"]["src/a.rs"]["ai_accepted"], 2);
+    assert_eq!(
+        json["file_stats"]["src/b.rs"]["unknown_additions"],
+        1
+    );
+    assert!(json.get("summary").is_none());
+}
+
+#[test]
+fn test_commit_stats_serialization_remains_aggregate_only() {
+    let json = serde_json::to_value(CommitStats::default()).unwrap();
+    assert!(json.get("file_stats").is_none());
+}
+
+#[test]
 fn test_stats_for_simple_ai_commit() {
     let repo = TestRepo::new();
 

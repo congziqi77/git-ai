@@ -32,6 +32,30 @@ pub struct CommitStats {
     pub tool_model_breakdown: BTreeMap<String, ToolModelHeadlineStats>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FileStats {
+    #[serde(default)]
+    pub ai_accepted: u32,
+    #[serde(default)]
+    pub unknown_additions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DetailedCommitStats {
+    #[serde(flatten)]
+    pub summary: CommitStats,
+    #[serde(default)]
+    pub file_stats: BTreeMap<String, FileStats>,
+}
+
+impl std::ops::Deref for DetailedCommitStats {
+    type Target = CommitStats;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
 pub fn stats_command(
     repo: &Repository,
     commit_sha: Option<&str>,
