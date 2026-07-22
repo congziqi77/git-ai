@@ -10,6 +10,13 @@ pub struct DiffAiAcceptedStats {
     pub total_ai_accepted: u32,
     pub per_tool_model: BTreeMap<String, u32>,
     pub per_prompt: BTreeMap<String, u32>,
+    pub per_file: BTreeMap<String, DiffAiAcceptedFileStats>,
+}
+
+#[derive(Debug, Default)]
+pub struct DiffAiAcceptedFileStats {
+    pub added_lines: u32,
+    pub ai_accepted: u32,
 }
 
 pub fn diff_ai_accepted_stats(
@@ -35,6 +42,13 @@ pub fn diff_ai_accepted_stats(
 
         lines.sort_unstable();
         lines.dedup();
+        stats.per_file.insert(
+            file_path.clone(),
+            DiffAiAcceptedFileStats {
+                added_lines: lines.len() as u32,
+                ai_accepted: 0,
+            },
+        );
         let line_ranges = lines_to_ranges(&lines);
 
         if line_ranges.is_empty() {
@@ -68,6 +82,11 @@ pub fn diff_ai_accepted_stats(
                 && prompt_records.contains_key(author_hash)
             {
                 stats.total_ai_accepted += 1;
+                stats
+                    .per_file
+                    .get_mut(&file_path)
+                    .expect("file stats inserted before blame")
+                    .ai_accepted += 1;
                 *stats.per_prompt.entry(author_hash.clone()).or_insert(0) += 1;
                 if let Some(tool_model) = author_tool_map.get(author_hash) {
                     *stats.per_tool_model.entry(tool_model.clone()).or_insert(0) += 1;
@@ -183,6 +202,7 @@ mod tests {
             total_ai_accepted: 10,
             per_tool_model: BTreeMap::new(),
             per_prompt: BTreeMap::new(),
+            per_file: BTreeMap::new(),
         };
         let debug_str = format!("{:?}", stats);
         assert!(debug_str.contains("DiffAiAcceptedStats"));

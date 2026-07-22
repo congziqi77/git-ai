@@ -60,6 +60,50 @@ fn test_stats_json_includes_file_stats() {
 }
 
 #[test]
+fn test_stats_range_json_includes_file_stats() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "base.txt"])
+        .unwrap();
+    let base = repo.stage_all_and_commit("base").unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
+        .unwrap();
+    fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
+        .unwrap();
+    fs::write(repo.path().join("src/unknown.rs"), "unknown\n").unwrap();
+    let end = repo.stage_all_and_commit("range files").unwrap();
+
+    let range = format!("{}..{}", base.commit_sha, end.commit_sha);
+    let json = stats_json_from_args(&repo, &["stats", &range, "--json"]);
+    let range_stats = &json["range_stats"];
+    assert_eq!(
+        range_stats["file_stats"]["src/ai.rs"]["ai_accepted"],
+        2
+    );
+    assert_eq!(
+        range_stats["file_stats"]["src/unknown.rs"]["unknown_additions"],
+        1
+    );
+    let files = range_stats["file_stats"].as_object().unwrap();
+    let ai_sum: u64 = files
+        .values()
+        .map(|value| value["ai_accepted"].as_u64().unwrap())
+        .sum();
+    let unknown_sum: u64 = files
+        .values()
+        .map(|value| value["unknown_additions"].as_u64().unwrap())
+        .sum();
+    assert_eq!(range_stats["ai_accepted"].as_u64().unwrap(), ai_sum);
+    assert_eq!(
+        range_stats["unknown_additions"].as_u64().unwrap(),
+        unknown_sum
+    );
+}
+
+#[test]
 fn test_status_json_does_not_include_file_stats() {
     let repo = TestRepo::new();
     repo.filename("README.md")

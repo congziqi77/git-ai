@@ -6,7 +6,9 @@ use serde::Serialize;
 
 use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
-use crate::authorship::stats::{CommitStats, stats_for_commit_stats, stats_from_authorship_log};
+use crate::authorship::stats::{
+    DetailedCommitStats, FileStats, stats_for_commit_detailed, stats_from_authorship_log,
+};
 use crate::error::GitAiError;
 use crate::git::notes_api::{CommitAuthorship, filter_commits_with_notes};
 use crate::git::repository::{CommitRange, InternalGitProfile, Repository, exec_git_with_profile};
@@ -27,7 +29,7 @@ pub fn should_ignore_file(path: &str, ignore_patterns: &[String]) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeAuthorshipStats {
     pub authorship_stats: RangeAuthorshipStatsData,
-    pub range_stats: CommitStats,
+    pub range_stats: DetailedCommitStats,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeAuthorshipStatsData {
@@ -399,12 +401,12 @@ fn calculate_range_stats_direct(
     commit_range: CommitRange,
     commit_shas: &[String],
     ignore_patterns: &[String],
-) -> Result<CommitStats, GitAiError> {
+) -> Result<DetailedCommitStats, GitAiError> {
     let start_sha = commit_range.start_oid.clone();
     let end_sha = commit_range.end_oid.clone();
     // Special case: single commit range (start == end)
     if start_sha == end_sha {
-        return stats_for_commit_stats(repo, &end_sha, ignore_patterns);
+        return stats_for_commit_detailed(repo, &end_sha, ignore_patterns);
     }
 
     // Step 1: Get git diff stats between start and end
@@ -418,7 +420,7 @@ fn calculate_range_stats_direct(
         create_authorship_log_for_range(repo, &start_sha, &end_sha, commit_shas, ignore_patterns)?;
 
     // Step 3: Calculate stats from the authorship log
-    let stats = stats_from_authorship_log(
+    let summary = stats_from_authorship_log(
         Some(&authorship_log),
         git_diff_added_lines,
         git_diff_deleted_lines,
@@ -426,8 +428,24 @@ fn calculate_range_stats_direct(
         0,
         &diff_ai_stats.per_tool_model,
     );
+    let file_stats = diff_ai_stats
+        .per_file
+        .into_iter()
+        .map(|(file_path, file)| {
+            (
+                file_path,
+                FileStats {
+                    ai_accepted: file.ai_accepted,
+                    unknown_additions: file.added_lines.saturating_sub(file.ai_accepted),
+                },
+            )
+        })
+        .collect();
 
-    Ok(stats)
+    Ok(DetailedCommitStats {
+        summary,
+        file_stats,
+    })
 }
 
 pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
@@ -444,7 +462,7 @@ pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
 
     // Only print stats if we're in an interactive terminal
     let is_interactive = std::io::stdout().is_terminal();
-    write_stats_to_terminal(&stats.range_stats, is_interactive);
+    write_stats_to_terminal(&stats.range_stats.summary, is_interactive);
 
     // Check if all individual commits have authorship logs (for optional breakdown)
     let all_have_authorship =
