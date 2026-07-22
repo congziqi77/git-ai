@@ -8,7 +8,7 @@ mod repos;
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::daemon::open_local_socket_stream_with_timeout;
 use git_ai::git::find_repository_in_path;
-use git_ai::git::refs::show_authorship_note;
+use git_ai::git::notes_api::read_note;
 use git_ai::git::repository::Repository as GitAiRepository;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::{TestRepo, new_daemon_test_sync_session_id, real_git_executable};
@@ -70,6 +70,28 @@ fn assert_note_has_ai_for_file(repo: &TestRepo, commit_sha: &str, file_path: &st
     );
 }
 
+fn ai_attested_lines_for_file(
+    log: &AuthorshipLog,
+    file_path: &str,
+) -> std::collections::BTreeSet<u32> {
+    log.attestations
+        .iter()
+        .find(|attestation| attestation.file_path == file_path)
+        .map(|attestation| {
+            attestation
+                .entries
+                .iter()
+                .filter(|entry| {
+                    let author_id = entry.hash.split("::").next().unwrap_or(&entry.hash);
+                    log.metadata.sessions.contains_key(author_id)
+                        || log.metadata.prompts.contains_key(&entry.hash)
+                })
+                .flat_map(|entry| entry.line_ranges.iter().flat_map(|range| range.expand()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn raw_traced_git(repo: &TestRepo, args: &[&str]) -> String {
     let mut command = Command::new(real_git_executable());
     command.arg("-C").arg(repo.path()).args(args);
@@ -88,7 +110,7 @@ fn raw_traced_git(repo: &TestRepo, args: &[&str]) -> String {
     );
     command.env(
         "GIT_TRACE2_EVENT_NESTING",
-        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "10".to_string()),
+        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "0".to_string()),
     );
 
     let output = command
@@ -130,7 +152,7 @@ fn raw_traced_git_stdin(repo: &TestRepo, args: &[&str], stdin: &str) -> String {
     );
     command.env(
         "GIT_TRACE2_EVENT_NESTING",
-        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "10".to_string()),
+        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "0".to_string()),
     );
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -184,7 +206,7 @@ fn raw_traced_git_with_session(repo: &TestRepo, args: &[&str], session: &str) ->
     );
     command.env(
         "GIT_TRACE2_EVENT_NESTING",
-        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "10".to_string()),
+        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "0".to_string()),
     );
 
     let output = command
@@ -235,7 +257,7 @@ fn raw_git_trace_to_file_output(repo: &TestRepo, args: &[&str], trace_path: &Pat
     command.env("GIT_TRACE2_EVENT", trace_path);
     command.env(
         "GIT_TRACE2_EVENT_NESTING",
-        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "10".to_string()),
+        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "0".to_string()),
     );
 
     command
@@ -1308,7 +1330,7 @@ fn test_commit_tree_update_ref_preserves_authorship_notes_on_reparent() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &feature_commit.commit_sha).is_some(),
+        read_note(&git_ai_repo, &feature_commit.commit_sha).is_some(),
         "expected initial feature commit to have an authorship note",
     );
 
@@ -1333,7 +1355,7 @@ fn test_commit_tree_update_ref_preserves_authorship_notes_on_reparent() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &new_head).is_some(),
+        read_note(&git_ai_repo, &new_head).is_some(),
         "expected rewritten commit {} to preserve authorship note from {}",
         new_head,
         old_head,
@@ -1431,7 +1453,7 @@ fn test_reset_keep_rewrite_preserves_authorship_notes_on_current_branch() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &feature_commit.commit_sha).is_some(),
+        read_note(&git_ai_repo, &feature_commit.commit_sha).is_some(),
         "expected initial feature commit to have an authorship note",
     );
 
@@ -1456,7 +1478,7 @@ fn test_reset_keep_rewrite_preserves_authorship_notes_on_current_branch() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &new_head).is_some(),
+        read_note(&git_ai_repo, &new_head).is_some(),
         "expected rewritten current-branch commit {} to preserve authorship note from {}",
         new_head,
         old_head,
@@ -1489,7 +1511,7 @@ fn test_update_ref_restack_after_parent_amend_preserves_child_attribution() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &child_commit.commit_sha).is_some(),
+        read_note(&git_ai_repo, &child_commit.commit_sha).is_some(),
         "expected initial child commit to have an authorship note",
     );
 
@@ -1519,7 +1541,7 @@ fn test_update_ref_restack_after_parent_amend_preserves_child_attribution() {
 
     let git_ai_repo = open_repo(&repo);
     assert!(
-        show_authorship_note(&git_ai_repo, &new_child_head).is_some(),
+        read_note(&git_ai_repo, &new_child_head).is_some(),
         "expected rewritten child commit {} to preserve authorship note from {}",
         new_child_head,
         child_commit.commit_sha,
@@ -1580,7 +1602,7 @@ fn test_graphite_style_multi_commit_single_update_ref() {
     let git_ai_repo = open_repo(&repo);
     for &sha in &feature_commits {
         assert!(
-            show_authorship_note(&git_ai_repo, sha).is_some(),
+            read_note(&git_ai_repo, sha).is_some(),
             "pre-rebase: commit {} should have authorship note",
             sha
         );
@@ -1671,7 +1693,7 @@ fn test_graphite_style_multi_commit_single_update_ref() {
     let git_ai_repo = open_repo(&repo);
     for (idx, &sha) in rebased_commits.iter().enumerate() {
         assert!(
-            show_authorship_note(&git_ai_repo, sha).is_some(),
+            read_note(&git_ai_repo, sha).is_some(),
             "post-rebase: rebased commit {} (index {}) should have authorship note",
             sha,
             idx
@@ -1753,6 +1775,85 @@ fn test_update_ref_current_branch_with_new_content_preserves_attribution() {
 
     let mut feature_file = repo.filename("branch-plumbing.txt");
     feature_file.assert_lines_and_blame(lines!["branch ai".ai()]);
+}
+
+#[test]
+fn test_update_ref_fast_forward_bounds_committed_hunks_to_final_commit() {
+    let repo = TestRepo::new();
+    setup_initial_commit(&repo);
+
+    let file_rel = "ff-overlap.txt";
+    let file_path = repo.path().join(file_rel);
+    fs::write(&file_path, "base\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", file_rel])
+        .unwrap();
+    repo.stage_all_and_commit("add fast-forward overlap base")
+        .unwrap();
+    let mut file = repo.filename(file_rel);
+    file.assert_committed_lines(lines!["base".human()]);
+
+    let old_tip = head_sha(&repo);
+    let final_content = "base\nintermediate pulled line\nfinal checkpointed line\n";
+    fs::write(&file_path, final_content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", file_rel]).unwrap();
+    repo.sync_daemon();
+
+    fs::write(&file_path, "base\nintermediate pulled line\n").unwrap();
+    raw_untraced_git(&repo, &["add", file_rel]);
+    let intermediate_tree = raw_untraced_git(&repo, &["write-tree"]).trim().to_string();
+    let intermediate_commit = raw_untraced_git(
+        &repo,
+        &[
+            "commit-tree",
+            &intermediate_tree,
+            "-p",
+            &old_tip,
+            "-m",
+            "intermediate pulled commit",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    fs::write(&file_path, final_content).unwrap();
+    raw_untraced_git(&repo, &["add", file_rel]);
+    let final_tree = raw_untraced_git(&repo, &["write-tree"]).trim().to_string();
+    let final_commit = raw_untraced_git(
+        &repo,
+        &[
+            "commit-tree",
+            &final_tree,
+            "-p",
+            &intermediate_commit,
+            "-m",
+            "final pulled commit",
+        ],
+    )
+    .trim()
+    .to_string();
+
+    repo.git(&["update-ref", "HEAD", &final_commit, &old_tip])
+        .unwrap();
+    let note = repo
+        .read_authorship_note(&final_commit)
+        .expect("fast-forward final commit should have an authorship note");
+    let log = AuthorshipLog::deserialize_from_string(&note).expect("parse authorship note");
+    let ai_lines = ai_attested_lines_for_file(&log, file_rel);
+
+    assert!(
+        !ai_lines.contains(&2),
+        "intermediate pulled line must not be attributed from the old-tip..new-head diff: {ai_lines:?}"
+    );
+    assert!(
+        ai_lines.contains(&3),
+        "final commit line should remain attributed to the checkpointed AI edit: {ai_lines:?}"
+    );
+
+    file.assert_committed_lines(lines![
+        "base".human(),
+        "intermediate pulled line".human(),
+        "final checkpointed line".ai(),
+    ]);
 }
 
 #[test]

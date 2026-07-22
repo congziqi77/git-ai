@@ -391,7 +391,7 @@ impl DaemonProcess {
                 "GIT_TRACE2_EVENT",
                 DaemonConfig::trace2_event_target_for_path(&self.trace_socket_path),
             )
-            .env("GIT_TRACE2_EVENT_NESTING", "10");
+            .env("GIT_TRACE2_EVENT_NESTING", "0");
         configure_test_home_env(&mut command, &self.daemon_home);
 
         let output = run_command_output(&mut command, "daemon readiness probe git config")
@@ -491,6 +491,15 @@ impl DaemonProcess {
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
     command.env("HOME", test_home);
+    if !command
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
+    {
+        command.env(
+            "GIT_AI_TEST_NOTES_DB_PATH",
+            test_home.join(".git-ai").join("internal").join("notes-db"),
+        );
+    }
     command.env("GIT_CONFIG_GLOBAL", test_home.join(".gitconfig"));
     // Redirect XDG_CONFIG_HOME so git does not read the real user's
     // $XDG_CONFIG_HOME/git/config (which may contain filter drivers,
@@ -1239,6 +1248,24 @@ impl TestRepo {
         if let Some(feature_flags) = &patch.feature_flags {
             config.insert("feature_flags".to_string(), feature_flags.clone());
         }
+        if let Some(max_bytes) = patch.max_checkpoint_file_size_bytes {
+            config.insert(
+                "max_checkpoint_file_size_bytes".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(max_bytes as u64)),
+            );
+        }
+        if let Some(max_bytes) = patch.max_checkpoint_total_size_bytes {
+            config.insert(
+                "max_checkpoint_total_size_bytes".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(max_bytes as u64)),
+            );
+        }
+        if let Some(max_lines) = patch.max_checkpoint_total_lines {
+            config.insert(
+                "max_checkpoint_total_lines".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(max_lines as u64)),
+            );
+        }
 
         let config_dir = home.join(".git-ai");
         fs::create_dir_all(&config_dir).expect("failed to create test HOME config directory");
@@ -1759,7 +1786,7 @@ impl TestRepo {
     }
 
     fn trace2_nesting_value() -> String {
-        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "10".to_string())
+        std::env::var("GIT_AI_TEST_TRACE2_NESTING").unwrap_or_else(|_| "0".to_string())
     }
 
     fn setup_daemon_mode(&mut self) {
@@ -3125,11 +3152,11 @@ impl TestRepo {
                 // In daemon mode, the authorship note may not be immediately
                 // visible after the session completes due to filesystem flush
                 // timing. Retry briefly before failing.
-                let mut content = git_ai::git::refs::show_authorship_note(&repo, &head_commit);
+                let mut content = git_ai::git::notes_api::read_note(&repo, &head_commit);
                 if content.is_none() {
                     for _ in 0..10 {
                         thread::sleep(Duration::from_millis(50));
-                        content = git_ai::git::refs::show_authorship_note(&repo, &head_commit);
+                        content = git_ai::git::notes_api::read_note(&repo, &head_commit);
                         if content.is_some() {
                             break;
                         }
@@ -3382,10 +3409,18 @@ fn ensure_isolated_process_home() {
         )
         .expect("write test git-ai config");
 
+        // Set a process-level test DB marker so that any in-process git-ai code
+        // (e.g., `CiContext` in the `ci_fork_notes` tests) treats the test
+        // harness as a test environment and does not run background-agent
+        // detection like `/opt/.devin`.
+        let process_test_db = home.join("git-ai-test-db");
+        fs::create_dir_all(&process_test_db).expect("create process test DB dir");
+
         // SAFETY: called once via OnceLock before any parallel test thread reads
         // HOME or PATH. The OnceLock ensures no concurrent env var writes.
         unsafe {
             std::env::set_var("HOME", &home);
+            std::env::set_var("GIT_AI_TEST_DB_PATH", &process_test_db);
             #[cfg(windows)]
             {
                 std::env::set_var("USERPROFILE", &home);
@@ -3608,6 +3643,41 @@ pub fn get_binary_path() -> &'static PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_configure_test_home_env_isolates_notes_database() {
+        let test_home = PathBuf::from("isolated-test-home");
+        let mut command = Command::new("git");
+
+        configure_test_home_env(&mut command, &test_home);
+
+        let notes_db_path = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from);
+        assert_eq!(
+            notes_db_path,
+            Some(test_home.join(".git-ai").join("internal").join("notes-db"))
+        );
+    }
+
+    #[test]
+    fn test_configure_test_home_env_preserves_explicit_notes_database() {
+        let test_home = PathBuf::from("isolated-test-home");
+        let explicit_notes_db = PathBuf::from("explicit-notes-db");
+        let mut command = Command::new("git");
+        command.env("GIT_AI_TEST_NOTES_DB_PATH", &explicit_notes_db);
+
+        configure_test_home_env(&mut command, &test_home);
+
+        let notes_db_path = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from);
+        assert_eq!(notes_db_path, Some(explicit_notes_db));
+    }
 
     #[test]
     fn test_normalize_test_git_ai_checkpoint_args_inserts_separator_for_direct_file() {

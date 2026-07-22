@@ -98,10 +98,17 @@ struct ReflogAnchor {
     end_offset: u64,
 }
 
+const CHERRY_PICK_REFLOG_PREFIXES: &[&str] = &["cherry-pick:", "commit (cherry-pick):"];
+
 enum ColdSeedMatchSpec {
     SingleEntry {
         expected: ExpectedTransition,
         prefixes: Vec<String>,
+    },
+    HeadSpan {
+        expected: ExpectedTransition,
+        prefixes: Vec<String>,
+        limit: usize,
     },
     PullSpan {
         action: String,
@@ -246,6 +253,12 @@ impl RefCursor {
                     self.command_start_hints.insert(key.clone(), offset);
                 }
                 self.initialize_reflog_cursor(&key, seed)?;
+            } else if command_can_clamp_non_authoritative_cold_seed(cmd) {
+                let seed = self.clamp_seed_to_own_entry(&key, offset, cmd)?;
+                if seed != offset {
+                    self.command_start_hints.insert(key.clone(), offset);
+                    self.initialize_reflog_cursor(&key, seed)?;
+                }
             }
         }
 
@@ -295,6 +308,26 @@ impl RefCursor {
                     .map(|entry| entry.start_offset)
                     .min();
                 Ok(earliest_own.unwrap_or(offset))
+            }
+            ColdSeedMatchSpec::HeadSpan {
+                expected,
+                prefixes,
+                limit,
+            } => {
+                if limit == 0 {
+                    return Ok(offset);
+                }
+                let prefix_refs = prefixes.iter().map(String::as_str).collect::<Vec<_>>();
+                let reference = if let Some(reference) = key.strip_prefix("common:") {
+                    reference.to_string()
+                } else {
+                    "HEAD".to_string()
+                };
+                let entries = read_reflog_entries(key.to_string(), &path, &reference, None)?;
+                Ok(
+                    head_span_start_near_offset(&entries, offset, &prefix_refs, expected, limit)
+                        .unwrap_or(offset),
+                )
             }
             ColdSeedMatchSpec::PullSpan { action, expected } => {
                 self.clamp_seed_to_pull_span_entry(key, &path, offset, &action, expected)
@@ -384,6 +417,34 @@ impl RefCursor {
             "rebase" => Some(ColdSeedMatchSpec::RebaseSpan {
                 expected: ExpectedTransition::default(),
             }),
+            "cherry-pick" => {
+                if args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--abort" | "--quit"))
+                    || args.iter().any(|arg| arg == "--no-commit" || arg == "-n")
+                {
+                    return None;
+                }
+                let source_args = cherry_pick_source_args(&args);
+                let limit = if source_args
+                    .iter()
+                    .any(|source| cherry_pick_source_is_range(source))
+                {
+                    usize::MAX
+                } else if source_args.is_empty() {
+                    self.pending_cherry_pick_source_oids.len().max(1)
+                } else {
+                    source_args.len().max(1)
+                };
+                Some(ColdSeedMatchSpec::HeadSpan {
+                    expected: ExpectedTransition::default(),
+                    prefixes: CHERRY_PICK_REFLOG_PREFIXES
+                        .iter()
+                        .map(|prefix| (*prefix).to_string())
+                        .collect(),
+                    limit,
+                })
+            }
             _ => None,
         }
     }
@@ -464,7 +525,7 @@ impl RefCursor {
         self.consume_head_span_for_command_limited(
             cmd,
             state,
-            &["cherry-pick:", "commit:", "commit (cherry-pick):"],
+            CHERRY_PICK_REFLOG_PREFIXES,
             self.head_expected_transition(cmd, state),
             source_limit,
         )?;
@@ -676,9 +737,11 @@ impl RefCursor {
         let Some(spec) = spec else {
             let mut changes = Vec::new();
             if let Some(worktree) = cmd.worktree.as_deref() {
-                while let Some(entry) =
-                    self.find_head_entry(Some(worktree), &[], ExpectedTransition::default())?
-                {
+                while let Some(entry) = self.find_head_entry_without_hint(
+                    Some(worktree),
+                    &[],
+                    ExpectedTransition::default(),
+                )? {
                     self.consume_entry(&entry)?;
                     changes.push(entry_to_ref_change(&entry));
                 }
@@ -687,9 +750,11 @@ impl RefCursor {
                 if reference == "HEAD" || reference == "ORIG_HEAD" {
                     continue;
                 }
-                while let Some(entry) =
-                    self.find_common_ref_entry(&reference, ExpectedTransition::default(), &[])?
-                {
+                while let Some(entry) = self.find_common_ref_entry_without_hint(
+                    &reference,
+                    ExpectedTransition::default(),
+                    &[],
+                )? {
                     self.consume_entry(&entry)?;
                     changes.push(entry_to_ref_change(&entry));
                 }
@@ -913,7 +978,9 @@ impl RefCursor {
         let expected = self.head_expected_transition(cmd, state);
         let first = match self.find_rebase_start_entry(cmd, expected.clone())? {
             Some(entry) => Some(entry),
-            None => self.find_head_entry(cmd.worktree.as_deref(), &["rebase"], expected)?,
+            None => {
+                self.find_head_entry_without_hint(cmd.worktree.as_deref(), &["rebase"], expected)?
+            }
         };
         let Some(first) = first else {
             return Ok(());
@@ -931,9 +998,11 @@ impl RefCursor {
         }
 
         let mut consumed_finish = rebase_reflog_action_is(&first.message, "finish");
+        let mut next_start = first.end_offset;
         while !consumed_finish {
-            let Some(next) = self.find_head_entry(
+            let Some(next) = self.find_head_entry_after(
                 cmd.worktree.as_deref(),
+                next_start,
                 &["rebase"],
                 ExpectedTransition {
                     old_oids: [new.clone()].into_iter().collect(),
@@ -949,6 +1018,7 @@ impl RefCursor {
             }
             new = next.new.clone();
             consumed_finish = rebase_reflog_action_is(&next.message, "finish");
+            next_start = next.end_offset;
             self.consume_entry(&next)?;
             changes.push(entry_to_ref_change(&next));
         }
@@ -1112,11 +1182,13 @@ impl RefCursor {
         let old = first.old.clone();
         let mut new = first.new.clone();
         let mut changes = vec![entry_to_ref_change(&first)];
+        let mut next_start = first.end_offset;
         self.consume_entry(&first)?;
 
         while changes.len() < limit
-            && let Some(next) = self.find_head_entry(
+            && let Some(next) = self.find_head_entry_after(
                 cmd.worktree.as_deref(),
+                next_start,
                 message_prefixes,
                 ExpectedTransition {
                     old_oids: [new.clone()].into_iter().collect(),
@@ -1126,6 +1198,7 @@ impl RefCursor {
             )?
         {
             new = next.new.clone();
+            next_start = next.end_offset;
             self.consume_entry(&next)?;
             changes.push(entry_to_ref_change(&next));
         }
@@ -1146,7 +1219,11 @@ impl RefCursor {
     ) -> Result<(), GitAiError> {
         let first = match self.find_pull_start_entry(cmd, expected.clone(), action)? {
             Some(entry) => Some(entry),
-            None => self.find_head_entry(cmd.worktree.as_deref(), message_prefixes, expected)?,
+            None => self.find_head_entry_without_hint(
+                cmd.worktree.as_deref(),
+                message_prefixes,
+                expected,
+            )?,
         };
         let Some(first) = first else {
             return Ok(());
@@ -1157,11 +1234,13 @@ impl RefCursor {
         let mut changes = vec![entry_to_ref_change(&first)];
         let mut consumed_finish = pull_reflog_action_state(&first.message, action).is_none()
             || pull_reflog_action_is(&first.message, action, "finish");
+        let mut next_start = first.end_offset;
         self.consume_entry(&first)?;
 
         while !consumed_finish
-            && let Some(next) = self.find_head_entry(
+            && let Some(next) = self.find_head_entry_after(
                 cmd.worktree.as_deref(),
+                next_start,
                 message_prefixes,
                 ExpectedTransition {
                     old_oids: [new.clone()].into_iter().collect(),
@@ -1175,6 +1254,7 @@ impl RefCursor {
             }
             new = next.new.clone();
             consumed_finish = pull_reflog_action_is(&next.message, action, "finish");
+            next_start = next.end_offset;
             self.consume_entry(&next)?;
             changes.push(entry_to_ref_change(&next));
         }
@@ -1217,13 +1297,10 @@ impl RefCursor {
         }))
     }
 
-    // DEFERRED (code-review #14): like find_rebase_start_entry, this scans the
-    // reflog from reflog_start_offset for a contiguous span matching the
-    // message prefixes and returns the first that satisfies `expected`; it does
-    // not bound the search by the command's ingress hint. With repeated
-    // identical spans this could pick an earlier same-shaped span than the one
-    // this command produced. Threading the per-command ingress offset would
-    // make it exact.
+    // Span commands can append several contiguous HEAD rows. If command ingress
+    // captured a late reflog offset, prefer the first matching span at/after that
+    // hint, then fall back to the latest matching span before the hint when the
+    // hint landed after the command's own rows.
     fn find_head_span_start_entry(
         &mut self,
         worktree: Option<&Path>,
@@ -1242,6 +1319,8 @@ impl RefCursor {
         let start = self.reflog_start_offset(&key, &path)?;
         let entries = read_reflog_entries(key, &path, "HEAD", start)?;
         let mut contiguous = VecDeque::<CursorEntry>::new();
+        let hint = self.command_start_hints.get(&head_key(&git_dir)).copied();
+        let mut latest_before_hint: Option<CursorEntry> = None;
 
         for entry in entries {
             if self.entry_consumed(&entry) || !message_matches(&entry.message, message_prefixes) {
@@ -1260,11 +1339,20 @@ impl RefCursor {
                 contiguous.pop_front();
             }
             if matches {
-                return Ok(contiguous.front().cloned());
+                let Some(candidate) = contiguous.front().cloned() else {
+                    continue;
+                };
+                let Some(hint) = hint else {
+                    return Ok(Some(candidate));
+                };
+                if candidate.start_offset >= hint {
+                    return Ok(Some(candidate));
+                }
+                latest_before_hint = Some(candidate);
             }
         }
 
-        Ok(None)
+        Ok(latest_before_hint)
     }
 
     fn find_head_entry(
@@ -1287,6 +1375,53 @@ impl RefCursor {
             expected,
             message_prefixes,
         )
+    }
+
+    fn find_head_entry_without_hint(
+        &mut self,
+        worktree: Option<&Path>,
+        message_prefixes: &[&str],
+        expected: ExpectedTransition,
+    ) -> Result<Option<CursorEntry>, GitAiError> {
+        let Some(worktree) = worktree else {
+            return Ok(None);
+        };
+        let Some(git_dir) = git_dir_for_worktree(worktree) else {
+            return Ok(None);
+        };
+        let path = git_dir.join("logs").join("HEAD");
+        self.find_entry_in_log_with_hint(
+            head_key(&git_dir),
+            &path,
+            "HEAD",
+            expected,
+            message_prefixes,
+            false,
+        )
+    }
+
+    fn find_head_entry_after(
+        &mut self,
+        worktree: Option<&Path>,
+        start_offset: u64,
+        message_prefixes: &[&str],
+        expected: ExpectedTransition,
+    ) -> Result<Option<CursorEntry>, GitAiError> {
+        let Some(worktree) = worktree else {
+            return Ok(None);
+        };
+        let Some(git_dir) = git_dir_for_worktree(worktree) else {
+            return Ok(None);
+        };
+        let key = head_key(&git_dir);
+        let path = git_dir.join("logs").join("HEAD");
+        Ok(read_reflog_entries(key, &path, "HEAD", Some(start_offset))?
+            .into_iter()
+            .find(|entry| {
+                !self.entry_consumed(entry)
+                    && expected.matches(entry)
+                    && message_matches(&entry.message, message_prefixes)
+            }))
     }
 
     fn consume_unique_direct_common_ref_matching_timestamp(
@@ -1393,6 +1528,23 @@ impl RefCursor {
         )
     }
 
+    fn find_common_ref_entry_without_hint(
+        &mut self,
+        reference: &str,
+        expected: ExpectedTransition,
+        message_prefixes: &[&str],
+    ) -> Result<Option<CursorEntry>, GitAiError> {
+        let path = self.common_dir().join("logs").join(reference);
+        self.find_entry_in_log_with_hint(
+            common_key(reference),
+            &path,
+            reference,
+            expected,
+            message_prefixes,
+            false,
+        )
+    }
+
     fn find_stash_push_entry(
         &mut self,
         stash_args: &[String],
@@ -1420,14 +1572,30 @@ impl RefCursor {
         expected: ExpectedTransition,
         message_prefixes: &[&str],
     ) -> Result<Option<CursorEntry>, GitAiError> {
+        self.find_entry_in_log_with_hint(key, path, reference, expected, message_prefixes, true)
+    }
+
+    fn find_entry_in_log_with_hint(
+        &mut self,
+        key: String,
+        path: &Path,
+        reference: &str,
+        expected: ExpectedTransition,
+        message_prefixes: &[&str],
+        use_hint: bool,
+    ) -> Result<Option<CursorEntry>, GitAiError> {
         let start = self.reflog_start_offset(&key, path)?;
         let entries = read_reflog_entries(key.clone(), path, reference, start)?;
-        let candidates = entries.into_iter().filter(|entry| {
+        let mut candidates = entries.into_iter().filter(|entry| {
             !self.entry_consumed(entry)
                 && expected.matches(entry)
                 && message_matches(&entry.message, message_prefixes)
         });
-        Ok(self.select_candidate_with_hint(&key, candidates))
+        if use_hint {
+            Ok(self.select_candidate_with_hint(&key, candidates))
+        } else {
+            Ok(candidates.next())
+        }
     }
 
     /// Choose among reflog entries that match a command's expected transition,
@@ -1441,31 +1609,29 @@ impl RefCursor {
     ///
     /// But the hint is captured asynchronously and can also race *behind* git,
     /// landing after the command's own entry (the graphite/gt-create flake). In
-    /// that case no match exists at/after the hint, so we fall back to the first
-    /// match overall — the in-order cursor's earliest unconsumed match, which is
-    /// the command's own entry. Either way the in-order cursor is the floor and
-    /// the hint only biases selection within it.
+    /// that case no match exists at/after the hint, so we fall back to the latest
+    /// match before the hint. That still preserves the single-candidate case, and
+    /// it avoids consuming an older untraced duplicate-message commit when both
+    /// the untraced commit and this command's commit sit before the late hint.
     fn select_candidate_with_hint<I>(&self, key: &str, candidates: I) -> Option<CursorEntry>
     where
         I: IntoIterator<Item = CursorEntry>,
     {
-        let hint = self.command_start_hints.get(key).copied();
-        let mut first_match: Option<CursorEntry> = None;
+        let Some(hint) = self.command_start_hints.get(key).copied() else {
+            return candidates.into_iter().next();
+        };
+        let mut latest_before_hint: Option<CursorEntry> = None;
         for entry in candidates {
             // An entry "at/after the hint" is one whose start offset is >= the
             // hint. Prefer the first such entry (skips an untraced collision the
-            // hint was captured after); otherwise remember the earliest match as
-            // the fallback for when the hint raced past the command's own entry.
-            if let Some(hint) = hint
-                && entry.start_offset >= hint
-            {
+            // hint was captured after). If the hint raced past the command's own
+            // entry, remember the latest matching entry before the hint.
+            if entry.start_offset >= hint {
                 return Some(entry);
             }
-            if first_match.is_none() {
-                first_match = Some(entry);
-            }
+            latest_before_hint = Some(entry);
         }
-        first_match
+        latest_before_hint
     }
 
     fn consume_common_refs_matching_transition(
@@ -2227,7 +2393,10 @@ fn commit_subject(message: &str) -> Option<String> {
     message
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| line.to_string())
+        .map(|line| {
+            line.trim_end_matches(|character: char| character.is_ascii_whitespace())
+                .to_string()
+        })
 }
 
 fn resolve_cherry_pick_source_oids_from_sources(
@@ -2421,6 +2590,8 @@ fn pull_reflog_action(cmd: &NormalizedCommand) -> String {
     let parsed = parse_git_cli_args(&raw_args);
     let args = if parsed.command.as_deref() == Some("pull") {
         parsed.command_args
+    } else if cmd.invoked_command.as_deref() == Some("pull") {
+        cmd.invoked_args.clone()
     } else {
         command_args(cmd)
     };
@@ -2495,6 +2666,46 @@ fn clamp_seed_to_entry_containing_offset(
                 && message_matches(&entry.message, message_prefixes)
         })
         .map(|entry| entry.start_offset)
+}
+
+fn head_span_start_near_offset(
+    entries: &[CursorEntry],
+    offset: u64,
+    message_prefixes: &[&str],
+    expected: ExpectedTransition,
+    limit: usize,
+) -> Option<u64> {
+    let mut contiguous = VecDeque::<&CursorEntry>::new();
+    let mut latest_before_offset: Option<u64> = None;
+
+    for entry in entries {
+        if !message_matches(&entry.message, message_prefixes) {
+            contiguous.clear();
+            continue;
+        }
+        if contiguous
+            .back()
+            .is_some_and(|previous| previous.new != entry.old)
+        {
+            contiguous.clear();
+        }
+        contiguous.push_back(entry);
+        while contiguous.len() > limit {
+            contiguous.pop_front();
+        }
+        if !expected.matches(entry) {
+            continue;
+        }
+        let Some(candidate) = contiguous.front() else {
+            continue;
+        };
+        if candidate.start_offset >= offset {
+            return None;
+        }
+        latest_before_offset = Some(candidate.start_offset);
+    }
+
+    latest_before_offset
 }
 
 fn pull_span_start_containing_offset(
@@ -3317,6 +3528,10 @@ fn command_can_move_refs_on_nonzero(primary: Option<&str>) -> bool {
     )
 }
 
+fn command_can_clamp_non_authoritative_cold_seed(cmd: &NormalizedCommand) -> bool {
+    matches!(cmd.primary_command.as_deref(), Some("cherry-pick"))
+}
+
 fn message_matches(message: &str, prefixes: &[&str]) -> bool {
     prefixes.is_empty() || prefixes.iter().any(|prefix| message.starts_with(prefix))
 }
@@ -3427,6 +3642,27 @@ mod tests {
     const E: &str = "5555555555555555555555555555555555555555";
     const F: &str = "6666666666666666666666666666666666666666";
     const G: &str = "7777777777777777777777777777777777777777";
+
+    #[test]
+    fn commit_subject_matches_git_reflog_trailing_whitespace_cleanup() {
+        assert_eq!(commit_subject("subject \t"), Some("subject".to_string()));
+        assert_eq!(
+            commit_subject("\nsubject \t\nbody"),
+            Some("subject".to_string())
+        );
+        assert_eq!(
+            commit_subject("subject\u{00a0}"),
+            Some("subject\u{00a0}".to_string())
+        );
+
+        let args = vec![
+            "commit".to_string(),
+            "-m".to_string(),
+            "subject \t".to_string(),
+        ];
+        assert!(commit_reflog_messages(&args, false).contains("commit: subject"));
+        assert!(commit_reflog_messages(&args, true).contains("commit (amend): subject"));
+    }
 
     #[test]
     fn revert_source_args_do_not_treat_bare_gpg_sign_as_value_option() {
@@ -3734,6 +3970,59 @@ mod tests {
                 new: D.to_string(),
             }],
             "ingress hint must skip the untraced duplicate-message commit"
+        );
+    }
+
+    #[test]
+    fn late_ingress_offset_skips_untraced_duplicate_message_commit() {
+        // Same duplicate-message shape as above, but the async ingress capture
+        // raced behind git and observed the reflog after this command's commit
+        // was already appended. With no candidate at/after the late hint, the
+        // cursor must choose the latest matching entry before the hint rather
+        // than the older untraced duplicate.
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = worktree.join(".git");
+        let head_log = git_dir.join("logs/HEAD");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+
+        let base_line =
+            format!("{A} {B} Test User <test@example.com> 0 +0000\tcommit: traced base\n");
+        let untraced_line =
+            format!("{B} {C} Test User <test@example.com> 0 +0000\tcommit: same message\n");
+        let traced_line =
+            format!("{C} {D} Test User <test@example.com> 0 +0000\tcommit: same message\n");
+        let in_order_offset = base_line.len() as u64;
+        let late_hint_offset = (base_line.len() + untraced_line.len() + traced_line.len()) as u64;
+        fs::write(
+            &head_log,
+            format!("{base_line}{untraced_line}{traced_line}"),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut state = family_state(&family);
+        state.refs.insert("HEAD".to_string(), B.to_string());
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&head_key(&git_dir), in_order_offset)
+            .unwrap();
+
+        let mut cmd =
+            command_with_worktree(&family, Some(worktree), &["commit", "-m", "same message"]);
+        cmd.reflog_start_offsets
+            .insert(head_key(&git_dir), late_hint_offset);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert_eq!(
+            cmd.ref_changes,
+            vec![RefChange {
+                reference: "HEAD".to_string(),
+                old: C.to_string(),
+                new: D.to_string(),
+            }],
+            "late ingress hint must select the traced duplicate-message commit"
         );
     }
 
@@ -4397,6 +4686,131 @@ mod tests {
     }
 
     #[test]
+    fn rebase_span_continuation_skips_stale_abort_before_selected_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = worktree.join(".git");
+        let head_log = git_dir.join("logs/HEAD");
+        let branch_log = git_dir.join("logs/refs/heads/feature");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+        fs::create_dir_all(branch_log.parent().unwrap()).unwrap();
+
+        let failed_start = format!(
+            "{B} {C} Test User <test@example.com> 0 +0000\trebase (start): checkout main\n"
+        );
+        let stale_abort = format!(
+            "{C} {B} Test User <test@example.com> 0 +0000\trebase (abort): returning to refs/heads/stale-topic\n"
+        );
+        let checkout_feature = format!(
+            "{B} {A} Test User <test@example.com> 0 +0000\tcheckout: moving from stale-topic to feature\n"
+        );
+        let feature_commit =
+            format!("{A} {D} Test User <test@example.com> 0 +0000\tcommit: feature ai\n");
+        let rebase_start = format!(
+            "{D} {C} Test User <test@example.com> 0 +0000\trebase (start): checkout main\n"
+        );
+        let rebase_pick =
+            format!("{C} {E} Test User <test@example.com> 0 +0000\trebase (pick): feature ai\n");
+        let rebase_finish = format!(
+            "{E} {E} Test User <test@example.com> 0 +0000\trebase (finish): returning to refs/heads/feature\n"
+        );
+        let failed_start_offset = failed_start.len() as u64;
+        let abort_offset = failed_start_offset + stale_abort.len() as u64;
+        let checkout_offset = abort_offset + checkout_feature.len() as u64;
+        let commit_offset = checkout_offset + feature_commit.len() as u64;
+        fs::write(
+            &head_log,
+            format!(
+                "{failed_start}{stale_abort}{checkout_feature}{feature_commit}{rebase_start}{rebase_pick}{rebase_finish}"
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            &branch_log,
+            format!(
+                "{ZERO} {A} Test User <test@example.com> 0 +0000\tbranch: Created from {A}\n\
+                 {A} {D} Test User <test@example.com> 0 +0000\tcommit: feature ai\n\
+                 {D} {E} Test User <test@example.com> 0 +0000\trebase (finish): refs/heads/feature onto main\n",
+                ZERO = zero_oid(),
+            ),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut state = family_state(&family);
+        state.refs.insert("HEAD".to_string(), C.to_string());
+        state
+            .refs
+            .insert("refs/heads/main".to_string(), C.to_string());
+        state
+            .refs
+            .insert("refs/heads/stale-topic".to_string(), B.to_string());
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&head_key(&git_dir), failed_start_offset)
+            .unwrap();
+
+        let mut checkout = command_with_worktree(
+            &family,
+            Some(worktree.clone()),
+            &["checkout", "-b", "feature", A],
+        );
+        checkout
+            .reflog_start_offsets
+            .insert(head_key(&git_dir), abort_offset);
+        cursor.enrich_command(&mut checkout, &state).unwrap();
+        for change in &checkout.ref_changes {
+            state
+                .refs
+                .insert(change.reference.clone(), change.new.clone());
+        }
+
+        let mut commit = command_with_worktree(
+            &family,
+            Some(worktree.clone()),
+            &["commit", "-m", "feature ai"],
+        );
+        commit
+            .reflog_start_offsets
+            .insert(head_key(&git_dir), checkout_offset);
+        cursor.enrich_command(&mut commit, &state).unwrap();
+        for change in &commit.ref_changes {
+            state
+                .refs
+                .insert(change.reference.clone(), change.new.clone());
+        }
+
+        let mut rebase = command_with_worktree(&family, Some(worktree), &["rebase", "main"]);
+        rebase
+            .reflog_start_offsets
+            .insert(head_key(&git_dir), commit_offset);
+        cursor.enrich_command(&mut rebase, &state).unwrap();
+
+        assert_eq!(
+            rebase.ref_changes,
+            vec![
+                RefChange {
+                    reference: "HEAD".to_string(),
+                    old: D.to_string(),
+                    new: C.to_string(),
+                },
+                RefChange {
+                    reference: "HEAD".to_string(),
+                    old: C.to_string(),
+                    new: E.to_string(),
+                },
+                RefChange {
+                    reference: "refs/heads/feature".to_string(),
+                    old: D.to_string(),
+                    new: E.to_string(),
+                },
+            ],
+            "rebase continuation must follow the selected start, not a stale untraced abort row before it"
+        );
+    }
+
+    #[test]
     fn skipped_reflog_entry_remains_available_for_later_sequenced_command() {
         let temp = tempfile::tempdir().unwrap();
         append_reflog(
@@ -5042,6 +5456,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn pull_reflog_action_uses_expanded_command_for_zero_arg_alias() {
+        let family = FamilyKey::new("/repo/.git".to_string());
+        let mut cmd = command_with_worktree(&family, None, &["up"]);
+        cmd.primary_command = Some("pull".to_string());
+        cmd.invoked_command = Some("pull".to_string());
+        cmd.invoked_args.clear();
+
+        assert_eq!(pull_reflog_action(&cmd), "pull");
     }
 
     #[test]

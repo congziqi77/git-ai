@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod authorship;
+pub(crate) mod checkpoint_content_budget;
 pub mod ci;
 pub mod commands;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod notes;
 pub mod observability;
 pub mod process_timeout;
 pub mod repo_url;
+pub mod sqlite;
 pub mod streams;
 pub mod tokio_runtime;
 pub mod utils;

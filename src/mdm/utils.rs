@@ -436,6 +436,28 @@ pub fn claude_config_dir() -> PathBuf {
     home_dir().join(".claude")
 }
 
+/// Codex home directory, respecting the CODEX_HOME env var.
+/// Falls back to ~/.codex when unset.
+pub fn codex_home_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CODEX_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    home_dir().join(".codex")
+}
+
+/// Gemini CLI config directory, respecting the GEMINI_CLI_HOME env var.
+/// GEMINI_CLI_HOME points to the user home root, and Gemini stores config under .gemini.
+pub fn gemini_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join(".gemini");
+    }
+    home_dir().join(".gemini")
+}
+
 /// Write data to a file atomically (write to temp, then rename)
 /// If the path is a symlink, writes to the target file (preserving the symlink)
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
@@ -732,8 +754,7 @@ pub fn update_vscode_chat_hook_settings(
 
     let object = root.object_value_or_set();
     let mut changed = false;
-
-    match object.get("chat.useHooks") {
+    let mut enable_setting = |key: &str| match object.get(key) {
         Some(prop) => {
             let should_update = match prop.value() {
                 Some(node) => match node.as_boolean_lit() {
@@ -749,10 +770,13 @@ pub fn update_vscode_chat_hook_settings(
             }
         }
         None => {
-            object.append("chat.useHooks", jsonc_parser::json!(true));
+            object.append(key, jsonc_parser::json!(true));
             changed = true;
         }
-    }
+    };
+
+    enable_setting("chat.useHooks");
+    enable_setting("github.copilot.chat.otel.dbSpanExporter.enabled");
 
     if !changed {
         return Ok(None);
@@ -933,6 +957,7 @@ mod tests {
         let final_content = fs::read_to_string(&settings_path).unwrap();
         assert!(final_content.contains("// keep existing entries"));
         assert!(final_content.contains("\"chat.useHooks\": true"));
+        assert!(final_content.contains("otel.dbSpanExporter.enabled\": true"));
     }
 
     #[test]
@@ -940,7 +965,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let settings_path = temp_dir.path().join("settings.json");
         let initial = r#"{
-    "chat.useHooks": true
+    "chat.useHooks": true,
+    "github.copilot.chat.otel.dbSpanExporter.enabled": true
 }
 "#;
         fs::write(&settings_path, initial).unwrap();
@@ -1335,6 +1361,110 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
         assert_eq!(dir, home_dir().join(".claude"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_home_dir_defaults_to_home_dot_codex() {
+        let prev = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+        }
+        let dir = codex_home_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        assert_eq!(dir, home_dir().join(".codex"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_gemini_config_dir_defaults_to_home_dot_gemini() {
+        let prev = std::env::var_os("GEMINI_CLI_HOME");
+        unsafe {
+            std::env::remove_var("GEMINI_CLI_HOME");
+        }
+        let dir = gemini_config_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("GEMINI_CLI_HOME", value),
+                None => std::env::remove_var("GEMINI_CLI_HOME"),
+            }
+        }
+        assert_eq!(dir, home_dir().join(".gemini"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_home_dir_respects_env_var() {
+        let prev = std::env::var_os("CODEX_HOME");
+        let custom = "/tmp/my-codex-home";
+        unsafe {
+            std::env::set_var("CODEX_HOME", custom);
+        }
+        let dir = codex_home_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        assert_eq!(dir, PathBuf::from(custom));
+    }
+
+    #[test]
+    #[serial]
+    fn test_gemini_config_dir_respects_env_var() {
+        let prev = std::env::var_os("GEMINI_CLI_HOME");
+        let custom = "/tmp/my-gemini-home";
+        unsafe {
+            std::env::set_var("GEMINI_CLI_HOME", custom);
+        }
+        let dir = gemini_config_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("GEMINI_CLI_HOME", value),
+                None => std::env::remove_var("GEMINI_CLI_HOME"),
+            }
+        }
+        assert_eq!(dir, PathBuf::from(custom).join(".gemini"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_home_dir_ignores_empty_env_var() {
+        let prev = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", "");
+        }
+        let dir = codex_home_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        assert_eq!(dir, home_dir().join(".codex"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_gemini_config_dir_ignores_empty_env_var() {
+        let prev = std::env::var_os("GEMINI_CLI_HOME");
+        unsafe {
+            std::env::set_var("GEMINI_CLI_HOME", "");
+        }
+        let dir = gemini_config_dir();
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("GEMINI_CLI_HOME", value),
+                None => std::env::remove_var("GEMINI_CLI_HOME"),
+            }
+        }
+        assert_eq!(dir, home_dir().join(".gemini"));
     }
 
     /// Regression test for #1039: write_atomic should create parent directories

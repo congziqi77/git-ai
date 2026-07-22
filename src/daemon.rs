@@ -1,4 +1,5 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
+use crate::checkpoint_content_budget::CheckpointContentBudget;
 use crate::config;
 use crate::daemon::git_backend::GitBackend;
 use crate::error::GitAiError;
@@ -37,9 +38,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-#[cfg(windows)]
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(not(windows))]
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
@@ -62,6 +64,7 @@ pub mod git_backend;
 pub mod global_actor;
 pub mod reducer;
 pub mod ref_cursor;
+pub mod rewrite_metrics;
 pub mod sentry_layer;
 pub mod stream_worker;
 pub mod sweep_coordinator;
@@ -87,6 +90,15 @@ const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_CHECKPOINT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const DAEMON_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+// Trace2 frames are written synchronously by Git to the daemon's Unix socket.
+// With small kernel socket buffers (macOS defaults to ~8 KiB), a bursty trace2
+// stream can fill the buffer and block the raw `git` process in `write()` until
+// the daemon drains it. A larger receive buffer absorbs those bursts. Starts at
+// a conservative 512 KiB and can be raised toward 1 MiB via the env override
+// without a code change. This is a mitigation, not a guarantee: any finite
+// buffer can still fill if the daemon genuinely stops draining.
+#[cfg(not(windows))]
+const TRACE_SOCKET_RECV_BUFFER_BYTES: usize = 512 * 1024;
 const TRACE_INGEST_QUEUE_CAPACITY: usize = 16_384;
 #[cfg(not(windows))]
 const TRACE_CONNECTION_BOOTSTRAP_READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -139,6 +151,15 @@ impl Write for DaemonClientStream {
 
 pub fn daemon_process_active() -> bool {
     DAEMON_PROCESS_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Result returned by the `await` control request.
+#[derive(Debug, Serialize, Deserialize)]
+struct AwaitResult {
+    done: bool,
+    timed_out: bool,
+    metrics_remaining: usize,
+    notes_remaining: usize,
 }
 
 struct DaemonProcessActiveGuard;
@@ -677,14 +698,20 @@ fn stash_base_head(repo: &Repository, stash_sha: &str) -> Option<String> {
 /// After a rebase completes, check if any newly-rebased commits were created
 /// from conflict resolution with AI checkpoints. If so, merge those resolution
 /// checkpoints into the already-shifted source authorship note for the new commit.
+#[derive(Default)]
+struct RewriteMetricContext {
+    parent_by_commit: HashMap<String, String>,
+    parent_diff_by_commit: HashMap<String, crate::authorship::rewrite::DiffTreeResult>,
+}
+
 fn process_conflict_resolution_working_logs(
     repo: &Repository,
     new_tip: &str,
     onto: Option<&str>,
-) -> Result<(), GitAiError> {
+) -> Result<RewriteMetricContext, GitAiError> {
     let onto_sha = match onto {
         Some(s) if !s.is_empty() => s,
-        _ => return Ok(()),
+        _ => return Ok(RewriteMetricContext::default()),
     };
 
     // Walk rebased commits between onto and new_tip
@@ -708,6 +735,18 @@ fn process_conflict_resolution_working_logs(
         .iter()
         .map(|(commit_sha, _)| commit_sha.clone())
         .collect::<Vec<_>>();
+    let collect_metric_context = crate::authorship::rewrite::rewrite_metrics_enabled();
+    let mut metric_context = if collect_metric_context {
+        RewriteMetricContext {
+            parent_by_commit: commit_parent_pairs
+                .iter()
+                .map(|(commit_sha, parent_sha)| (commit_sha.clone(), parent_sha.clone()))
+                .collect(),
+            parent_diff_by_commit: HashMap::new(),
+        }
+    } else {
+        RewriteMetricContext::default()
+    };
     let existing_notes = crate::git::notes_api::read_notes_batch(repo, &commit_shas)?;
     let author = repo.effective_author_identity().formatted_or_unknown();
 
@@ -733,6 +772,13 @@ fn process_conflict_resolution_working_logs(
         .zip(diff_results.iter())
         .map(|((commit_sha, _), result)| (commit_sha.as_str(), result))
         .collect();
+    if collect_metric_context {
+        metric_context.parent_diff_by_commit = qualifying
+            .iter()
+            .zip(diff_results.iter())
+            .map(|((commit_sha, _), result)| (commit_sha.clone(), result.clone()))
+            .collect();
+    }
 
     for (commit_sha, parent_sha) in &commit_parent_pairs {
         let existing_shifted_log = existing_notes
@@ -747,7 +793,25 @@ fn process_conflict_resolution_working_logs(
             diff_by_commit.get(commit_sha.as_str()).copied(),
         )?;
     }
-    Ok(())
+    Ok(metric_context)
+}
+
+fn rewrite_metric_commits_with_context(
+    metric_commits: Vec<crate::authorship::rewrite::RewriteMetricCommit>,
+    context: RewriteMetricContext,
+) -> Vec<crate::authorship::rewrite::RewriteMetricCommit> {
+    metric_commits
+        .into_iter()
+        .map(|mut commit| {
+            if let Some(parent_sha) = context.parent_by_commit.get(&commit.new_sha) {
+                commit = commit.with_parent_sha(parent_sha.clone());
+            }
+            if let Some(diff) = context.parent_diff_by_commit.get(&commit.new_sha) {
+                commit = commit.with_parent_diff(diff.clone());
+            }
+            commit
+        })
+        .collect()
 }
 
 fn post_conflict_resolution_working_log(
@@ -793,7 +857,7 @@ fn rfc3339_to_unix_nanos(value: &str) -> Option<u128> {
         .and_then(|timestamp| u128::try_from(timestamp.timestamp_nanos_opt()?).ok())
 }
 
-fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiError> {
+fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
     if request.files.is_empty() {
         return Ok(());
     }
@@ -824,7 +888,7 @@ fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiE
         crate::metrics::record(values, attrs);
     }
 
-    let resolved = resolve_checkpoint_request(&repo, &request)?;
+    let resolved = resolve_checkpoint_request(&repo, &mut request)?;
     let Some(resolved) = resolved else {
         return Ok(());
     };
@@ -840,7 +904,7 @@ fn apply_checkpoint_side_effect(request: CheckpointRequest) -> Result<(), GitAiE
 
 fn resolve_checkpoint_request(
     repo: &crate::git::repository::Repository,
-    request: &CheckpointRequest,
+    request: &mut CheckpointRequest,
 ) -> Result<Option<crate::daemon::checkpoint::ResolvedCheckpointExecution>, GitAiError> {
     use crate::authorship::ignore::{
         build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
@@ -862,10 +926,12 @@ fn resolve_checkpoint_request(
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
 
     let mut files = Vec::new();
-    let mut dirty_files = HashMap::new();
+    let mut dirty_files: HashMap<String, Arc<str>> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
+    let config = config::Config::fresh();
+    let mut content_budget = CheckpointContentBudget::from_config(&config);
 
-    for file in &request.files {
+    for file in &mut request.files {
         let path_str = file.path.to_string_lossy();
         let path_str = path_str.trim();
         if path_str.is_empty() {
@@ -900,10 +966,14 @@ fn resolve_checkpoint_request(
             continue;
         }
 
-        if let Some(content) = &file.content
-            && !content.chars().any(|c| c == '\0')
-        {
-            dirty_files.insert(relative_path.clone(), content.clone());
+        if let Some(content) = std::mem::take(&mut file.content) {
+            if content.as_bytes().contains(&0) {
+                continue;
+            }
+            if !content_budget.reserve(&relative_path, &content) {
+                continue;
+            }
+            dirty_files.insert(relative_path.clone(), Arc::from(content));
             files.push(relative_path);
         }
     }
@@ -1372,6 +1442,44 @@ fn valid_non_zero_ref_change(change: &crate::daemon::domain::RefChange) -> bool 
         && change.old != change.new
 }
 
+fn rewrite_metric_branch_for_ref(reference: &str) -> Option<String> {
+    crate::authorship::rewrite::branch_name_from_ref(reference)
+}
+
+fn rewrite_metric_branch_for_transition(
+    cmd: &crate::daemon::domain::NormalizedCommand,
+    old_tip: &str,
+    new_tip: &str,
+    reference_hint: Option<&str>,
+) -> Option<String> {
+    reference_hint
+        .and_then(rewrite_metric_branch_for_ref)
+        .or_else(|| {
+            cmd.ref_changes
+                .iter()
+                .rev()
+                .find(|change| {
+                    change.reference.starts_with("refs/heads/")
+                        && change.old == old_tip
+                        && change.new == new_tip
+                })
+                .and_then(|change| rewrite_metric_branch_for_ref(&change.reference))
+        })
+}
+
+fn rewrite_metric_commits_with_branch(
+    metric_commits: Vec<crate::authorship::rewrite::RewriteMetricCommit>,
+    branch: Option<String>,
+) -> Vec<crate::authorship::rewrite::RewriteMetricCommit> {
+    match branch {
+        Some(branch) => metric_commits
+            .into_iter()
+            .map(|commit| commit.with_branch(branch.clone()))
+            .collect(),
+        None => metric_commits,
+    }
+}
+
 fn rebase_new_tip_from_command(
     cmd: &crate::daemon::domain::NormalizedCommand,
     original_head: &str,
@@ -1787,7 +1895,10 @@ fn apply_revert_complete_rewrite(
             },
         )
         .collect();
-    crate::authorship::rewrite_revert::handle_revert_commits(repo, &specs)
+    let metric_commits =
+        crate::authorship::rewrite_revert::handle_revert_commits_with_metrics(repo, &specs)?;
+    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, metric_commits);
+    Ok(())
 }
 
 fn apply_cherry_pick_complete_rewrite(
@@ -1801,15 +1912,17 @@ fn apply_cherry_pick_complete_rewrite(
         sources,
         new_commits,
     )?;
+    let mut rewrite_metric_commits = Vec::new();
     if !pairs.is_empty() {
         let (src, dst): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-        crate::authorship::rewrite::handle_rewrite_event(
+        let outcome = crate::authorship::rewrite::handle_rewrite_event_with_metrics(
             repo,
             crate::authorship::rewrite::RewriteEvent::CherryPickComplete {
                 sources: src,
                 new_commits: dst,
             },
         )?;
+        rewrite_metric_commits.extend(outcome.metric_commits);
     }
 
     let existing_notes = crate::git::notes_api::read_notes_batch(repo, new_commits)?;
@@ -1859,12 +1972,35 @@ fn apply_cherry_pick_complete_rewrite(
         )?;
     }
 
+    let rewrite_metric_commits = if rewrite_metric_commits.is_empty() {
+        rewrite_metric_commits
+    } else {
+        let parent_by_commit: HashMap<&str, &str> = commit_parent_pairs
+            .iter()
+            .map(|(commit_sha, parent_sha)| (commit_sha.as_str(), parent_sha.as_str()))
+            .collect();
+        rewrite_metric_commits
+            .into_iter()
+            .map(|mut commit| {
+                if let Some(parent_sha) = parent_by_commit.get(commit.new_sha.as_str()) {
+                    commit = commit.with_parent_sha((*parent_sha).to_string());
+                }
+                if let Some(diff) = diff_by_commit.get(commit.new_sha.as_str()) {
+                    commit = commit.with_parent_diff((*diff).clone());
+                }
+                commit
+            })
+            .collect()
+    };
+    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, rewrite_metric_commits);
+
     Ok(())
 }
 
 fn apply_cherry_pick_no_commit_rewrite(
     repo: &crate::git::repository::Repository,
     sources: &[String],
+    parent_head: &str,
     new_head: &str,
 ) -> Result<(), GitAiError> {
     if sources.is_empty() || new_head.is_empty() {
@@ -1875,7 +2011,26 @@ fn apply_cherry_pick_no_commit_rewrite(
         .map(|source| (source.clone(), new_head.to_string()))
         .collect::<Vec<_>>();
     crate::git::sync_authorship::fetch_missing_notes_for_commits(repo, sources)?;
-    crate::authorship::rewrite::shift_authorship_notes_merging_existing(repo, &mappings)
+    let shifted_notes =
+        crate::authorship::rewrite::shift_authorship_notes_merging_existing_with_notes(
+            repo, &mappings,
+        )?;
+    if crate::authorship::rewrite::rewrite_metrics_enabled() {
+        let mut metric_commit = crate::authorship::rewrite::RewriteMetricCommit::new(
+            new_head.to_string(),
+            sources.to_vec(),
+            crate::authorship::rewrite::RewriteMetricOperation::CherryPickNoCommit,
+        )
+        .with_parent_sha(parent_head.to_string());
+        if let Some((_, note)) = shifted_notes
+            .into_iter()
+            .find(|(commit_sha, _)| commit_sha == new_head)
+        {
+            metric_commit = metric_commit.with_authorship_note(note);
+        }
+        crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, vec![metric_commit]);
+    }
+    Ok(())
 }
 
 fn strict_rebase_original_head_from_command(
@@ -4643,24 +4798,36 @@ impl ActorDaemonCoordinator {
                             && is_ancestor_commit(&repo, onto, &new_tip)
                     })
                     .or(command_rebase_onto);
-                crate::authorship::rewrite::handle_non_fast_forward_rewrite(
-                    &repo,
-                    &original_head,
-                    &new_tip,
-                    rebase_onto.as_deref(),
-                )?;
+                let outcome =
+                    crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
+                        &repo,
+                        &original_head,
+                        &new_tip,
+                        rebase_onto.as_deref(),
+                        crate::authorship::rewrite::RewriteMetricOperation::Rebase,
+                    )?;
                 repo.storage.rename_working_log(&original_head, &new_tip)?;
                 let conflict_base = rebase_onto.clone();
-                process_conflict_resolution_working_logs(
+                let metric_context = process_conflict_resolution_working_logs(
                     &repo,
                     &new_tip,
                     conflict_base.as_deref(),
                 )?;
+                let metric_commits =
+                    rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
+                if !metric_commits.is_empty() {
+                    let branch =
+                        rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
+                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                        &repo,
+                        rewrite_metric_commits_with_branch(metric_commits, branch),
+                    );
+                }
             }
             return Ok(());
         }
 
-        for (old_tip, new_tip) in collapsed.values() {
+        for (reference, (old_tip, new_tip)) in &collapsed {
             if *old_tip == *new_tip {
                 continue;
             }
@@ -4675,16 +4842,47 @@ impl ActorDaemonCoordinator {
             } else {
                 onto_hint.clone()
             };
-            crate::authorship::rewrite::handle_non_fast_forward_rewrite(
-                &repo,
-                old_tip,
-                new_tip,
-                rewrite_onto.as_deref(),
-            )?;
+            let outcome = if is_rebase_cmd {
+                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
+                    &repo,
+                    old_tip,
+                    new_tip,
+                    rewrite_onto.as_deref(),
+                    crate::authorship::rewrite::RewriteMetricOperation::Rebase,
+                )?
+            } else if cmd.primary_command.as_deref() == Some("update-ref") {
+                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
+                    &repo,
+                    old_tip,
+                    new_tip,
+                    rewrite_onto.as_deref(),
+                    crate::authorship::rewrite::RewriteMetricOperation::UpdateRef,
+                )?
+            } else {
+                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
+                    &repo,
+                    old_tip,
+                    new_tip,
+                    rewrite_onto.as_deref(),
+                    crate::authorship::rewrite::RewriteMetricOperation::NonFastForward,
+                )?
+            };
             repo.storage.rename_working_log(old_tip, new_tip)?;
-            if is_rebase_cmd {
+            let metric_context = if is_rebase_cmd {
                 let conflict_base = rewrite_onto.clone().or_else(|| onto_hint.clone());
-                process_conflict_resolution_working_logs(&repo, new_tip, conflict_base.as_deref())?;
+                process_conflict_resolution_working_logs(&repo, new_tip, conflict_base.as_deref())?
+            } else {
+                RewriteMetricContext::default()
+            };
+            let metric_commits =
+                rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
+            if !metric_commits.is_empty() {
+                let branch =
+                    rewrite_metric_branch_for_transition(cmd, old_tip, new_tip, Some(reference));
+                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                    &repo,
+                    rewrite_metric_commits_with_branch(metric_commits, branch),
+                );
             }
         }
 
@@ -5282,14 +5480,19 @@ impl ActorDaemonCoordinator {
                         {
                             if base.as_deref().is_some_and(|base| base == pending.onto) {
                                 let repo = find_repository_in_path(&worktree)?;
-                                crate::authorship::rewrite::handle_rewrite_event(
+                                let outcome =
+                                    crate::authorship::rewrite::handle_rewrite_event_with_metrics(
+                                        &repo,
+                                        crate::authorship::rewrite::RewriteEvent::SquashMerge {
+                                            source_head: pending.source_head,
+                                            squash_commit: new_head.clone(),
+                                            onto: pending.onto,
+                                        },
+                                    )?;
+                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
                                     &repo,
-                                    crate::authorship::rewrite::RewriteEvent::SquashMerge {
-                                        source_head: pending.source_head,
-                                        squash_commit: new_head.clone(),
-                                        onto: pending.onto,
-                                    },
-                                )?;
+                                    outcome.metric_commits,
+                                );
                                 handled_as_squash_merge = true;
                             } else {
                                 self.set_pending_squash_merge_for_worktree(
@@ -5366,6 +5569,7 @@ impl ActorDaemonCoordinator {
                                     apply_cherry_pick_no_commit_rewrite(
                                         &repo,
                                         &pending.source_commits,
+                                        &pending.head,
                                         new_head,
                                     )?;
                                 } else {
@@ -5405,8 +5609,8 @@ impl ActorDaemonCoordinator {
                             // Post-commit note generation does synchronous git/filesystem work
                             // and may briefly wait for transcript recovery. Mark it as blocking
                             // so the transcript worker can process the recovery sweep promptly.
-                            run_blocking_side_effect(|| {
-                                crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps(
+                            let amend_result = run_blocking_side_effect(|| {
+                                crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
                                     &repo,
                                     old_head,
                                     new_head,
@@ -5415,6 +5619,20 @@ impl ActorDaemonCoordinator {
                                     Some(&recovery_preflight),
                                 )
                             })?;
+                            if crate::authorship::rewrite::rewrite_metrics_enabled() {
+                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                    &repo,
+                                    vec![
+                                        crate::authorship::rewrite::RewriteMetricCommit::new(
+                                            new_head.to_string(),
+                                            vec![old_head.to_string()],
+                                            crate::authorship::rewrite::RewriteMetricOperation::Amend,
+                                        )
+                                        .with_parent_sha(amend_result.parent_sha)
+                                        .with_authorship_note(amend_result.authorship_note),
+                                    ],
+                                );
+                            }
                         }
                     }
                     crate::daemon::domain::SemanticEvent::Reset {
@@ -5433,7 +5651,8 @@ impl ActorDaemonCoordinator {
                                         &repo, old_head, new_head,
                                     )?;
                                 } else if !is_ancestor_commit(&repo, old_head, new_head) {
-                                    crate::authorship::rewrite::handle_rewrite_event(
+                                    let outcome =
+                                        crate::authorship::rewrite::handle_rewrite_event_with_metrics(
                                         &repo,
                                         crate::authorship::rewrite::RewriteEvent::NonFastForward {
                                             old_tip: old_head.to_string(),
@@ -5441,6 +5660,10 @@ impl ActorDaemonCoordinator {
                                             onto: None,
                                         },
                                     )?;
+                                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                        &repo,
+                                        outcome.metric_commits,
+                                    );
                                 }
                             }
                         }
@@ -5753,6 +5976,164 @@ impl ActorDaemonCoordinator {
         self.status_for_family(repo_working_dir).await
     }
 
+    /// Wait for the daemon to finish all in-flight work and telemetry flushing.
+    ///
+    /// Progress is logged every few seconds. Returns an `AwaitResult` describing
+    /// whether the daemon was idle before the timeout and how much telemetry
+    /// (if any) is still pending.
+    async fn await_completion(&self, timeout_secs: u64) -> AwaitResult {
+        use tokio::time::{Duration, Instant, timeout};
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(timeout_secs);
+        let log_interval = Duration::from_secs(3);
+        let mut last_log = start;
+
+        let mut result = AwaitResult {
+            done: false,
+            timed_out: false,
+            metrics_remaining: 0,
+            notes_remaining: 0,
+        };
+
+        let mut maybe_log = |phase: &str| {
+            let now = Instant::now();
+            if now - last_log >= log_interval {
+                tracing::info!(phase, "await: still waiting");
+                eprintln!("await: still waiting for {}...", phase);
+                last_log = now;
+            }
+        };
+
+        // Phase 1: wait for the trace-ingest and family-sequencer work side.
+        while !self.is_shutting_down() {
+            let now = Instant::now();
+            if now >= deadline {
+                result.timed_out = true;
+                break;
+            }
+            let remaining = deadline - now;
+
+            maybe_log("daemon work");
+            if timeout(remaining, self.wait_for_trace_ingest_processed_through())
+                .await
+                .is_err()
+            {
+                result.timed_out = true;
+                break;
+            }
+
+            if self.is_shutting_down() {
+                break;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                result.timed_out = true;
+                break;
+            }
+            let remaining = deadline - now;
+
+            if timeout(remaining, self.drain_all_ready_family_sequencers())
+                .await
+                .is_err()
+            {
+                result.timed_out = true;
+                break;
+            }
+
+            if !self.has_pending_daemon_work() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        if self.is_shutting_down() {
+            result.timed_out = true;
+        }
+
+        // Phase 2: drain the transcript/stream worker.
+        if !result.timed_out
+            && let Some(worker) = &self.stream_worker
+        {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = deadline - now;
+                maybe_log("transcript processing");
+                match timeout(remaining, worker.drain()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "await: transcript drain failed");
+                    }
+                    Err(_) => {
+                        result.timed_out = true;
+                    }
+                }
+            } else {
+                result.timed_out = true;
+            }
+        }
+
+        // Phase 3: flush telemetry and wait for the worker to finish.
+        if !result.timed_out
+            && let Some(worker) = &self.telemetry_worker
+        {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = deadline - now;
+                maybe_log("telemetry flush");
+                match timeout(remaining, worker.flush_and_wait()).await {
+                    Ok(Ok(status)) => {
+                        result.metrics_remaining = status.metrics_remaining;
+                        result.notes_remaining = status.notes_remaining;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "await: telemetry flush failed");
+                    }
+                    Err(_) => {
+                        result.timed_out = true;
+                    }
+                }
+            } else {
+                result.timed_out = true;
+            }
+        }
+
+        result.done = !result.timed_out
+            && result.metrics_remaining == 0
+            && result.notes_remaining == 0
+            && !self.has_pending_daemon_work();
+        result
+    }
+
+    fn has_pending_daemon_work(&self) -> bool {
+        if self.queued_trace_payloads.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        if self.next_trace_ingest_seq.load(Ordering::Acquire)
+            > self.processed_trace_ingest_seq.load(Ordering::Acquire)
+        {
+            return true;
+        }
+        if self.has_open_trace_roots_that_may_mutate_refs() {
+            return true;
+        }
+        if let Ok(map) = self.inflight_effects_by_family.lock()
+            && !map.is_empty()
+        {
+            return true;
+        }
+        if let Ok(map) = self.family_sequencers_by_family.lock() {
+            for state in map.values() {
+                if !state.entries.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
@@ -5832,6 +6213,12 @@ impl ActorDaemonCoordinator {
                     crate::daemon::telemetry_worker::flush_notes();
                 });
                 Ok(ControlResponse::ok(None, None))
+            }
+            ControlRequest::Await { timeout_secs } => {
+                let result = self.await_completion(timeout_secs).await;
+                serde_json::to_value(result)
+                    .map(|v| ControlResponse::ok(None, Some(v)))
+                    .map_err(GitAiError::from)
             }
             ControlRequest::BashSessionStart {
                 repo_work_dir,
@@ -6330,6 +6717,12 @@ fn trace_listener_loop_actor(
             let Ok(stream) = stream else {
                 continue;
             };
+            // Raise the receive buffer on each accepted connection. Unlike TCP,
+            // a Unix-domain listener's SO_RCVBUF is not inherited by accepted
+            // connections, so this per-connection call is what takes effect.
+            if let Err(error) = set_trace_socket_recv_buffer(&stream) {
+                tracing::debug!(%error, "trace connection recv buffer setup failed");
+            }
             if let Err(error) = coordinator.trace_unidentified_connection_opened() {
                 tracing::debug!(%error, "trace connection open bookkeeping error");
                 continue;
@@ -7178,6 +7571,12 @@ fn checkpoint_control_response_timeout(
         }
         ControlRequest::SyncFamily { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         ControlRequest::SnapshotWatermarks { .. } => Duration::from_millis(500),
+        // Await blocks until the requested timeout is reached; give the daemon
+        // a small grace period over the requested limit so the caller sees a
+        // response rather than a client-side socket timeout.
+        ControlRequest::Await { timeout_secs } => {
+            Duration::from_secs(timeout_secs.saturating_add(5))
+        }
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     }
 }
@@ -7194,6 +7593,75 @@ fn local_socket_name<'a>(socket_path: &'a Path) -> Result<Name<'a>, GitAiError> 
     socket_path
         .to_fs_name::<GenericFilePath>()
         .map_err(|e| GitAiError::Generic(format!("invalid daemon socket path: {}", e)))
+}
+
+/// Target trace socket receive buffer size in bytes.
+///
+/// Defaults to `TRACE_SOCKET_RECV_BUFFER_BYTES` and can be overridden via
+/// `GIT_AI_TRACE_SOCKET_RECV_BUFFER_BYTES` to ramp toward 1 MiB (or larger)
+/// without a code change. A value of `0` disables the buffer bump entirely.
+#[cfg(not(windows))]
+fn trace_socket_recv_buffer_bytes() -> usize {
+    std::env::var("GIT_AI_TRACE_SOCKET_RECV_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(TRACE_SOCKET_RECV_BUFFER_BYTES)
+}
+
+#[cfg(not(windows))]
+fn set_trace_socket_recv_buffer(stream: &LocalSocketStream) -> io::Result<()> {
+    match stream {
+        LocalSocketStream::UdSocket(stream) => {
+            set_socket_recv_buffer(stream, trace_socket_recv_buffer_bytes())
+        }
+    }
+}
+
+/// Raise a socket's kernel receive buffer to `bytes` via `SO_RCVBUF`.
+///
+/// A `bytes` of `0` is a no-op (buffer bump disabled). The kernel may clamp the
+/// request to `net.core.rmem_max` on Linux, so the effective value can be lower
+/// than requested; that is fine -- this only ever raises capacity.
+#[cfg(not(windows))]
+fn set_socket_recv_buffer<S: AsFd>(socket: &S, bytes: usize) -> io::Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let value = bytes.min(libc::c_int::MAX as usize) as libc::c_int;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+fn socket_recv_buffer<S: AsFd>(socket: &S) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(value.max(0) as usize)
+    }
 }
 
 pub fn open_local_socket_stream_with_timeout(
@@ -8684,6 +9152,47 @@ mod tests {
         )
         .await
         .expect("checkpoint trace ingest drain must return when daemon shutdown is requested");
+    }
+
+    /// The trace socket receive-buffer helper must raise a socket's `SO_RCVBUF`
+    /// capacity toward the configured target.
+    #[test]
+    #[cfg(not(windows))]
+    fn trace_socket_recv_buffer_helper_raises_socket_capacity() {
+        let (server, _client) =
+            std::os::unix::net::UnixStream::pair().expect("create connected unix socket pair");
+        let before = socket_recv_buffer(&server).expect("read baseline receive buffer");
+        set_socket_recv_buffer(&server, TRACE_SOCKET_RECV_BUFFER_BYTES)
+            .expect("set trace socket receive buffer");
+        let after = socket_recv_buffer(&server).expect("read trace socket receive buffer");
+        // Linux clamps SO_RCVBUF to net.core.rmem_max, so `after` can land below
+        // the target on hosts with a small rmem_max (e.g. CI's ~208 KiB
+        // default). The helper is still correct as long as it raised capacity
+        // toward the target: it either reached the target or grew past the
+        // default buffer.
+        assert!(
+            after >= TRACE_SOCKET_RECV_BUFFER_BYTES || after > before,
+            "trace socket receive buffer should reach {} bytes or exceed the {}-byte baseline, got {}",
+            TRACE_SOCKET_RECV_BUFFER_BYTES,
+            before,
+            after
+        );
+    }
+
+    /// A zero target is a no-op: the helper must not error and must not shrink
+    /// the socket's existing receive buffer.
+    #[test]
+    #[cfg(not(windows))]
+    fn trace_socket_recv_buffer_helper_zero_is_noop() {
+        let (server, _client) =
+            std::os::unix::net::UnixStream::pair().expect("create connected unix socket pair");
+        let before = socket_recv_buffer(&server).expect("read baseline receive buffer");
+        set_socket_recv_buffer(&server, 0).expect("zero target must be a no-op");
+        let after = socket_recv_buffer(&server).expect("read receive buffer after no-op");
+        assert_eq!(
+            before, after,
+            "a zero target must not change the socket receive buffer"
+        );
     }
 
     /// Concurrent enqueues from multiple threads must never deadlock or

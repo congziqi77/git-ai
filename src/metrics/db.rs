@@ -9,18 +9,30 @@ use crate::metrics::attrs::attr_pos;
 use crate::metrics::events::{checkpoint_pos, otel_trace_pos, session_event_pos};
 use crate::metrics::pos_encoded::sparse_get_string;
 use crate::metrics::types::{MetricEvent, MetricEventId};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// Current schema version (must match MIGRATIONS.len())
-const SCHEMA_VERSION: usize = 4;
+const SCHEMA_VERSION: usize = 5;
 
+// This value is part of the metrics retry index schema. Changing it requires a
+// migration that rebuilds `metrics_retryable` with the same literal used by
+// the retry queries below; SQLite cannot prove a parameterized predicate
+// implies a partial-index predicate.
 const MAX_METRIC_UPLOAD_ATTEMPTS: u32 = 6;
 const METRIC_PROCESSING_LOCK_TIMEOUT_SECS: u64 = 10 * 60;
 pub(crate) const METADATA_BACKFILL_BATCH_SIZE: usize = 1000;
 const NS_PER_SECOND: u128 = 1_000_000_000;
+
+const RETRYABLE_METRIC_IDS_SQL: &str = "SELECT id FROM metrics \
+     WHERE delivered_ts IS NULL \
+       AND processing_started_at IS NULL \
+       AND next_retry_at <= ?1 \
+       AND attempts < 6 \
+     ORDER BY next_retry_at ASC, id DESC \
+     LIMIT ?2";
 
 /// Database migrations - each migration upgrades the schema by one version
 const MIGRATIONS: &[&str] = &[
@@ -65,6 +77,17 @@ const MIGRATIONS: &[&str] = &[
         WHERE parent_session_id IS NOT NULL
             AND event_kind IS NOT NULL
             AND event_ts IS NOT NULL;
+    "#,
+    // Migration 4 -> 5: Keep terminal history out of retry lookups. The
+    // predicate and ordering intentionally match dequeue/count queries.
+    r#"
+    CREATE INDEX IF NOT EXISTS metrics_retryable
+        ON metrics (next_retry_at ASC, id DESC)
+        WHERE delivered_ts IS NULL
+            AND processing_started_at IS NULL
+            AND attempts < 6;
+
+    DROP INDEX IF EXISTS metrics_pending_retry;
     "#,
 ];
 
@@ -151,16 +174,13 @@ impl MetricsDatabase {
 
     /// Get or initialize the global database
     pub fn global() -> Result<&'static Mutex<MetricsDatabase>, GitAiError> {
-        let db_mutex = METRICS_DB.get_or_init(|| {
-            match Self::new() {
-                Ok(db) => Mutex::new(db),
-                Err(e) => {
-                    eprintln!("[Error] Failed to initialize metrics database: {}", e);
-                    // Create a dummy connection that will fail on any operation
-                    let temp_path = std::env::temp_dir().join("git-ai-metrics-db-failed");
-                    let conn = Connection::open(&temp_path).expect("Failed to create temp DB");
-                    Mutex::new(MetricsDatabase { conn })
-                }
+        let db_mutex = METRICS_DB.get_or_init(|| match Self::new() {
+            Ok(db) => Mutex::new(db),
+            Err(e) => {
+                eprintln!("[Error] Failed to initialize metrics database: {}", e);
+                Mutex::new(
+                    Self::new_fallback().expect("Failed to create fallback metrics database"),
+                )
             }
         });
 
@@ -177,12 +197,11 @@ impl MetricsDatabase {
         }
 
         // Open with WAL mode and performance optimizations
-        let conn = Connection::open(&db_path)?;
+        let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
             "#,
         )?;
@@ -193,9 +212,31 @@ impl MetricsDatabase {
         Ok(db)
     }
 
+    fn new_fallback() -> Result<Self, GitAiError> {
+        let temp_path = std::env::temp_dir().join("git-ai-metrics-db-failed");
+        Self::new_fallback_at_path(&temp_path)
+    }
+
+    fn new_fallback_at_path(path: &std::path::Path) -> Result<Self, GitAiError> {
+        let conn = crate::sqlite::open_with_memory_limits(path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA temp_store=MEMORY;
+            "#,
+        )?;
+
+        let mut db = Self { conn };
+        db.initialize_schema()?;
+        Ok(db)
+    }
+
     #[cfg(test)]
-    pub(crate) fn new_in_memory_for_tests() -> Result<Self, GitAiError> {
-        let conn = Connection::open_in_memory()?;
+    pub(crate) fn new_temp_for_tests() -> Result<(Self, tempfile::TempDir), GitAiError> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("metrics.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -206,7 +247,7 @@ impl MetricsDatabase {
         let mut db = Self { conn };
         db.initialize_schema()?;
 
-        Ok(db)
+        Ok((db, temp_dir))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -214,12 +255,11 @@ impl MetricsDatabase {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = crate::sqlite::open_with_memory_limits(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
             "#,
         )?;
@@ -547,19 +587,10 @@ impl MetricsDatabase {
 
         let tx = self.conn.transaction()?;
         let ids = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM metrics \
-                 WHERE delivered_ts IS NULL \
-                   AND processing_started_at IS NULL \
-                   AND next_retry_at <= ?1 \
-                   AND attempts < ?2 \
-                 ORDER BY next_retry_at ASC, id DESC \
-                 LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                params![now as i64, MAX_METRIC_UPLOAD_ATTEMPTS as i64, limit as i64],
-                |row| row.get::<_, i64>(0),
-            )?;
+            let mut stmt = tx.prepare(RETRYABLE_METRIC_IDS_SQL)?;
+            let rows = stmt.query_map(params![now as i64, limit as i64], |row| {
+                row.get::<_, i64>(0)
+            })?;
             let mut ids = Vec::new();
             for row in rows {
                 ids.push(row?);
@@ -721,8 +752,8 @@ impl MetricsDatabase {
              WHERE delivered_ts IS NULL \
                AND processing_started_at IS NULL \
                AND next_retry_at <= ?1 \
-               AND attempts < ?2",
-            params![now as i64, MAX_METRIC_UPLOAD_ATTEMPTS as i64],
+               AND attempts < 6",
+            params![now as i64],
             |row| row.get(0),
         )?;
         Ok(count as usize)
@@ -1062,6 +1093,101 @@ impl MetricsDatabase {
         Ok(candidates)
     }
 
+    pub(crate) fn latest_session_event_candidates_for_tools(
+        &self,
+        tools: &[&str],
+    ) -> Result<Vec<SessionEventRecoveryCandidate>, GitAiError> {
+        if tools.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", tools.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT
+                id,
+                event_json,
+                event_ts,
+                session_id,
+                trace_id,
+                tool,
+                external_session_id,
+                external_tool_use_id
+            FROM metrics
+            WHERE event_kind = ?1
+              AND tool IN ({placeholders})
+              AND event_ts IS NOT NULL
+              AND session_id IS NOT NULL
+              AND session_id != ''
+              AND tool IS NOT NULL
+              AND tool != ''
+              AND tool != 'mock_ai'
+              AND external_session_id IS NOT NULL
+              AND external_session_id != ''
+            ORDER BY event_ts DESC, id DESC
+            LIMIT 100
+            "#
+        );
+
+        let mut values = Vec::with_capacity(tools.len() + 1);
+        values.push(rusqlite::types::Value::Integer(
+            MetricEventId::SessionEvent as i64,
+        ));
+        values.extend(
+            tools
+                .iter()
+                .map(|tool| rusqlite::types::Value::Text((*tool).to_string())),
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                row_id,
+                event_json,
+                event_ts,
+                session_id,
+                trace_id,
+                tool,
+                external_session_id,
+                external_tool_use_id,
+            ) = row?;
+            if event_ts < 0 || event_ts > u32::MAX as i64 {
+                continue;
+            }
+
+            let (repo_url, model) = recovery_attrs_from_event_json(&event_json);
+            candidates.push(SessionEventRecoveryCandidate {
+                row_id,
+                event_ts: event_ts as u32,
+                session_id,
+                trace_id,
+                tool,
+                model,
+                external_session_id,
+                external_tool_use_id,
+                repo_url,
+            });
+        }
+
+        Ok(candidates)
+    }
+
     /// Backfill cached event metadata for one bounded batch of legacy rows.
     pub fn backfill_event_metadata_batch(
         &mut self,
@@ -1380,13 +1506,14 @@ fn event_specific_external_tool_use_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
     use tempfile::TempDir;
 
     fn create_test_db() -> (MetricsDatabase, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test-metrics.db");
 
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
         let mut db = MetricsDatabase { conn };
@@ -1437,6 +1564,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "missing index {index}");
+    }
+
+    fn assert_metric_index_missing(db: &MetricsDatabase, index: &str) {
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                params![index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "unexpected index {index}");
     }
 
     fn metric_metadata_rows(db: &MetricsDatabase) -> Vec<(Option<i64>, Option<i64>)> {
@@ -1533,7 +1672,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
 
         for column in [
             "delivered_ts",
@@ -1566,6 +1705,7 @@ mod tests {
         }
 
         for index in [
+            "metrics_retryable",
             "metrics_event_ts_kind",
             "metrics_session_kind_ts",
             "metrics_parent_session_kind_ts",
@@ -1575,10 +1715,25 @@ mod tests {
     }
 
     #[test]
+    fn test_fallback_database_initializes_schema() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("fallback-metrics.db");
+        let mut db = MetricsDatabase::new_fallback_at_path(&db_path).unwrap();
+
+        db.insert_events(&[event_json(days_ago(1))]).unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_initialize_schema_handles_preexisting_agent_usage_table() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("concurrent-init.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
 
         // Simulate a partial migration state from a concurrent process:
         // schema version indicates agent_usage_throttle is missing, but it already exists.
@@ -1613,14 +1768,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
     }
 
     #[test]
     fn test_migrates_version_2_to_row_level_retry_schema() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("v2.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
         conn.execute_batch(
             r#"
             CREATE TABLE schema_metadata (
@@ -1652,7 +1807,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         assert_eq!(db.count().unwrap(), 1);
         assert_eq!(db.count_retryable().unwrap(), 1);
     }
@@ -1661,7 +1816,7 @@ mod tests {
     fn test_migrates_version_2_with_preexisting_retry_columns() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("v2-partial-retry.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
         conn.execute_batch(
             r#"
             CREATE TABLE schema_metadata (
@@ -1695,7 +1850,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
 
         for column in [
             "delivered_ts",
@@ -1725,7 +1880,7 @@ mod tests {
     fn test_migrates_version_3_to_event_metadata_schema_without_sync_backfill() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("v3.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
         conn.execute_batch(
             r#"
             CREATE TABLE schema_metadata (
@@ -1764,7 +1919,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         assert!(db.column_exists("metrics", "event_ts").unwrap());
         assert!(db.column_exists("metrics", "event_kind").unwrap());
         for index in [
@@ -1789,6 +1944,45 @@ mod tests {
                 external_tool_use_id: None,
             }]
         );
+    }
+
+    #[test]
+    fn test_migrates_version_4_to_retryable_only_index() {
+        let (mut db, _temp_dir) = create_test_db();
+        let ids = db.insert_events(&[event_json(days_ago(1))]).unwrap();
+        db.conn
+            .execute(
+                "UPDATE metrics SET attempts = 6 WHERE id = ?1",
+                params![ids[0]],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                r#"
+                DROP INDEX metrics_retryable;
+                CREATE INDEX metrics_pending_retry
+                    ON metrics (delivered_ts, next_retry_at, id)
+                    WHERE delivered_ts IS NULL;
+                UPDATE schema_metadata SET value = '4' WHERE key = 'version';
+                "#,
+            )
+            .unwrap();
+
+        db.initialize_schema().unwrap();
+
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+        assert_metric_index_exists(&db, "metrics_retryable");
+        assert_metric_index_missing(&db, "metrics_pending_retry");
+        assert_eq!(db.count().unwrap(), 1);
+        assert_eq!(db.status().unwrap().stopped_after_errors, 1);
     }
 
     #[test]
@@ -2309,6 +2503,48 @@ mod tests {
         assert!(batch[0].id > batch[1].id);
         assert!(batch[0].event_json.contains(&format!("\"t\":{newest_ts}")));
         assert!(batch[1].event_json.contains(&format!("\"t\":{middle_ts}")));
+    }
+
+    #[test]
+    fn test_retryable_query_work_is_independent_of_exhausted_history() {
+        let (db, _temp_dir) = create_test_db();
+        let now = unix_now() as i64;
+
+        db.conn
+            .execute(
+                "INSERT INTO metrics (event_json, next_retry_at) VALUES (?1, 0)",
+                params![event_json(days_ago(1))],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                r#"
+                WITH RECURSIVE exhausted(n) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT n + 1 FROM exhausted WHERE n < 20000
+                )
+                INSERT INTO metrics (event_json, attempts, next_retry_at)
+                SELECT '{"t":1,"e":1,"v":{},"a":{}}', 6, 0 FROM exhausted
+                "#,
+                [],
+            )
+            .unwrap();
+
+        let mut stmt = db.conn.prepare(RETRYABLE_METRIC_IDS_SQL).unwrap();
+        let ids = stmt
+            .query_map(params![now, 100], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(ids, vec![1]);
+        assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+        assert_eq!(stmt.get_status(StatementStatus::Sort), 0);
+        assert!(
+            stmt.get_status(StatementStatus::VmStep) < 1_000,
+            "retryable lookup must not scale with exhausted history"
+        );
     }
 
     #[test]

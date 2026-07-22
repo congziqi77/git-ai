@@ -8,6 +8,7 @@ use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
+use crate::mdm::utils::codex_home_dir;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -36,10 +37,9 @@ impl CodexPreset {
             return Some(tp.to_string());
         }
 
-        let codex_home = dirs::home_dir()?.join(".codex");
         crate::streams::agents::CodexAgent::find_rollout_path_for_session_in_home(
             session_id,
-            &codex_home,
+            &codex_home_dir(),
         )
         .ok()
         .flatten()
@@ -306,6 +306,92 @@ mod tests {
                 }
                 _ => panic!("Expected PostBashCall for {}", tool_name),
             }
+        }
+    }
+
+    #[test]
+    fn test_codex_namespaced_tools_are_classified() {
+        for tool_name in &[
+            "functions.apply_patch",
+            "functions.exec_command",
+            "functions.Bash",
+            "multi_tool_use.parallel",
+        ] {
+            let input = json!({
+                "cwd": "/home/user/project",
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool_name,
+                "session_id": "codex-sess-1",
+                "tool_use_id": "tu-1"
+            })
+            .to_string();
+            let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
+            assert_eq!(events.len(), 1, "{} should parse to one event", tool_name);
+            match &events[0] {
+                ParsedHookEvent::PostBashCall(_) => {
+                    assert!(
+                        tool_name.ends_with("exec_command")
+                            || tool_name.ends_with("Bash")
+                            || *tool_name == "multi_tool_use.parallel",
+                        "{} should be bash",
+                        tool_name
+                    );
+                }
+                ParsedHookEvent::PostFileEdit(_) => {
+                    assert_eq!(
+                        *tool_name, "functions.apply_patch",
+                        "only apply_patch is a file edit"
+                    );
+                }
+                _ => panic!("Expected PostBashCall or PostFileEdit for {}", tool_name),
+            }
+        }
+    }
+
+    #[test]
+    fn test_codex_extracts_patch_file_paths_from_patch_and_command_keys() {
+        let input = json!({
+            "cwd": "/home/user/project",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "session_id": "codex-sess-1",
+            "tool_use_id": "patch-1",
+            "tool_input": {
+                "patch": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
+            }
+        })
+        .to_string();
+        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/home/user/project/src/main.rs")]
+                );
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+
+        let input = json!({
+            "cwd": "/home/user/project",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "functions.apply_patch",
+            "session_id": "codex-sess-1",
+            "tool_use_id": "patch-2",
+            "tool_input": {
+                "command": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
+            }
+        })
+        .to_string();
+        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/home/user/project/src/main.rs")]
+                );
+            }
+            _ => panic!("Expected PostFileEdit"),
         }
     }
 
