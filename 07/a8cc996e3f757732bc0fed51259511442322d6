@@ -1,0 +1,25 @@
+docs/superpowers/plans/2026-07-22-file-level-stats.md
+  s_ed24eb2129653d::t_c67e54e4b17572 354,357-381,461,464-499,595-612,614-631,635,638-639,641-660
+  s_ed24eb2129653d::t_82041ad12fcc8e 1-353,355-356,382-460,462-463,500-594,613,632-634,636-637,640,661-712
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5-ep",
+  "base_commit_sha": "07a8cc996e3f757732bc0fed51259511442322d6",
+  "prompts": {},
+  "humans": {
+    "h_ad404ca4b5c06a": {
+      "author": "congziqi <congziqi@lixiang.com>"
+    }
+  },
+  "sessions": {
+    "s_ed24eb2129653d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8882-242f-7ea3-8a0d-d4d7811775c0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
