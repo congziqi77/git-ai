@@ -403,8 +403,16 @@ pub fn stats_for_commit_stats(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<CommitStats, GitAiError> {
+    Ok(stats_for_commit_detailed(repo, commit_sha, ignore_patterns)?.summary)
+}
+
+pub fn stats_for_commit_detailed(
+    repo: &Repository,
+    commit_sha: &str,
+    ignore_patterns: &[String],
+) -> Result<DetailedCommitStats, GitAiError> {
     let authorship_log = read_authorship(repo, commit_sha);
-    stats_for_commit_stats_with_authorship(
+    stats_for_commit_detailed_with_authorship(
         repo,
         commit_sha,
         ignore_patterns,
@@ -418,17 +426,33 @@ pub fn stats_for_commit_stats_with_authorship(
     ignore_patterns: &[String],
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
 ) -> Result<CommitStats, GitAiError> {
+    Ok(
+        stats_for_commit_detailed_with_authorship(
+            repo,
+            commit_sha,
+            ignore_patterns,
+            authorship_log,
+        )?
+        .summary,
+    )
+}
+
+fn stats_for_commit_detailed_with_authorship(
+    repo: &Repository,
+    commit_sha: &str,
+    ignore_patterns: &[String],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+) -> Result<DetailedCommitStats, GitAiError> {
     let commit_obj = repo.revparse_single(commit_sha)?.peel_to_commit()?;
     let parent_count = commit_obj.parent_count()?;
 
     if parent_count > 1 {
-        return stats_for_commit_stats_from_hunks(
-            repo,
-            commit_sha,
+        return Ok(detailed_stats_from_hunks_with_merge_flag(
             ignore_patterns,
             &[],
             authorship_log,
-        );
+            true,
+        ));
     }
 
     let parent_sha = if parent_count == 0 {
@@ -437,13 +461,17 @@ pub fn stats_for_commit_stats_with_authorship(
         Some(commit_obj.parent(0)?.id())
     };
 
-    stats_for_commit_stats_with_parent_and_authorship(
-        repo,
-        commit_sha,
-        parent_sha.as_deref(),
+    use crate::commands::diff::get_diff_with_line_numbers;
+    let from_ref = parent_sha
+        .as_deref()
+        .unwrap_or("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    let hunks = get_diff_with_line_numbers(repo, from_ref, commit_sha)?;
+    Ok(detailed_stats_from_hunks_with_merge_flag(
         ignore_patterns,
+        &hunks,
         authorship_log,
-    )
+        false,
+    ))
 }
 
 pub fn stats_for_commit_stats_with_parent_and_authorship(
@@ -467,16 +495,45 @@ pub fn accepted_lines_from_attestations(
     is_merge_commit: bool,
 ) -> (u32, u32, BTreeMap<String, u32>) {
     // returns (ai_accepted, known_human_accepted, per_tool_model)
+    let counts = accepted_counts_from_attestations(
+        authorship_log,
+        added_lines_by_file,
+        is_merge_commit,
+    );
+    (
+        counts.ai_accepted,
+        counts.known_human_accepted,
+        counts.ai_accepted_by_tool,
+    )
+}
+
+#[derive(Debug, Default)]
+struct FileAcceptedCounts {
+    ai_accepted: u32,
+    known_human_accepted: u32,
+}
+
+#[derive(Debug, Default)]
+struct AcceptedCounts {
+    ai_accepted: u32,
+    known_human_accepted: u32,
+    ai_accepted_by_tool: BTreeMap<String, u32>,
+    by_file: BTreeMap<String, FileAcceptedCounts>,
+}
+
+fn accepted_counts_from_attestations(
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+    added_lines_by_file: &HashMap<String, Vec<u32>>,
+    is_merge_commit: bool,
+) -> AcceptedCounts {
     if is_merge_commit {
-        return (0, 0, BTreeMap::new());
+        return AcceptedCounts::default();
     }
 
-    let mut total_ai_accepted = 0u32;
-    let mut known_human_accepted = 0u32;
-    let mut per_tool_model = BTreeMap::new();
+    let mut counts = AcceptedCounts::default();
 
     let Some(log) = authorship_log else {
-        return (0, 0, per_tool_model);
+        return counts;
     };
 
     for file_attestation in &log.attestations {
@@ -493,7 +550,12 @@ pub fn accepted_lines_from_attestations(
                     .map(|line_range| line_range_overlap_len(line_range, added_lines))
                     .sum::<u32>();
                 if accepted > 0 {
-                    known_human_accepted += accepted;
+                    counts.known_human_accepted += accepted;
+                    counts
+                        .by_file
+                        .entry(file_attestation.file_path.clone())
+                        .or_default()
+                        .known_human_accepted += accepted;
                 }
                 continue;
             }
@@ -508,7 +570,12 @@ pub fn accepted_lines_from_attestations(
                 continue;
             }
 
-            total_ai_accepted += accepted;
+            counts.ai_accepted += accepted;
+            counts
+                .by_file
+                .entry(file_attestation.file_path.clone())
+                .or_default()
+                .ai_accepted += accepted;
 
             // Session entries (s_ prefix): look up in sessions map
             if entry.hash.starts_with("s_") {
@@ -518,19 +585,25 @@ pub fn accepted_lines_from_attestations(
                         "{}::{}",
                         session_record.agent_id.tool, session_record.agent_id.model
                     );
-                    *per_tool_model.entry(tool_model).or_insert(0) += accepted;
+                    *counts
+                        .ai_accepted_by_tool
+                        .entry(tool_model)
+                        .or_insert(0) += accepted;
                 }
             } else if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {
                 let tool_model = format!(
                     "{}::{}",
                     prompt_record.agent_id.tool, prompt_record.agent_id.model
                 );
-                *per_tool_model.entry(tool_model).or_insert(0) += accepted;
+                *counts
+                    .ai_accepted_by_tool
+                    .entry(tool_model)
+                    .or_insert(0) += accepted;
             }
         }
     }
 
-    (total_ai_accepted, known_human_accepted, per_tool_model)
+    counts
 }
 
 #[doc(hidden)]
@@ -572,6 +645,21 @@ pub(crate) fn stats_for_commit_stats_from_hunks_with_merge_flag(
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
     is_merge_commit: bool,
 ) -> CommitStats {
+    detailed_stats_from_hunks_with_merge_flag(
+        ignore_patterns,
+        hunks,
+        authorship_log,
+        is_merge_commit,
+    )
+    .summary
+}
+
+fn detailed_stats_from_hunks_with_merge_flag(
+    ignore_patterns: &[String],
+    hunks: &[crate::commands::diff::DiffHunk],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+    is_merge_commit: bool,
+) -> DetailedCommitStats {
     let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     let mut git_diff_added_lines = 0u32;
@@ -585,7 +673,7 @@ pub(crate) fn stats_for_commit_stats_from_hunks_with_merge_flag(
         git_diff_added_lines += hunk.added_lines.len() as u32;
         git_diff_deleted_lines += hunk.deleted_lines.len() as u32;
 
-        if !is_merge_commit && !hunk.added_lines.is_empty() {
+        if !hunk.added_lines.is_empty() {
             added_lines_by_file
                 .entry(hunk.file_path.clone())
                 .or_default()
@@ -598,17 +686,43 @@ pub(crate) fn stats_for_commit_stats_from_hunks_with_merge_flag(
         lines.dedup();
     }
 
-    let (ai_accepted, known_human_accepted, ai_accepted_by_tool) =
-        accepted_lines_from_attestations(authorship_log, &added_lines_by_file, is_merge_commit);
+    let accepted = accepted_counts_from_attestations(
+        authorship_log,
+        &added_lines_by_file,
+        is_merge_commit,
+    );
+    let file_stats = added_lines_by_file
+        .iter()
+        .map(|(file_path, added_lines)| {
+            let file_accepted = accepted.by_file.get(file_path);
+            let ai_accepted = file_accepted.map_or(0, |counts| counts.ai_accepted);
+            let known_human_accepted =
+                file_accepted.map_or(0, |counts| counts.known_human_accepted);
+            (
+                file_path.clone(),
+                FileStats {
+                    ai_accepted,
+                    unknown_additions: (added_lines.len() as u32)
+                        .saturating_sub(ai_accepted)
+                        .saturating_sub(known_human_accepted),
+                },
+            )
+        })
+        .collect();
 
-    stats_from_authorship_log(
+    let summary = stats_from_authorship_log(
         authorship_log,
         git_diff_added_lines,
         git_diff_deleted_lines,
-        ai_accepted,
-        known_human_accepted,
-        &ai_accepted_by_tool,
-    )
+        accepted.ai_accepted,
+        accepted.known_human_accepted,
+        &accepted.ai_accepted_by_tool,
+    );
+
+    DetailedCommitStats {
+        summary,
+        file_stats,
+    }
 }
 
 /// Get git diff statistics between commit and its parent

@@ -57,6 +57,58 @@ fn test_commit_stats_serialization_remains_aggregate_only() {
 }
 
 #[test]
+fn test_detailed_stats_group_ai_human_and_unknown_by_file() {
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "base.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
+        .unwrap();
+    std::fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
+        .unwrap();
+
+    std::fs::write(repo.path().join("src/human.rs"), "human\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "src/human.rs"])
+        .unwrap();
+
+    std::fs::write(repo.path().join("src/unknown.rs"), "unknown\n").unwrap();
+    let commit = repo.stage_all_and_commit("mixed files").unwrap();
+    let gitai_repo = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
+
+    let detailed = stats_for_commit_detailed(&gitai_repo, &commit.commit_sha, &[]).unwrap();
+
+    assert_eq!(detailed.file_stats["src/ai.rs"].ai_accepted, 2);
+    assert_eq!(detailed.file_stats["src/ai.rs"].unknown_additions, 0);
+    assert_eq!(detailed.file_stats["src/human.rs"], FileStats::default());
+    assert_eq!(detailed.file_stats["src/unknown.rs"].ai_accepted, 0);
+    assert_eq!(
+        detailed.file_stats["src/unknown.rs"].unknown_additions,
+        1
+    );
+    assert_eq!(
+        detailed.ai_accepted,
+        detailed
+            .file_stats
+            .values()
+            .map(|value| value.ai_accepted)
+            .sum::<u32>()
+    );
+    assert_eq!(
+        detailed.unknown_additions,
+        detailed
+            .file_stats
+            .values()
+            .map(|value| value.unknown_additions)
+            .sum::<u32>()
+    );
+}
+
+#[test]
 fn test_stats_for_simple_ai_commit() {
     let repo = TestRepo::new();
 
