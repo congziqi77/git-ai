@@ -1,0 +1,374 @@
+src/git/authorship_traversal.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5,21,56
+flake.nix
+  s_ed24eb2129653d::t_1e1bd21ec687b3 39
+src/metrics/types.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 25,201
+src/commands/checkpoint_agent/presets/github_copilot/ide.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 233-239,608-675
+  s_ed24eb2129653d::t_335a3806ada96b 676-680
+scripts/benchmarks/git/benchmark_modes_vs_main.py
+  s_ed24eb2129653d::t_661f66e6fe98ae 274
+src/daemon/rewrite_metrics.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-670
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 484-503
+  s_ed24eb2129653d::t_f4cc4c300c6056 483
+src/git/repo_storage.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 11,13,16-20,294,304,317,339,351-354,441,475-495,501-505,509-510,515,576-632,666-667,670-671,674
+.github/workflows/nightly-agent-integration.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 65-81,115,122,134,157,190,192-193,223,263,326
+.github/workflows/release.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 118,233,481
+Cargo.toml
+  s_ed24eb2129653d::t_661f66e6fe98ae 36-37
+  s_ed24eb2129653d::t_1e1bd21ec687b3 3
+src/diagnostics.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 21
+src/notes/db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 73-74,87,108,465-479,557-577,619,808-835
+  s_ed24eb2129653d::t_7592d9d8006be0 836
+tests/integration/blame_comprehensive.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 27,695,753
+tests/integration/session_event_attribution.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3-4,39-56,87-153,251-296,463-922
+agent-support/opencode/package.json
+  s_ed24eb2129653d::t_661f66e6fe98ae 11,14
+tests/integration/status_unit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 261-299,366
+src/checkpoint_content_budget.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-74
+.github/workflows/github-integration-tests.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 27
+src/metrics/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 19
+src/mdm/agents/droid.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3-6,11-44,121,287,355,358,376,406,417-482,1032-1112,1137-1240
+src/metrics/local_stats.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1481-1490
+tests/integration/ci_fork_notes.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5-6,69,181,240,302,306,358,362,480,540,544,798,837,915,919
+src/commands/diff.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 8,1614,1643
+tests/integration/graphite.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 289
+tests/integration/ci_squash_rebase.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,309
+src/ci/ci_context.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,6,127,135,361,385,683-685,833
+src/error.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 176-178,279-281
+tests/integration/agent_v1.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 293-339
+src/commands/checkpoint_agent/bash_tool.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 307-312,351-361,377-387,405,1536-1576
+  s_ed24eb2129653d::t_5eb70bb687ff24 1577-1578
+src/commands/checkpoint_agent/presets/cline.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-654
+src/commands/install_hooks.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 16,201-202,205-208,235-236,239-242,548,629-630,632,634,636,733-734,737-740,868,901,1047-1081
+  s_ed24eb2129653d::t_396a74c4e2d87c 1082
+tests/integration/commit_metric_metadata.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-146
+tests/integration/repos/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 95,206
+src/daemon.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 2,43-44,67,93-101,156-164,701-706,711,714,738-749,775-781,796-814,860,891,907,929,931-932,934,969-976,1445-1482,1898-1901,1915,1918,1925,1975-1996,2003,2014-2033,4801-4808,4811,4816-4825,4830,4845-4869,4871,4873-4885,5483-5492,5494-5495,5572,5612-5613,5622-5635,5654-5655,5663-5666,5979-6136,6217-6222,6720-6725,7574-7579,7598-7666,9157-9196
+  s_ed24eb2129653d::t_df84777806e787 9197
+src/metrics/db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 12,18,20-23,29-36,81-91,177-183,200,215-234,236-239,250,258,590-593,755-756,1096-1190,1509,1516,1569-1580,1675,1708,1717-1731,1736,1771,1778,1810,1819,1853,1883,1922,1949-1987,2508-2548
+  s_ed24eb2129653d::t_a4e828cbc8cd4c 2549
+src/commands/whoami.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 222,229,434
+src/daemon/bash_history_db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 92,149-150,153-163,166-169,181-190,197,202-209,216,894,896-897,903-912
+  s_ed24eb2129653d::t_17bb1db8b9f4d7 913-914
+src/authorship/diff_base.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-17
+src/commands/status.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 110
+.github/workflows/e2e-tests.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 32
+src/commands/flush_metrics_db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 19
+src/mdm/agents/gemini.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,19,328,378,389-422,497-538
+  s_ed24eb2129653d::t_5d95794fedee0f 539
+tests/integration/tls_native_certs.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 15-41
+src/mdm/utils.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 439-460,757,773,776-779,960,968-969,1366-1468
+  s_ed24eb2129653d::t_059854934ec125 1469
+src/commands/analyze/sessions.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 741,1533-1536,1540,1558,1572,1614,1645,1675,1728,1741,1757,1774,1804
+.github/workflows/lint-format.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 42,61,88
+tests/integration/blame_flags.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 9,1453
+src/authorship/internal_db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 118-119,156,534,577
+tests/integration/cold_trace2_repo.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 167-185,700
+src/process_timeout.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 68-78,88-89
+  s_ed24eb2129653d::t_07d69320c2a14f 67,90
+agent-support/vscode/package.json
+  s_ed24eb2129653d::t_661f66e6fe98ae 47,84,86,88,101
+src/commands/debug.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 9,103-104,879-882,887-910,913,919-920,1259
+src/commands/checkpoint_agent/orchestrator.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,61-84,99-100,151-159,173-174,324-327,350,373,400,457-478,554-574
+  s_ed24eb2129653d::t_91628c3f6b123c 575
+src/commands/blame.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 6,962,1085
+tests/integration/bash_attribution.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 181-255
+  s_ed24eb2129653d::t_5bfdac25ce83e5 180
+tests/integration/sqlite_connection_policy.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-59
+tests/integration/repos/test_file.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 23
+src/daemon/git_backend.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,20-38,168-207,329-335,344-347,349-354,567,730-766
+  s_ed24eb2129653d::t_7b3cb4b2346208 767
+src/streams/agents/copilot_otel.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 353,407,424,438,465,493,522,706,766,829,879,901,965
+tests/integration/cherry_pick.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 6,52,172,262,464
+src/authorship/range_authorship.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 11,117
+.github/workflows/install-scripts-local.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 64,210
+.github/workflows/test.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,45-59,61-82,84-88,106,138-230,329-428,436-440,442-476,491
+scripts/nightly/verify-hook-wiring.sh
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,5-6,9-10,20
+src/authorship/rewrite.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1,5,9-13,33,40-379,381-387,398-404,411,415-424,435-451,454,458-465,473,527-528,530-532,576,615-617,619-631,633-640,648,651,653,658-679,686,690-696,703,710-716,724,730,790,847,1239-1243,1245-1254,1257-1265,1267-1268,1270-1272,1274-1276,1280-1284,1286-1292,1294,1296-1305,1319-1328,1330-1331,1334-1336,1338-1339,1341-1342,1345,1348-1353,1355-1356,1371-1381,1383,1385-1389,1391,1406-1453,1790,1814,1827,1846,1855,1858-1899
+src/daemon/checkpoint.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 87,191,205,485,514,516,519-523,590,606,615-619,635-639,815,821
+src/authorship/stats.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,382,537-550,580,587
+src/streams/model_extraction.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5,19,179-266,368,377-455,517,606-719
+  s_00f92a342223ec::t_a29645adec297b 456-457,720-721
+README.md
+  s_ed24eb2129653d::t_661f66e6fe98ae 213
+src/authorship/rewrite_stash.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1,3,8,10,12,30-67,107,109-125,135-136,146-147,149,153,167-169,189,196-197,211-247,249-250,253-257,260-267,270-273,276-294,296-317,321-326,330-336,338-339,343-347,349,351,353-356,360-394,400-401,405-407,410-413,422-423,427-430,433-435,439,441,443,447,459-460,484,491-492,499,508-579,581-593,597-636,669-672,675-679
+src/git/sync_authorship.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 121-125,128,161
+src/authorship/hunk_shift.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5
+src/lib.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,21
+src/streams/db.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 152-155,998,1069
+tests/integration/main.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 46,88,126
+tests/integration/opencode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 22,35-39
+src/git/refs.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,14,154,165,371-374,484,597,682,703,713,732,945-948,975-1007,1009,1011-1013,1015-1075
+src/streams/agents/gemini.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,15-16,33,37-38,240,251-283
+  s_00f92a342223ec::t_a29645adec297b 284-285
+src/metrics/events.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 32-34,63-65,84-86,215-244,307-321,344-346,365-644,1108-1129,1165-1211,1253-1256,1268-1270
+tests/integration/git_alias_resolution.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 182-183
+src/observability/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 65,68,71,73-82
+src/authorship/virtual_attribution.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 37-42,242-243,247,2083,2091-2095,2103,2142-2150,2154,2180
+tests/integration/daemon_commit_carryover.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 30
+tests/integration/sessions_cutover.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 13,56,158,244,356,477,578,701,1009,1119,1337-1338,1419,1468,1523,1647,1718,1833,1947,2062,2169,2273,2344,2461,2580,2631-2758
+  s_ed24eb2129653d::t_e174dc78a0dcef 2759
+src/config.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 21-23,187-189,271-276,336-341,648-662,1187-1213,1240-1242,1273-1275,1722-1730,1772-1774,2017-2019,2165-2167
+src/commands/git_ai_handlers.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 194-196,323,377-378,406-407,411-417,596-654,1217-1224
+tests/integration/performance.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 22,24
+scripts/benchmarks/git/benchmark_nasty_rebases.sh
+  s_ed24eb2129653d::t_661f66e6fe98ae 117
+src/authorship/attribution_recovery.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 10,25-157,161-195,254-263,517-1117
+  s_ed24eb2129653d::t_ad59224c83715d 1118
+scripts/create_test_vsc_db.py
+  s_ed24eb2129653d::t_661f66e6fe98ae 46-47
+src/commands/checkpoint_agent/presets/agent_v1.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-4,31-93,112-113,139-140,142-149,156-194,287-377
+  s_ed24eb2129653d::t_d56bf7be34c972 378
+src/mdm/agents/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,20,41
+tests/integration/show_prompt.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,221,227
+src/commands/checkpoint_agent/presets/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 7,156
+src/commands/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 2
+.github/workflows/performance-benchmarks.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 36,92
+src/feature_flags.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 85,87,141,143,151,153,168-178,184,190-193,201,213-232,240,242,250,252,262,264,271,273
+src/commands/git_handlers.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 205,249
+src/authorship/prompt_utils.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,36,81-82,94
+tests/async_mode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 256,376
+agent-support/intellij/build.gradle.kts
+  s_ed24eb2129653d::t_661f66e6fe98ae 12
+tests/integration/pull_rebase_ff.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 2-3,8-9,231-282,346-500,671-754,1984
+src/git/repository.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1347-1348,2744,2770,2782-2806,2836-2844,2846-2847,2849,2872-2965,3259-3286
+  s_ed24eb2129653d::t_aab56061de06bf 3287
+tests/daemon_mode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 10,187,198,219,227-235,253-254,257,277-292,573,639,1583-1648,2186-2289,5204-5333
+src/authorship/rewrite_cherry_pick.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 99-116,124,157-162,220-239
+  s_ed24eb2129653d::t_e3c54213d8ade7 240
+tests/integration/rebase.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 6,393
+tests/integration/prompt_utils_unit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5,30,101,138,200,234
+src/sqlite.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-58
+tests/integration/metrics_retry_idle.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-143
+src/mdm/agents/codex.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5,21,25,682,972,978,993-996,1435-1490
+  s_ed24eb2129653d::t_06b30ecf2b0e13 1491-1493
+src/mdm/agents/opencode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 42,46,168,187-272,412-491
+tests/integration/config_cli_coverage.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 78-114,238-239,303-305
+  s_ed24eb2129653d::t_2d6400348ae64c 77
+AGENTS.md
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-16,232-237
+benches/notes_io.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 35-38,168-173,211-216,256-260,296-299,343-346,380-384,423
+src/authorship/rewrite_revert.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 9,28-34,36,38,48,97,107,120-124,131,168,219-231,237-245,352-365
+src/commands/notes_migrate.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 305
+scripts/benchmarks/git/benchmark_nasty_modes_vs_main.py
+  s_ed24eb2129653d::t_661f66e6fe98ae 244,595-602
+src/daemon/stream_worker.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 108-111,189,260-275,279,283,313,319,327,344,411-414,434-477,1172-1174,1176-1178,1180,1312,1344-1369,1380,1391,1402,1465-1470,1473,1475,1488,1491,1511,1528,1538-1555,1558,1579,1593,1608-1640,1654,1665
+tests/integration/refs_unit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5-9,11-13,67,71,77,100-101,121,134,137,188,192,219,230,292,298,314,330,358,384-386,422,602,628,648,651
+src/authorship/post_commit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 5,11,15-16,126-131,186-211,254-277,318,326-329,353-359,430,438,447,459-463,486-487,561-565,604-607,638-644,653-671,690-699,787-791,835,852-857,975-980,982-986,993,1018-1023,1025-1031,1033-1063,1066-1067,1069-1075,1077-1084,1086-1092,1111-1178,1188-1226,1306-1359
+  s_ed24eb2129653d::t_5b90b82126635b 1360
+.github/workflows/coverage.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 29
+src/daemon/telemetry_worker.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 25,37-55,198,204,207,243-255,286-296,434,437,444,487-491,494,497-502,514-518,524,529-531,536-538,543,545-558,569-583,624-664,1376-1409,1534-1581,1635-1636,1700-1701,1764-1765,1842-1843,1917-1918,1970-1971,2011-2012
+src/commands/checkpoint_agent/presets/codex.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 11,42,312-396
+  s_ed24eb2129653d::t_6e01778e69bea4 397
+src/commands/config.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 122-124,380-392,522-530,835-867,1207-1227
+src/daemon/control_api.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 87-89
+src/mdm/agents/cline.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-646
+tests/integration/repo_storage_unit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 212-240
+src/authorship/mod.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 9
+src/mdm/agents/github_copilot.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4-7,11,40-90,162-163,169,176,184-185,194-195,232,235,272,274,283-284,293,295,368,481-593
+tests/integration/stash_attribution.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3-7,9-67,1286-1621,1623,1640-1641,1653-1667
+src/streams/agents/opencode.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 31-32,34,36,358,451,483,529-538
+src/api/metrics.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 19-23
+src/daemon/ref_cursor.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 101-102,108-112,256-261,312-331,420-447,528,740-744,753-757,981-983,1001,1003,1005,1021,1185,1189,1191,1201,1222-1226,1237,1241,1243,1257,1300-1303,1322-1323,1342-1351,1355,1380-1426,1531-1547,1574-1585,1589,1594-1598,1612-1615,1620-1623,1627-1629,1632,1634,2396-2399,2593-2594,2671-2710,3531-3534,3646-3666,3976-4028,4688-4812,5461-5470
+  s_ed24eb2129653d::t_848be3e3de773a 5471
+tests/integration/codex.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1200-1436,1456-1458
+tests/integration/cursor.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 248-302
+src/daemon/trace_normalizer.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 598,600-624,1049-1058,1064-1067,1073-1086,1426-1573
+  s_ed24eb2129653d::t_a77bda8452ac3f 1574
+src/commands/show.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 3,40
+src/git/notes_api.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 294-299,301-321,750-781,783,785-786
+  s_ed24eb2129653d::t_52740dc152e8c4 782,784,787
+CONTRIBUTING.md
+  s_ed24eb2129653d::t_661f66e6fe98ae 10-12,44-63
+  s_ed24eb2129653d::t_2dbd3124539750 64
+src/authorship/background_agent.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 19-20,42,74-89
+  s_ed24eb2129653d::t_959a39e67d66a3 90-92
+scripts/nightly/test-live-agent.sh
+  s_ed24eb2129653d::t_661f66e6fe98ae 12-13,72,79,86,91,96
+tests/commit_tree_update_ref.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 11,73-94,113,155,209,260,1333,1358,1456,1481,1514,1544,1605,1696,1780-1857
+  s_ed24eb2129653d::t_170bb7abdf4233 1858
+.github/workflows/git-core-compat.yml
+  s_ed24eb2129653d::t_661f66e6fe98ae 49
+src/commands/await.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-162
+src/commands/git_hook_handlers.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 327
+tests/integration/checkpoint_size.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 2-3,5,92-271
+  s_ed24eb2129653d::t_5727ebc81a4e1b 272
+src/streams/agents/codex.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 4,82
+tests/integration/internal_spawn_safety.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 1-4,7-8,97-169,177-178
+tests/integration/repos/test_repo.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 394,494-502,1251-1268,1789,3155,3159,3412-3418,3423,3647-3680
+  s_ed24eb2129653d::t_7dd1a4d5bd1292 3681
+tests/integration/checkpoint_unit.rs
+  s_ed24eb2129653d::t_661f66e6fe98ae 13,249,307,415,1325
+agent-support/opencode/package-lock.json
+  s_ed24eb2129653d::t_922eaeb3d7c7a6 12,15,19-30,110-112,115-117,121-123,138-140,153-155,159,187-189,247-252,291-293,321-323,358-360,381-383,388-390
+agent-support/vscode/package-lock.json
+  s_ed24eb2129653d::t_0a44399fe02f93 11,15,17,19,803-805,808,812-814,1135-1137,1141,1166-1168,1173-1176,1189,1195-1197,1201-1204,1220-1222,1226-1227,1242-1244,1248-1249,1260-1262,1277-1279,1283-1285,1302-1304,1316-1318,1322-1325,1344-1346,1351-1353,1368-1370,1374,1414-1416,1421-1426,1428,1434,1437-1468,1472-1475,1479-1487,1490-1493,1495,1497-1499,1502,1505-1533,2101-2103,2114,2123,2253-2255,2259,2262,2764-2766,5192-5194,5197,5447-5449,5453-5457,6233-6235,6389-6391
+docs/telemetry-examples.md
+  s_ed24eb2129653d::t_673fcb329b6084 1-235
+Cargo.lock
+  s_ed24eb2129653d::t_fa449429b0ba5c 617-647,1053,1106,1108,1117,1119,1126,1128,1135,1137,1149,1151,1167,1169,1180,1182,1192,1194,1201,1203,1215,1217,1229,1231,1241,1243,1253,1255,1258,1264,1266,1292,1294,1303,1305,1322,1324,1334,1336,1354,1356,1370,1372,1382,1384,1394,1396,1400,1402,1417,1419,1427,1429,1521-1526,1784,1786,1923,1925,1927,1934,1939,1941,2138,2140,3159,3161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5-ep",
+  "base_commit_sha": "3ccf6948690871ad8bce2d0e07615152d51f6998",
+  "prompts": {},
+  "humans": {
+    "h_ad404ca4b5c06a": {
+      "author": "congziqi <congziqi@lixiang.com>"
+    }
+  },
+  "sessions": {
+    "s_00f92a342223ec": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ece3a-656c-7472-8d55-6d88a75cbec9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_ed24eb2129653d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8882-242f-7ea3-8a0d-d4d7811775c0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
