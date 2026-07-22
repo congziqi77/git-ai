@@ -43,10 +43,7 @@ fn test_detailed_commit_stats_serializes_flat_file_stats() {
     let json = serde_json::to_value(&detailed).unwrap();
     assert_eq!(json["ai_accepted"], 2);
     assert_eq!(json["file_stats"]["src/a.rs"]["ai_accepted"], 2);
-    assert_eq!(
-        json["file_stats"]["src/b.rs"]["unknown_additions"],
-        1
-    );
+    assert_eq!(json["file_stats"]["src/b.rs"]["unknown_additions"], 1);
     assert!(json.get("summary").is_none());
 }
 
@@ -66,8 +63,7 @@ fn test_detailed_stats_group_ai_human_and_unknown_by_file() {
 
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
 
-    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"]).unwrap();
     std::fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
         .unwrap();
@@ -86,10 +82,7 @@ fn test_detailed_stats_group_ai_human_and_unknown_by_file() {
     assert_eq!(detailed.file_stats["src/ai.rs"].unknown_additions, 0);
     assert_eq!(detailed.file_stats["src/human.rs"], FileStats::default());
     assert_eq!(detailed.file_stats["src/unknown.rs"].ai_accepted, 0);
-    assert_eq!(
-        detailed.file_stats["src/unknown.rs"].unknown_additions,
-        1
-    );
+    assert_eq!(detailed.file_stats["src/unknown.rs"].unknown_additions, 1);
     assert_eq!(
         detailed.ai_accepted,
         detailed

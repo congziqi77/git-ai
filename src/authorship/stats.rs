@@ -426,15 +426,13 @@ pub fn stats_for_commit_stats_with_authorship(
     ignore_patterns: &[String],
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
 ) -> Result<CommitStats, GitAiError> {
-    Ok(
-        stats_for_commit_detailed_with_authorship(
-            repo,
-            commit_sha,
-            ignore_patterns,
-            authorship_log,
-        )?
-        .summary,
-    )
+    Ok(stats_for_commit_detailed_with_authorship(
+        repo,
+        commit_sha,
+        ignore_patterns,
+        authorship_log,
+    )?
+    .summary)
 }
 
 fn stats_for_commit_detailed_with_authorship(
@@ -495,11 +493,8 @@ pub fn accepted_lines_from_attestations(
     is_merge_commit: bool,
 ) -> (u32, u32, BTreeMap<String, u32>) {
     // returns (ai_accepted, known_human_accepted, per_tool_model)
-    let counts = accepted_counts_from_attestations(
-        authorship_log,
-        added_lines_by_file,
-        is_merge_commit,
-    );
+    let counts =
+        accepted_counts_from_attestations(authorship_log, added_lines_by_file, is_merge_commit);
     (
         counts.ai_accepted,
         counts.known_human_accepted,
@@ -585,20 +580,14 @@ fn accepted_counts_from_attestations(
                         "{}::{}",
                         session_record.agent_id.tool, session_record.agent_id.model
                     );
-                    *counts
-                        .ai_accepted_by_tool
-                        .entry(tool_model)
-                        .or_insert(0) += accepted;
+                    *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted;
                 }
             } else if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {
                 let tool_model = format!(
                     "{}::{}",
                     prompt_record.agent_id.tool, prompt_record.agent_id.model
                 );
-                *counts
-                    .ai_accepted_by_tool
-                    .entry(tool_model)
-                    .or_insert(0) += accepted;
+                *counts.ai_accepted_by_tool.entry(tool_model).or_insert(0) += accepted;
             }
         }
     }
@@ -686,11 +675,8 @@ fn detailed_stats_from_hunks_with_merge_flag(
         lines.dedup();
     }
 
-    let accepted = accepted_counts_from_attestations(
-        authorship_log,
-        &added_lines_by_file,
-        is_merge_commit,
-    );
+    let accepted =
+        accepted_counts_from_attestations(authorship_log, &added_lines_by_file, is_merge_commit);
     let file_stats = added_lines_by_file
         .iter()
         .map(|(file_path, added_lines)| {

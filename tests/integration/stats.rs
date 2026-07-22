@@ -35,8 +35,7 @@ fn test_stats_json_includes_file_stats() {
     repo.stage_all_and_commit("base").unwrap();
     fs::create_dir_all(repo.path().join("src")).unwrap();
 
-    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"]).unwrap();
     fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
         .unwrap();
@@ -48,14 +47,8 @@ fn test_stats_json_includes_file_stats() {
 
     let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
     assert_eq!(json["file_stats"]["src/ai.rs"]["ai_accepted"], 2);
-    assert_eq!(
-        json["file_stats"]["src/human.rs"]["unknown_additions"],
-        0
-    );
-    assert_eq!(
-        json["file_stats"]["src/unknown.rs"]["unknown_additions"],
-        1
-    );
+    assert_eq!(json["file_stats"]["src/human.rs"]["unknown_additions"], 0);
+    assert_eq!(json["file_stats"]["src/unknown.rs"]["unknown_additions"], 1);
     assert!(json.get("summary").is_none());
 }
 
@@ -68,8 +61,7 @@ fn test_stats_range_json_includes_file_stats() {
     let base = repo.stage_all_and_commit("base").unwrap();
     fs::create_dir_all(repo.path().join("src")).unwrap();
 
-    repo.git_ai(&["checkpoint", "human", "src/ai.rs"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"]).unwrap();
     fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
         .unwrap();
@@ -79,10 +71,7 @@ fn test_stats_range_json_includes_file_stats() {
     let range = format!("{}..{}", base.commit_sha, end.commit_sha);
     let json = stats_json_from_args(&repo, &["stats", &range, "--json"]);
     let range_stats = &json["range_stats"];
-    assert_eq!(
-        range_stats["file_stats"]["src/ai.rs"]["ai_accepted"],
-        2
-    );
+    assert_eq!(range_stats["file_stats"]["src/ai.rs"]["ai_accepted"], 2);
     assert_eq!(
         range_stats["file_stats"]["src/unknown.rs"]["unknown_additions"],
         1
@@ -116,6 +105,60 @@ fn test_status_json_does_not_include_file_stats() {
             .get("file_stats")
             .is_none()
     );
+}
+
+#[test]
+fn test_stats_file_stats_missing_note() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    fs::write(repo.path().join("one.txt"), "one\ntwo\n").unwrap();
+    fs::write(repo.path().join("two.txt"), "three\n").unwrap();
+    repo.stage_all_and_commit("unknown files").unwrap();
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    assert_eq!(json["file_stats"]["one.txt"]["ai_accepted"], 0);
+    assert_eq!(json["file_stats"]["one.txt"]["unknown_additions"], 2);
+    assert_eq!(json["file_stats"]["two.txt"]["unknown_additions"], 1);
+    assert_eq!(json["unknown_additions"], 3);
+}
+
+#[test]
+fn test_stats_file_stats_respect_ignore() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    fs::write(repo.path().join("included.txt"), "included\n").unwrap();
+    fs::write(repo.path().join("ignored.txt"), "ignored\n").unwrap();
+    repo.stage_all_and_commit("two files").unwrap();
+
+    let json = stats_json_from_args(
+        &repo,
+        &["stats", "HEAD", "--json", "--ignore", "ignored.txt"],
+    );
+    assert!(json["file_stats"].get("ignored.txt").is_none());
+    assert_eq!(json["file_stats"]["included.txt"]["unknown_additions"], 1);
+    assert_eq!(json["unknown_additions"], 1);
+}
+
+#[test]
+fn test_stats_file_stats_preserve_utf8_paths_and_sorted_order() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    fs::create_dir_all(repo.path().join("目录")).unwrap();
+    fs::write(repo.path().join("z.rs"), "z\n").unwrap();
+    fs::write(repo.path().join("a.rs"), "a\n").unwrap();
+    fs::write(repo.path().join("目录/统计.rs"), "统计\n").unwrap();
+    repo.stage_all_and_commit("utf8 files").unwrap();
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    let files = json["file_stats"].as_object().unwrap();
+    assert!(files.contains_key("目录/统计.rs"));
+    let keys: Vec<&String> = files.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -795,6 +838,9 @@ fn test_post_commit_large_ignored_files_do_not_trigger_skip_warning() {
     assert_eq!(stats.git_diff_added_lines, 0);
     assert_eq!(stats.ai_additions, 0);
     assert_eq!(stats.human_additions, 0);
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    assert!(json["file_stats"].as_object().unwrap().is_empty());
 }
 
 #[test]
@@ -859,6 +905,9 @@ fn test_stats_ignores_renamed_files() {
     );
     assert_eq!(stats.ai_additions, 0);
     assert_eq!(stats.human_additions, 0);
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    assert!(json["file_stats"].as_object().unwrap().is_empty());
 }
 
 crate::reuse_tests_in_worktree!(
