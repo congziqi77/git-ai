@@ -1,0 +1,39 @@
+Cargo.toml
+  s_ed24eb2129653d::t_0830338fa40a5e 3
+src/authorship/range_authorship.rs
+  s_ed24eb2129653d::t_5b14591caf8516 9-11,32
+  s_ed24eb2129653d::t_ef516a5a965dca 404,409,413,417-421,428,433,436-452,454-457,474
+tests/integration/range_authorship_unit.rs
+  s_ed24eb2129653d::t_d9100e254f1a47 226-227,451,453
+src/authorship/stats.rs
+  s_ed24eb2129653d::t_8262679222876c 9,43-68,104-109,113-118,493-500,502,516-530,535,539-540,549-554,556,558-559,573-576,585-612,614,617,619,622-623,627-629,631-662,665,669-681,687-701,729,734-735,744-758,772,785-796,805,811-813
+  s_ed24eb2129653d::t_e35273d85dfd30 797-804,809-810,814-817
+src/authorship/diff_ai_accepted.rs
+  s_ed24eb2129653d::t_78c956e5276cf4 11,14-21,47-53,83-97,200,203,210,213
+tests/integration/stats.rs
+  s_ed24eb2129653d::t_2709468f8f3e44 38,73
+  s_ed24eb2129653d::t_d477609f3c7320 84-89,92-121
+  s_ed24eb2129653d::t_b7b206fb7fe8a6 26-37,39-72,74-83
+  s_ed24eb2129653d::t_8a22b91d58e013 90
+  s_ed24eb2129653d::t_9ba153e3d8ca05 91,571-572
+flake.nix
+  s_ed24eb2129653d::t_0830338fa40a5e 39
+Cargo.lock
+  s_ed24eb2129653d::t_90dfada03e0304 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15-ep",
+  "base_commit_sha": "f740a936f828fa73f21058cfb1912336837670cf",
+  "prompts": {},
+  "sessions": {
+    "s_ed24eb2129653d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8882-242f-7ea3-8a0d-d4d7811775c0",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
