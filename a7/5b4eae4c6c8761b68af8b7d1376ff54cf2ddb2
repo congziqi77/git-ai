@@ -1,0 +1,19 @@
+.github/workflows/release-s3.yml
+  s_ed24eb2129653d::t_a249b9b5051919 203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15-ep",
+  "base_commit_sha": "a75b4eae4c6c8761b68af8b7d1376ff54cf2ddb2",
+  "prompts": {},
+  "sessions": {
+    "s_ed24eb2129653d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8882-242f-7ea3-8a0d-d4d7811775c0",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
