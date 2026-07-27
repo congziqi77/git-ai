@@ -23,6 +23,102 @@ fn stats_from_args(repo: &TestRepo, args: &[&str]) -> CommitStats {
     serde_json::from_str(&json).expect("valid stats json")
 }
 
+fn stats_json_from_args(repo: &TestRepo, args: &[&str]) -> serde_json::Value {
+    let raw = repo.git_ai(args).expect("git-ai stats should succeed");
+    serde_json::from_str(&extract_json_object(&raw)).expect("valid stats json")
+}
+
+#[test]
+fn test_stats_json_classifies_file_additions_by_authorship() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    repo.git_ai(&["checkpoint", "human", "src/ai.rs"]).unwrap();
+    fs::write(repo.path().join("src/ai.rs"), "ai one\nai two\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "src/ai.rs"])
+        .unwrap();
+
+    fs::write(
+        repo.path().join("src/human.py"),
+        "human_one = 1\nhuman_two = 2\n",
+    )
+    .unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "src/human.py"])
+        .unwrap();
+
+    fs::write(
+        repo.path().join("settings.json"),
+        "{\n  \"unknown\": true\n}\n",
+    )
+    .unwrap();
+    repo.stage_all_and_commit("mixed file authorship").unwrap();
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    let file_stats = json["file_stats"]
+        .as_object()
+        .expect("stats JSON should include file_stats");
+
+    assert_eq!(file_stats["src/ai.rs"]["ai_accepted"], 2);
+    assert_eq!(file_stats["src/ai.rs"]["human_additions"], 0);
+    assert_eq!(file_stats["src/ai.rs"]["unknown_additions"], 0);
+
+    assert_eq!(file_stats["src/human.py"]["ai_accepted"], 0);
+    assert_eq!(file_stats["src/human.py"]["human_additions"], 2);
+    assert_eq!(file_stats["src/human.py"]["unknown_additions"], 0);
+
+    assert_eq!(file_stats["settings.json"]["ai_accepted"], 0);
+    assert_eq!(file_stats["settings.json"]["human_additions"], 0);
+    assert_eq!(file_stats["settings.json"]["unknown_additions"], 3);
+
+    for field in ["ai_accepted", "human_additions", "unknown_additions"] {
+        let file_total: u64 = file_stats
+            .values()
+            .map(|stats| stats[field].as_u64().unwrap())
+            .sum();
+        assert_eq!(json[field].as_u64().unwrap(), file_total, "{field}");
+    }
+}
+
+#[test]
+fn test_stats_range_json_classifies_file_additions_by_authorship() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    let base = repo.stage_all_and_commit("base").unwrap();
+
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    repo.git_ai(&["checkpoint", "human", "src/lib.rs"]).unwrap();
+    fs::write(repo.path().join("src/lib.rs"), "pub fn generated() {}\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "src/lib.rs"])
+        .unwrap();
+
+    fs::write(repo.path().join("config.py"), "setting = 1\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "config.py"])
+        .unwrap();
+
+    fs::write(repo.path().join("data.json"), "{}\n").unwrap();
+    let end = repo.stage_all_and_commit("mixed range authorship").unwrap();
+
+    let range = format!("{}..{}", base.commit_sha, end.commit_sha);
+    let json = stats_json_from_args(&repo, &["stats", &range, "--json"]);
+    let range_stats = &json["range_stats"];
+    let file_stats = range_stats["file_stats"]
+        .as_object()
+        .expect("range stats JSON should include file_stats");
+
+    assert_eq!(file_stats["src/lib.rs"]["ai_accepted"], 1);
+    assert_eq!(file_stats["config.py"]["human_additions"], 1);
+    assert_eq!(file_stats["data.json"]["unknown_additions"], 1);
+    for field in ["ai_accepted", "human_additions", "unknown_additions"] {
+        let file_total: u64 = file_stats
+            .values()
+            .map(|stats| stats[field].as_u64().unwrap())
+            .sum();
+        assert_eq!(range_stats[field].as_u64().unwrap(), file_total, "{field}");
+    }
+}
+
 fn stats_while_restoring_authorship_note(
     repo: &TestRepo,
     commit_sha: &str,
@@ -472,10 +568,8 @@ fn test_stats_cli_empty_tree_range() {
     assert_eq!(stats.authorship_stats.total_commits, 2);
     assert_eq!(stats.range_stats.git_diff_added_lines, 2);
     assert_eq!(stats.range_stats.ai_additions, 1);
-    // Range stats use legacy Human checkpoints and pass known_human_accepted=0,
-    // so human lines appear as unknown_additions (not human_additions).
-    assert_eq!(stats.range_stats.human_additions, 0);
-    assert_eq!(stats.range_stats.unknown_additions, 1);
+    assert_eq!(stats.range_stats.human_additions, 1);
+    assert_eq!(stats.range_stats.unknown_additions, 0);
 }
 
 #[test]
