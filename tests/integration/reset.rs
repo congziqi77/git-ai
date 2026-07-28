@@ -299,12 +299,12 @@ fn test_reset_mixed_ai_human_changes() {
     let repo = TestRepo::new();
     let mut file = repo.filename("main.rs");
 
-    // Base commit
-    file.set_contents(crate::lines!["fn main() {}"]);
+    // Base commit has known-human wrapper context.
+    file.set_contents(crate::lines!["fn main() {", "}"]);
     let base = repo.stage_all_and_commit("Base").unwrap();
 
     // AI commit
-    file.set_contents(crate::lines!["fn main() {", "    // AI".ai(), "}"]);
+    file.insert_at(1, crate::lines!["    // AI".ai()]);
     repo.stage_all_and_commit("AI changes").unwrap();
 
     // Human commit
@@ -661,6 +661,332 @@ fn test_reset_large_commit_preserves_attribution() {
     }
 }
 
+/// Test soft-reset-recommit preserves secondary file attribution when only
+/// primary file is edited between reset and recommit. Reproduces the pattern
+/// from fuzz_chaos_99 where multi-file commit → soft reset → edit one file → recommit
+/// loses attribution for the untouched secondary file.
+#[test]
+fn test_soft_reset_recommit_preserves_secondary_file() {
+    let repo = TestRepo::new();
+    let main_path = repo.path().join("main.txt");
+    let sec_path = repo.path().join("secondary.txt");
+
+    // Initial commit with main file
+    fs::write(&main_path, "AAA\nAAA\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    // Create secondary file with AI content and commit both
+    fs::write(&sec_path, "BBB\nBBB\nBBB\nBBB\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    // Also edit main
+    fs::write(&main_path, "AAA\nAAA\nCCC\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("multi-file commit").unwrap();
+
+    // Verify secondary before soft-reset
+    let mut sec_file = repo.filename("secondary.txt");
+    sec_file.assert_committed_lines(crate::lines![
+        "BBB".ai(),
+        "BBB".ai(),
+        "BBB".ai(),
+        "BBB".ai(),
+    ]);
+
+    // Soft reset
+    repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
+
+    // Edit only main file
+    fs::write(&main_path, "AAA\nAAA\nCCC\nDDD\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+
+    // Recommit
+    repo.stage_all_and_commit("recommit after soft reset")
+        .unwrap();
+
+    // Secondary file should still have full AI attribution
+    sec_file.assert_committed_lines(crate::lines![
+        "BBB".ai(),
+        "BBB".ai(),
+        "BBB".ai(),
+        "BBB".ai(),
+    ]);
+}
+
+/// Test that attribution survives: multi-file commit → soft-reset-recommit →
+/// further edits to one file with prepends → commit. The prepends shift line
+/// numbers but the untouched lines should still be properly attributed by
+/// tracing back through blame.
+#[test]
+fn test_soft_reset_recommit_with_subsequent_prepend() {
+    let repo = TestRepo::new();
+    let main_path = repo.path().join("main.txt");
+    let sec_path = repo.path().join("secondary.txt");
+
+    // Initial commit
+    fs::write(&main_path, "base\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    // Commit secondary file with AI lines
+    fs::write(&sec_path, "AI1\nAI2\nAI3\nAI4\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    fs::write(&main_path, "base\nedit1\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("add secondary").unwrap();
+
+    // Soft reset and recommit (with extra edit to main only)
+    repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
+    fs::write(&main_path, "base\nedit1\nextra\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("recommit").unwrap();
+
+    // Verify secondary still attributed
+    let mut sec_file = repo.filename("secondary.txt");
+    sec_file.assert_committed_lines(crate::lines![
+        "AI1".ai(),
+        "AI2".ai(),
+        "AI3".ai(),
+        "AI4".ai(),
+    ]);
+
+    // Now prepend to secondary and commit — old AI lines shift down
+    fs::write(&sec_path, "NEW1\nNEW2\nNEW3\nAI1\nAI2\nAI3\nAI4\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("prepend to secondary").unwrap();
+
+    // Lines 4-7 should still be AI (traced back to recommit via blame)
+    sec_file.assert_committed_lines(crate::lines![
+        "NEW1".ai(),
+        "NEW2".ai(),
+        "NEW3".ai(),
+        "AI1".ai(),
+        "AI2".ai(),
+        "AI3".ai(),
+        "AI4".ai(),
+    ]);
+}
+
+/// Reproduces the fuzz_chaos_99 pattern where identical content (same char
+/// repeated) across multiple commits causes git blame to misattribute shifted
+/// lines to a newer commit. The note for that commit must still cover them.
+///
+/// Pattern: AI file created → committed → soft-reset → recommit → further edits
+/// with ReplaceRandom + Prepend → commit. Git blame assigns the shifted-but-
+/// unchanged AI lines to the last commit, but since they weren't re-checkpointed,
+/// they're missing from the note.
+#[test]
+fn test_blame_identical_content_shift_attribution() {
+    let repo = TestRepo::new();
+    let main_path = repo.path().join("main.txt");
+    let sec_path = repo.path().join("secondary.txt");
+
+    // Initial commit
+    fs::write(&main_path, "base\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    // Create secondary file: 8 lines of "X" (AI) — identical content per line
+    fs::write(&sec_path, "X\nX\nX\nX\nX\nX\nX\nX\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    fs::write(&main_path, "base\nedit\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("add secondary with AI").unwrap();
+
+    // Soft reset + recommit (only edit main)
+    repo.git(&["reset", "--soft", "HEAD~1"]).unwrap();
+    fs::write(&main_path, "base\nedit\nextra\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "main.txt"]).unwrap();
+    repo.stage_all_and_commit("recommit").unwrap();
+
+    // Verify: all 8 "X" lines should be AI
+    let mut sec_file = repo.filename("secondary.txt");
+    sec_file.assert_committed_lines(crate::lines![
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+    ]);
+
+    // Now: replace lines 1-2 with "Y" (AI), then prepend 4 "Z" lines (AI)
+    // After: Z Z Z Z Y Y X X X X X X (12 lines)
+    // The "X" lines at 5-12 were at 3-8 in parent → git blame should trace back.
+    // But with identical "X" content and the replacement of lines 1-2, git's
+    // diff algorithm may assign some "X" lines to this commit.
+    fs::write(&sec_path, "Y\nY\nX\nX\nX\nX\nX\nX\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    fs::write(&sec_path, "Z\nZ\nZ\nZ\nY\nY\nX\nX\nX\nX\nX\nX\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "secondary.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("replace and prepend").unwrap();
+
+    // All lines should still be AI-attributed regardless of which commit
+    // git blame assigns them to.
+    sec_file.assert_committed_lines(crate::lines![
+        "Z".ai(),
+        "Z".ai(),
+        "Z".ai(),
+        "Z".ai(),
+        "Y".ai(),
+        "Y".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+        "X".ai(),
+    ]);
+}
+
+/// Repro for forward reset orphaning the working log
+/// (docs/forward-reset-orphans-working-log-2026-07-20.md): a non-hard reset
+/// that moves HEAD *forward* (old HEAD is an ancestor of the new HEAD, e.g.
+/// syncing the local branch onto a newer upstream commit) must carry
+/// uncommitted AI attribution over to the new base commit.
+#[test]
+fn test_forward_reset_mixed_preserves_uncommitted_ai_attribution() {
+    let repo = TestRepo::new();
+
+    let ai_path = repo.path().join("feature.txt");
+    let upstream_path = repo.path().join("upstream.txt");
+
+    fs::write(&ai_path, "human line\n").unwrap();
+    fs::write(&upstream_path, "upstream v1\n").unwrap();
+    repo.stage_all_and_commit("Base commit").unwrap();
+
+    // A newer "upstream" commit that is a descendant of the base commit.
+    fs::write(&upstream_path, "upstream v2\n").unwrap();
+    let upstream = repo.stage_all_and_commit("Upstream commit").unwrap();
+
+    // Move the local branch back to the base commit (nothing uncommitted yet).
+    repo.git(&["reset", "--hard", "HEAD~1"]).unwrap();
+
+    // Uncommitted AI edit while HEAD is on the old base.
+    fs::write(&ai_path, "human line\nAI line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+
+    // Forward mixed reset onto the newer upstream commit.
+    repo.git(&["reset", "--mixed", &upstream.commit_sha])
+        .unwrap();
+
+    // Commit the AI edit on top of the new base.
+    repo.git(&["add", "feature.txt"]).unwrap();
+    let commit = repo.commit("Commit AI work after forward reset").unwrap();
+
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "AI attribution should survive a forward mixed reset"
+    );
+    let mut file = repo.filename("feature.txt");
+    file.assert_committed_lines(crate::lines![
+        "human line".unattributed_human(),
+        "AI line".ai(),
+    ]);
+}
+
+/// Same bug via `git reset --keep`, the exact mechanism Graphite's restack
+/// uses to land a branch on a newer base commit (`git reset -q --keep
+/// <new-commit>`). Unlike `--mixed`, `--keep` refuses to move HEAD at all if
+/// the reset would clobber a conflicting uncommitted change, but it still
+/// must carry non-conflicting uncommitted AI attribution over to the new
+/// base -- exercised here as a forward reset with no stash involved.
+#[test]
+fn test_forward_reset_keep_preserves_uncommitted_ai_attribution() {
+    let repo = TestRepo::new();
+
+    let ai_path = repo.path().join("feature.txt");
+    let upstream_path = repo.path().join("upstream.txt");
+
+    fs::write(&ai_path, "human line\n").unwrap();
+    fs::write(&upstream_path, "upstream v1\n").unwrap();
+    repo.stage_all_and_commit("Base commit").unwrap();
+
+    // A newer "upstream" commit that is a descendant of the base commit.
+    fs::write(&upstream_path, "upstream v2\n").unwrap();
+    let upstream = repo.stage_all_and_commit("Upstream commit").unwrap();
+
+    // Move the local branch back to the base commit (nothing uncommitted yet).
+    repo.git(&["reset", "--hard", "HEAD~1"]).unwrap();
+
+    // Uncommitted AI edit while HEAD is on the old base. This edit doesn't
+    // touch upstream.txt, so `--keep` won't refuse the reset.
+    fs::write(&ai_path, "human line\nAI line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+
+    // Forward `reset --keep` onto the newer upstream commit.
+    repo.git(&["reset", "--keep", &upstream.commit_sha])
+        .unwrap();
+
+    // Commit the AI edit on top of the new base.
+    repo.git(&["add", "feature.txt"]).unwrap();
+    let commit = repo
+        .commit("Commit AI work after forward reset --keep")
+        .unwrap();
+
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "AI attribution should survive a forward `reset --keep`"
+    );
+    let mut file = repo.filename("feature.txt");
+    file.assert_committed_lines(crate::lines![
+        "human line".unattributed_human(),
+        "AI line".ai(),
+    ]);
+}
+
+/// Same bug via the real-world sequence that surfaced it (IDE "sync/update
+/// project": stash local changes -> forward reset onto newer upstream ->
+/// stash pop -> commit).
+#[test]
+fn test_forward_reset_stash_pop_preserves_ai_attribution() {
+    let repo = TestRepo::new();
+
+    let ai_path = repo.path().join("feature.txt");
+    let upstream_path = repo.path().join("upstream.txt");
+
+    fs::write(&ai_path, "human line\n").unwrap();
+    fs::write(&upstream_path, "upstream v1\n").unwrap();
+    repo.stage_all_and_commit("Base commit").unwrap();
+
+    fs::write(&upstream_path, "upstream v2\n").unwrap();
+    let upstream = repo.stage_all_and_commit("Upstream commit").unwrap();
+
+    repo.git(&["reset", "--hard", "HEAD~1"]).unwrap();
+
+    fs::write(&ai_path, "human line\nAI line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "feature.txt"])
+        .unwrap();
+
+    repo.git(&["stash"]).unwrap();
+    repo.git(&["reset", "--mixed", &upstream.commit_sha])
+        .unwrap();
+    repo.git(&["stash", "pop"]).unwrap();
+
+    repo.git(&["add", "feature.txt"]).unwrap();
+    let commit = repo
+        .commit("Commit AI work after stashed forward reset")
+        .unwrap();
+
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "AI attribution should survive stash -> forward reset -> stash pop"
+    );
+    let mut file = repo.filename("feature.txt");
+    file.assert_committed_lines(crate::lines![
+        "human line".unattributed_human(),
+        "AI line".ai(),
+    ]);
+}
+
 crate::reuse_tests_in_worktree!(
     test_reset_hard_deletes_working_log,
     test_reset_soft_reconstructs_working_log,
@@ -678,4 +1004,7 @@ crate::reuse_tests_in_worktree!(
     test_reset_mixed_pathspec_multiple_commits,
     test_reset_with_directory_pathspec,
     test_reset_large_commit_preserves_attribution,
+    test_forward_reset_mixed_preserves_uncommitted_ai_attribution,
+    test_forward_reset_keep_preserves_uncommitted_ai_attribution,
+    test_forward_reset_stash_pop_preserves_ai_attribution,
 );

@@ -38,12 +38,9 @@ fn test_ensure_config_directory_creates_structure() {
         "working_logs should be a directory"
     );
 
-    let rewrite_log_file = ai_dir.join("rewrite_log");
-    assert!(rewrite_log_file.exists(), "rewrite_log file should exist");
-    assert!(rewrite_log_file.is_file(), "rewrite_log should be a file");
-
-    let content = fs::read_to_string(&rewrite_log_file).expect("Failed to read rewrite_log");
-    assert_eq!(content, "", "rewrite_log should be empty by default");
+    let logs_dir = ai_dir.join("logs");
+    assert!(logs_dir.exists(), "logs directory should exist");
+    assert!(logs_dir.is_dir(), "logs should be a directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -51,22 +48,14 @@ fn test_ensure_config_directory_creates_structure() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_ensure_config_directory_handles_existing_files() {
+fn test_ensure_config_directory_handles_existing_dirs() {
     let repo = TestRepo::new();
     let repo_storage = storage_for(&repo);
 
-    let rewrite_log_file = repo.path().join(".git").join("ai").join("rewrite_log");
-    fs::write(&rewrite_log_file, "existing content").expect("Failed to write to rewrite_log");
-
+    // Call ensure_config_directory again - should be idempotent
     repo_storage
         .ensure_config_directory()
         .expect("Failed to ensure config directory again");
-
-    let content = fs::read_to_string(&rewrite_log_file).expect("Failed to read rewrite_log");
-    assert_eq!(
-        content, "existing content",
-        "Existing rewrite_log content should be preserved"
-    );
 
     let ai_dir = repo.path().join(".git").join("ai");
     let working_logs_dir = ai_dir.join("working_logs");
@@ -220,6 +209,35 @@ fn test_read_all_checkpoints_filters_incompatible_versions() {
     assert_eq!(checkpoints[0].api_version, CHECKPOINT_API_VERSION);
 }
 
+#[test]
+fn test_oversized_checkpoints_file_is_truncated_before_read() {
+    let repo = TestRepo::new();
+    let repo_storage = storage_for(&repo);
+    let working_log = repo_storage
+        .working_log_for_base_commit("test-commit-sha")
+        .unwrap();
+    let checkpoints_file = working_log.dir.join("checkpoints.jsonl");
+
+    fs::write(&checkpoints_file, "this is intentionally not valid json\n")
+        .expect("write oversized checkpoints fixture");
+
+    let checkpoints = working_log
+        .read_all_checkpoints_with_size_limit_for_test(8)
+        .expect("oversized checkpoint file should be reset before parsing");
+
+    assert!(
+        checkpoints.is_empty(),
+        "oversized checkpoints file should read back as empty"
+    );
+    assert_eq!(
+        fs::metadata(&checkpoints_file)
+            .expect("empty checkpoints file should remain")
+            .len(),
+        0,
+        "oversized checkpoints file should be truncated to an empty file"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. test_persisted_working_log_reset
 // ---------------------------------------------------------------------------
@@ -364,6 +382,43 @@ fn test_write_initial_with_contents_persists_snapshot_blob() {
     assert_eq!(persisted, "fn main() {}\n");
 }
 
+#[test]
+fn test_write_initial_with_contents_rejects_missing_snapshot() {
+    let repo = TestRepo::new();
+    let repo_storage = storage_for(&repo);
+    let working_log = repo_storage
+        .working_log_for_base_commit("test-commit-sha")
+        .unwrap();
+
+    let mut attributions = HashMap::new();
+    attributions.insert(
+        "src/test.rs".to_string(),
+        vec![LineAttribution {
+            start_line: 1,
+            end_line: 1,
+            author_id: "ai-1".to_string(),
+            overrode: None,
+        }],
+    );
+
+    let error = working_log
+        .write_initial_attributions_with_contents(
+            attributions,
+            HashMap::new(),
+            std::collections::BTreeMap::new(),
+            HashMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect_err("missing content snapshot must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("INITIAL missing file content snapshot for src/test.rs"),
+        "unexpected error: {error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. test_write_initial_empty_removes_existing_file
 // ---------------------------------------------------------------------------
@@ -387,7 +442,13 @@ fn test_write_initial_empty_removes_existing_file() {
         }],
     );
     working_log
-        .write_initial_attributions(attributions, HashMap::new())
+        .write_initial_attributions_with_contents(
+            attributions,
+            HashMap::new(),
+            std::collections::BTreeMap::new(),
+            HashMap::from([("src/test.rs".to_string(), "fn main() {}\n".to_string())]),
+            std::collections::BTreeMap::new(),
+        )
         .expect("write INITIAL");
     assert!(working_log.initial_file.exists(), "INITIAL should exist");
 

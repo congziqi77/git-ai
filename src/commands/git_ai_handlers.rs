@@ -53,6 +53,7 @@ pub fn handle_git_ai(args: &[String]) {
             | "install-hooks"
             | "install"
             | "uninstall-hooks"
+            | "usage"
     );
     if needs_daemon {
         use crate::daemon::telemetry_handle::{
@@ -107,6 +108,15 @@ pub fn handle_git_ai(args: &[String]) {
                 log_message("stats", "info", None)
             }
             handle_stats(&args[1..]);
+        }
+        "usage" => {
+            commands::usage::handle_usage(&args[1..]);
+        }
+        "analyze" => {
+            commands::analyze::handle_analyze(&args[1..]);
+            if is_interactive_terminal() {
+                log_message("analyze", "info", None)
+            }
         }
         "status" => {
             commands::status::handle_status(&args[1..]);
@@ -172,9 +182,6 @@ pub fn handle_git_ai(args: &[String]) {
         "git-hooks" => {
             handle_git_hooks(&args[1..]);
         }
-        "squash-authorship" => {
-            commands::squash_authorship::handle_squash_authorship(&args[1..]);
-        }
         "ci" => {
             commands::ci_handlers::handle_ci(&args[1..]);
         }
@@ -183,6 +190,9 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
+        }
+        "await" => {
+            commands::r#await::handle_await(&args[1..]);
         }
         "login" => {
             commands::login::handle_login(&args[1..]);
@@ -228,7 +238,7 @@ pub fn handle_git_ai(args: &[String]) {
 }
 
 /// Dispatch `git-ai notes <subcommand>` commands.
-fn handle_notes_subcommand(args: &[String]) {
+pub(crate) fn handle_notes_subcommand(args: &[String]) {
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("--help");
     match subcommand {
         "migrate" => {
@@ -310,7 +320,7 @@ fn print_help() {
     eprintln!("Commands:");
     eprintln!("  checkpoint         Checkpoint working changes and attribute author");
     eprintln!(
-        "    Presets: claude, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
+        "    Presets: claude, cline, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
     );
     eprintln!(
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
@@ -318,10 +328,8 @@ fn print_help() {
     eprintln!("    human [pathspecs...]             Untracked/legacy human checkpoint");
     eprintln!("    mock_ai [pathspecs...]           Test preset accepting optional file pathspecs");
     eprintln!("    mock_known_human [pathspecs...]  Test preset for KnownHuman checkpoints");
-    eprintln!("  log [args...]      Show commit log with AI authorship notes");
-    eprintln!(
-        "                        Proxies git log --notes=ai with all standard git log options"
-    );
+    eprintln!("  log [args...]      Show commit log with AI authorship stats");
+    eprintln!("                        Use --raw or --notes to include raw authorship note data");
     eprintln!("  blame <file>       Git blame with AI authorship overlay");
     eprintln!("  diff <commit|range>  Show diff with AI authorship annotations");
     eprintln!("    <commit>              Diff from commit's parent to commit");
@@ -335,8 +343,15 @@ fn print_help() {
     );
     eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!("  usage              Show local AI usage statistics");
+    eprintln!("    --period <1d|3d|7d|30d>  Time window (default: 30d)");
+    eprintln!("    --json                 Output in JSON format");
+    eprintln!("  analyze [beta]      Analyze agent sessions and effectiveness");
     eprintln!("  status             Show uncommitted AI authorship status (debug)");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!(
+        "    --diff-only            Report only current-diff stats, omitting the per-checkpoint breakdown"
+    );
     eprintln!("  show <rev|range>   Display authorship logs for a revision or range");
     eprintln!("  show-prompt <id>   Display a prompt record by its ID");
     eprintln!("    --commit <rev>        Look in a specific commit only");
@@ -353,15 +368,14 @@ fn print_help() {
     eprintln!("  bg                 Run and control git-ai background service");
     eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
     eprintln!("    --skills               Also install agent skill files");
+    eprintln!("    --visual-studio-extension");
+    eprintln!("                           Also install the Visual Studio extension on Windows");
     eprintln!("  uninstall-hooks    Remove git-ai hooks from all detected tools");
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
-    eprintln!("  squash-authorship  Generate authorship log for squashed commits");
-    eprintln!(
-        "    <base_branch> <new_sha> <old_sha>  Required: base branch, new commit SHA, old commit SHA"
-    );
-    eprintln!("    --dry-run             Show what would be done without making changes");
     eprintln!("  git-path           Print the path to the underlying git executable");
+    eprintln!("  await [beta]       Wait for the background service to finish all work");
+    eprintln!("    --timeout <seconds>    Maximum time to wait (default: 30)");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
@@ -389,11 +403,18 @@ fn handle_checkpoint(args: &[String]) {
                     hook_input = Some(strip_utf8_bom(args[i + 1].clone()));
                     if hook_input.as_ref().unwrap() == "stdin" {
                         let mut stdin = std::io::stdin();
-                        let mut buffer = String::new();
-                        if let Err(e) = stdin.read_to_string(&mut buffer) {
+                        let mut buffer = Vec::new();
+                        if let Err(e) = stdin.read_to_end(&mut buffer) {
                             eprintln!("Failed to read stdin for hook input: {}", e);
                             std::process::exit(0);
                         }
+                        let buffer = match decode_hook_input_bytes(buffer) {
+                            Ok(buffer) => buffer,
+                            Err(e) => {
+                                eprintln!("Failed to decode stdin for hook input: {}", e);
+                                std::process::exit(0);
+                            }
+                        };
                         if buffer.trim().is_empty() {
                             eprintln!("No hook input provided (via --hook-input or stdin).");
                             std::process::exit(0);
@@ -537,10 +558,8 @@ fn handle_checkpoint(args: &[String]) {
         let control_request = ControlRequest::CheckpointRun {
             request: Box::new(request),
         };
-        let send_result = crate::daemon::send_control_request_fire_and_forget(
-            &config.control_socket_path,
-            &control_request,
-        );
+        let send_result =
+            crate::daemon::send_control_request(&config.control_socket_path, &control_request);
         if perf {
             eprintln!(
                 "[perf] checkpoint: ipc_send={:.1}ms",
@@ -572,6 +591,65 @@ fn strip_utf8_bom(input: String) -> String {
     } else {
         input
     }
+}
+
+fn decode_hook_input_bytes(bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16_hook_input(&bytes[2..], Utf16Endian::Little);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_hook_input(&bytes[2..], Utf16Endian::Big);
+    }
+
+    match likely_utf16_endian(&bytes) {
+        Some(endian) => decode_utf16_hook_input(&bytes, endian),
+        None => String::from_utf8(bytes).map_err(|e| e.to_string()),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Utf16Endian {
+    Little,
+    Big,
+}
+
+fn likely_utf16_endian(bytes: &[u8]) -> Option<Utf16Endian> {
+    let sample_len = bytes.len().min(512);
+    if sample_len < 8 {
+        return None;
+    }
+
+    let sample = &bytes[..sample_len];
+    let even_nuls = sample.iter().step_by(2).filter(|&&b| b == 0).count();
+    let odd_nuls = sample
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .filter(|&&b| b == 0)
+        .count();
+    let min_nuls = sample_len / 8;
+
+    if odd_nuls > min_nuls && odd_nuls > even_nuls.saturating_mul(4) {
+        Some(Utf16Endian::Little)
+    } else if even_nuls > min_nuls && even_nuls > odd_nuls.saturating_mul(4) {
+        Some(Utf16Endian::Big)
+    } else {
+        None
+    }
+}
+
+fn decode_utf16_hook_input(bytes: &[u8], endian: Utf16Endian) -> Result<String, String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return Err("UTF-16 hook input has an odd byte length".to_string());
+    }
+
+    let code_units = chunks.map(|chunk| match endian {
+        Utf16Endian::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
+        Utf16Endian::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
+    });
+
+    String::from_utf16(&code_units.collect::<Vec<u16>>()).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -676,7 +754,7 @@ fn notes_existence_label(existence: NotesExistence) -> &'static str {
     }
 }
 
-fn handle_effective_ignore_patterns_internal(args: &[String]) {
+pub(crate) fn handle_effective_ignore_patterns_internal(args: &[String]) {
     let payload = parse_machine_json_arg(args, "effective-ignore-patterns")
         .unwrap_or_else(|msg| emit_machine_json_error(msg));
 
@@ -696,7 +774,7 @@ fn handle_effective_ignore_patterns_internal(args: &[String]) {
     print_machine_json(&response_value);
 }
 
-fn handle_blame_analysis_internal(args: &[String]) {
+pub(crate) fn handle_blame_analysis_internal(args: &[String]) {
     let payload = parse_machine_json_arg(args, "blame-analysis")
         .unwrap_or_else(|msg| emit_machine_json_error(msg));
 
@@ -720,7 +798,7 @@ fn handle_blame_analysis_internal(args: &[String]) {
     print_machine_json(&response_value);
 }
 
-fn handle_fetch_authorship_notes_internal(args: &[String]) {
+pub(crate) fn handle_fetch_authorship_notes_internal(args: &[String]) {
     disable_debug_logs_for_machine_command();
     let (repo, request) = parse_authorship_remote_request(args, "fetch-authorship-notes");
 
@@ -737,7 +815,7 @@ fn handle_fetch_authorship_notes_internal(args: &[String]) {
     print_machine_json(&response_value);
 }
 
-fn handle_push_authorship_notes_internal(args: &[String]) {
+pub(crate) fn handle_push_authorship_notes_internal(args: &[String]) {
     disable_debug_logs_for_machine_command();
     let (repo, request) = parse_authorship_remote_request(args, "push-authorship-notes");
 
@@ -852,7 +930,6 @@ fn handle_ai_diff(args: &[String]) {
             std::process::exit(1);
         }
     };
-
     if let Err(e) = commands::diff::handle_diff(&repo, args) {
         eprintln!("Diff failed: {}", e);
         std::process::exit(1);
@@ -1137,11 +1214,14 @@ fn discover_dirty_files_from_status(cwd: &std::path::Path) -> Vec<String> {
         .and_then(|r| r.workdir().ok())
         .unwrap_or_else(|| cwd.to_path_buf());
 
-    let output = std::process::Command::new(crate::config::Config::get().git_cmd())
-        .args(["status", "--porcelain", "-uall"])
-        .current_dir(cwd)
-        .output()
-        .ok();
+    let args = vec![
+        "-C".to_string(),
+        cwd.to_string_lossy().to_string(),
+        "status".to_string(),
+        "--porcelain".to_string(),
+        "-uall".to_string(),
+    ];
+    let output = crate::git::repository::exec_git(&args).ok();
     let Some(output) = output else {
         return vec![];
     };

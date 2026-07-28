@@ -48,6 +48,51 @@ pub fn read_note(repo: &Repository, commit_sha: &str) -> Option<String> {
     }
 }
 
+/// Read note contents for multiple commits in O(1) git process calls.
+/// Returns a map of commit_sha → note_content for commits that have notes.
+///
+/// On the HTTP backend this checks the local cache, then fetches-and-caches any
+/// misses from the remote, and finally falls back to local git notes; on the
+/// GitNotes backend it reads directly via the batched `notes_for_commits` path.
+pub fn read_notes_batch(
+    repo: &Repository,
+    commit_shas: &[String],
+) -> Result<HashMap<String, String>, GitAiError> {
+    if commit_shas.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    match Config::get().notes_backend_kind() {
+        NotesBackendKind::Http => {
+            let mut notes = http_read_notes(commit_shas);
+
+            let missing_after_cache: Vec<String> = commit_shas
+                .iter()
+                .filter(|sha| !notes.contains_key(*sha))
+                .cloned()
+                .collect();
+            if !missing_after_cache.is_empty() {
+                notes.extend(http_fetch_and_cache_notes(&missing_after_cache));
+            }
+
+            let missing_after_http: Vec<String> = commit_shas
+                .iter()
+                .filter(|sha| !notes.contains_key(*sha))
+                .cloned()
+                .collect();
+            if !missing_after_http.is_empty()
+                && let Ok(git_notes) =
+                    crate::git::refs::notes_for_commits(repo, &missing_after_http)
+            {
+                notes.extend(git_notes);
+            }
+
+            Ok(notes)
+        }
+        NotesBackendKind::GitNotes => crate::git::refs::notes_for_commits(repo, commit_shas),
+    }
+}
+
 pub fn read_authorship(repo: &Repository, commit_sha: &str) -> Option<AuthorshipLog> {
     match Config::get().notes_backend_kind() {
         NotesBackendKind::Http => {
@@ -95,13 +140,8 @@ pub fn read_authorship_v3(
 ///
 /// 1. `authorship_traversal::load_ai_touched_files_for_commits` — passes OIDs
 ///    to `batch_read_blobs_with_oids`; must be real git OIDs.
-/// 2. `rebase_authorship::build_rebase_note_cache` — passes OIDs to
-///    `batch_read_blob_contents`; must be real git OIDs.
-/// 3. `rebase_authorship::load_note_contents_for_commits` — same pattern.
-/// 4. `rebase_authorship::try_fast_path_cherry_pick_remap` — passes OIDs to
-///    `batch_read_blob_contents`; also checks `len() != source_commits.len()`
-///    and returns `false` on mismatch, which is the correct behaviour when
-///    notes are not in git refs.
+/// 2. `rewrite::shift_authorship_notes` — reads notes by OID;
+///    must be real git OIDs.
 ///
 /// **HTTP backend**: notes do not live in `refs/notes/ai`, so there are no
 /// git blob OIDs to return.  Returning an empty map causes callers to handle
@@ -204,8 +244,34 @@ pub fn filter_commits_with_notes(
 
 // --- Search ---
 
+/// Search authorship-note content for a literal substring and return matching
+/// commit SHAs, newest first.
+///
+/// On the HTTP backend this searches the notes-db cache and unions in any
+/// matches from local git notes (transition-period repos may have both); on
+/// the GitNotes backend it greps `refs/notes/ai` directly.
 pub fn search_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, GitAiError> {
-    crate::git::refs::grep_ai_notes(repo, pattern)
+    match Config::get().notes_backend_kind() {
+        NotesBackendKind::Http => http_search_notes(repo, pattern),
+        NotesBackendKind::GitNotes => crate::git::refs::grep_ai_notes(repo, pattern),
+    }
+}
+
+fn http_search_notes(repo: &Repository, pattern: &str) -> Result<Vec<String>, GitAiError> {
+    let mut shas: HashSet<String> = {
+        let db = crate::notes::db::NotesDatabase::global()?;
+        let db_lock = db
+            .lock()
+            .map_err(|e| GitAiError::Generic(format!("notes-db lock: {}", e)))?;
+        db_lock.search_notes_content(pattern)?.into_iter().collect()
+    };
+
+    // Union in matches from local git notes for transition-period repos.
+    if let Ok(git_shas) = crate::git::refs::grep_ai_notes(repo, pattern) {
+        shas.extend(git_shas);
+    }
+
+    crate::git::refs::sort_commit_shas_by_date_desc(repo, shas)
 }
 
 // --- Materialization (for git ai log) ---
@@ -315,7 +381,6 @@ pub fn materialize_notes_for_display(repo: &Repository, limit: usize) -> Result<
 /// This function is a best-effort operation: errors are logged but not propagated
 /// (callers should treat failure as a cache miss, not a hard error).
 pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), GitAiError> {
-    use crate::api::client::{ApiClient, ApiContext};
     use crate::git::repository::exec_git;
 
     // 1. Walk recent history. Prefer the remote's default branch; fall back to HEAD.
@@ -365,27 +430,7 @@ pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), GitA
     }
 
     // 2. Filter out SHAs already in notes-db.
-    let already_cached: std::collections::HashSet<String> = {
-        match crate::notes::db::NotesDatabase::global() {
-            Ok(db) => match db.lock() {
-                Ok(lock) => {
-                    let refs: Vec<&str> = all_shas.iter().map(|s| s.as_str()).collect();
-                    lock.get_notes(&refs)
-                        .unwrap_or_default()
-                        .into_keys()
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::warn!("warm_cache_for_remote: DB lock poisoned: {}", e);
-                    std::collections::HashSet::new()
-                }
-            },
-            Err(e) => {
-                tracing::warn!("warm_cache_for_remote: failed to open notes-db: {}", e);
-                std::collections::HashSet::new()
-            }
-        }
-    };
+    let already_cached = cached_note_shas(&all_shas);
 
     let uncached: Vec<String> = all_shas
         .into_iter()
@@ -397,72 +442,74 @@ pub fn warm_cache_for_remote(repo: &Repository, remote: &str) -> Result<(), GitA
         return Ok(());
     }
 
+    tracing::info!(
+        remote = %remote,
+        backend = %"http",
+        uncached_commits = uncached.len(),
+        "fetching authorship notes"
+    );
     tracing::debug!(
         "warm_cache_for_remote: fetching notes for {} uncached commits",
         uncached.len()
     );
 
-    // 3. Batch-fetch from the HTTP backend (chunks of 100).
-    let cfg = crate::config::Config::fresh();
-    let backend_url = match cfg.notes_backend_url() {
-        Some(url) => url.to_string(),
-        None => {
-            tracing::debug!(
-                "warm_cache_for_remote: notes_backend.backend_url is not configured; skipping"
-            );
-            return Ok(());
-        }
-    };
-    let ctx = ApiContext::new(Some(backend_url));
-    let client = ApiClient::new(ctx);
+    // 3+4. Batch-fetch from the HTTP backend and cache as synced rows.
+    http_fetch_and_cache_notes(&uncached);
+    Ok(())
+}
 
-    // Skip when not authenticated (matches daemon flush_notes pattern).
-    if !client.is_logged_in() && !client.has_api_key() {
-        tracing::debug!("warm_cache_for_remote: not authenticated; skipping");
-        return Ok(());
+/// Fetch authorship notes for the given commits from the HTTP notes backend
+/// into the local notes-db cache (as already-synced rows), skipping SHAs
+/// already cached. Returns the SHAs newly cached.
+///
+/// Used by rewrite/shift paths when source notes are missing locally: on the
+/// HTTP backend the server — not `refs/notes/ai` — is the source of truth,
+/// and the git refs fetch requires SSH auth that is not available in every
+/// daemon environment.
+///
+/// Best-effort like [`warm_cache_for_remote`]: backend-unconfigured and
+/// unauthenticated states return an empty set rather than an error.
+pub fn warm_cache_for_commits(commit_shas: &[String]) -> Result<Vec<String>, GitAiError> {
+    let already_cached = cached_note_shas(commit_shas);
+    let uncached: Vec<String> = commit_shas
+        .iter()
+        .filter(|sha| !already_cached.contains(sha.as_str()))
+        .cloned()
+        .collect();
+    if uncached.is_empty() {
+        return Ok(Vec::new());
     }
 
-    for chunk in uncached.chunks(100) {
-        let sha_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-        match client.read_notes(&sha_refs) {
-            Ok(response) => {
-                if response.notes.is_empty() {
-                    continue;
-                }
-                // 4. Write returned entries as already-synced cache rows.
-                let entries: Vec<(String, String)> = response.notes.into_iter().collect();
-                match crate::notes::db::NotesDatabase::global() {
-                    Ok(db) => match db.lock() {
-                        Ok(mut lock) => {
-                            if let Err(e) = lock.cache_synced_notes(&entries) {
-                                tracing::warn!(
-                                    "warm_cache_for_remote: cache_synced_notes error: {}",
-                                    e
-                                );
-                            } else {
-                                tracing::debug!(
-                                    count = entries.len(),
-                                    "warm_cache_for_remote: cached notes from remote"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("warm_cache_for_remote: DB lock poisoned: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("warm_cache_for_remote: failed to open notes-db: {}", e);
-                    }
-                }
+    tracing::info!(
+        backend = %"http",
+        uncached_commits = uncached.len(),
+        "fetching authorship notes"
+    );
+
+    Ok(http_fetch_and_cache_notes(&uncached).into_keys().collect())
+}
+
+/// SHAs among `shas` that already have a note in the local notes-db cache.
+fn cached_note_shas(shas: &[String]) -> std::collections::HashSet<String> {
+    match crate::notes::db::NotesDatabase::global() {
+        Ok(db) => match db.lock() {
+            Ok(lock) => {
+                let refs: Vec<&str> = shas.iter().map(|s| s.as_str()).collect();
+                lock.get_notes(&refs)
+                    .unwrap_or_default()
+                    .into_keys()
+                    .collect()
             }
             Err(e) => {
-                // Best-effort: log and continue.
-                tracing::warn!("warm_cache_for_remote: read_notes error: {}", e);
+                tracing::warn!("notes cache lookup: DB lock poisoned: {}", e);
+                std::collections::HashSet::new()
             }
+        },
+        Err(e) => {
+            tracing::warn!("notes cache lookup: failed to open notes-db: {}", e);
+            std::collections::HashSet::new()
         }
     }
-
-    Ok(())
 }
 
 // --- HTTP backend helpers (private) ---
@@ -504,6 +551,47 @@ fn http_read_notes(commit_shas: &[String]) -> HashMap<String, String> {
     };
     let refs: Vec<&str> = commit_shas.iter().map(|s| s.as_str()).collect();
     db_lock.get_notes(&refs).unwrap_or_default()
+}
+
+fn http_fetch_and_cache_notes(commit_shas: &[String]) -> HashMap<String, String> {
+    if commit_shas.is_empty() {
+        return HashMap::new();
+    }
+
+    let cfg = Config::fresh();
+    let Some(backend_url) = cfg.notes_backend_url().map(str::to_string) else {
+        return HashMap::new();
+    };
+
+    let ctx = crate::api::client::ApiContext::new(Some(backend_url));
+    let client = crate::api::client::ApiClient::new(ctx);
+    if !client.is_logged_in() && !client.has_api_key() {
+        return HashMap::new();
+    }
+
+    let mut fetched = HashMap::new();
+    for chunk in commit_shas.chunks(100) {
+        let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        match client.read_notes(&refs) {
+            Ok(response) => {
+                if response.notes.is_empty() {
+                    continue;
+                }
+                let entries: Vec<(String, String)> = response.notes.into_iter().collect();
+                if let Ok(db) = crate::notes::db::NotesDatabase::global()
+                    && let Ok(mut lock) = db.lock()
+                {
+                    let _ = lock.cache_synced_notes(&entries);
+                }
+                fetched.extend(entries);
+            }
+            Err(e) => {
+                tracing::debug!(%e, "notes batch read from HTTP backend failed");
+            }
+        }
+    }
+
+    fetched
 }
 
 fn http_check_exists(commit_shas: &[String]) -> HashSet<String> {
@@ -581,6 +669,44 @@ mod tests {
         assert_eq!(result.get(&sha1), Some(&"content-a".to_string()));
         assert_eq!(result.get(&sha2), Some(&"content-b".to_string()));
         assert!(!result.contains_key(&sha3));
+
+        unsafe {
+            env::remove_var("GIT_AI_TEST_NOTES_DB_PATH");
+        }
+    }
+
+    /// Under the HTTP backend, note search must find notes that only exist in
+    /// the notes-db cache (refs/notes/ai is empty there). Regression: search was
+    /// a pure pass-through to `git grep refs/notes/ai`, so session/prompt history
+    /// lookups silently found nothing under the HTTP backend.
+    #[test]
+    #[serial_test::serial(notes_db_env)]
+    fn http_search_notes_finds_cached_note_content() {
+        use crate::git::test_utils::TmpRepo;
+        use std::env;
+
+        let tmp_db = tempfile::NamedTempFile::new().expect("tmp file");
+        let db_path = tmp_db.path().to_str().unwrap().to_string();
+        unsafe {
+            env::set_var("GIT_AI_TEST_NOTES_DB_PATH", &db_path);
+        }
+
+        let tmp = TmpRepo::new().expect("TmpRepo::new");
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        http_write_note(sha, r#"{"sessions": {"s_searchable123456": {}}}"#).expect("write");
+
+        let matches =
+            http_search_notes(tmp.gitai_repo(), "\"s_searchable123456\"").expect("search");
+        assert_eq!(
+            matches,
+            vec![sha.to_string()],
+            "search must find notes that only exist in the notes-db cache"
+        );
+
+        // A needle that appears nowhere must return no matches (LIKE wildcards in
+        // the needle must not be interpreted).
+        let no_matches = http_search_notes(tmp.gitai_repo(), "\"s_%_absent%\"").expect("search");
+        assert!(no_matches.is_empty(), "got: {:?}", no_matches);
 
         unsafe {
             env::remove_var("GIT_AI_TEST_NOTES_DB_PATH");
@@ -770,11 +896,8 @@ mod tests {
             "Config::fresh() should reflect GIT_AI_NOTES_BACKEND_KIND=http"
         );
 
-        // The actual early-return code in run_pre_push_hook_managed was added
-        // in Phase 2.6. Verify it compiles and is reachable by referencing the
-        // function pointer. Structural verification: when kind == Http, the
-        // function returns before doing any work.
-        let _ = crate::commands::hooks::push_hooks::run_pre_push_hook_managed as fn(_, _);
+        // Structural verification: the Http backend skip is now inlined in
+        // apply_push_side_effect in daemon.rs — no separate hook function needed.
     }
 
     // --- warm_cache_for_remote tests ---

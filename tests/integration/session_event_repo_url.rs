@@ -1,10 +1,10 @@
 use crate::repos::test_repo::TestRepo;
 use git_ai::metrics::{EventAttributes, MetricEvent, PosEncoded, SessionEventValues};
 use git_ai::repo_url::resolve_repo_url_from_path;
-use git_ai::transcripts::agent::Agent;
-use git_ai::transcripts::agents::ClaudeAgent;
-use git_ai::transcripts::watermark::ByteOffsetWatermark;
-use git_ai::transcripts::{SessionRecord, TranscriptsDatabase};
+use git_ai::streams::agent::Agent;
+use git_ai::streams::agents::ClaudeAgent;
+use git_ai::streams::watermark::ByteOffsetWatermark;
+use git_ai::streams::{StreamRecord, StreamsDatabase};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,22 +54,23 @@ fn write_claude_transcript_cwd_on_later_line(path: &Path, cwd: &str) {
     fs::write(path, content).unwrap();
 }
 
-fn setup_test_db(dir: &Path) -> TranscriptsDatabase {
+fn setup_test_db(dir: &Path) -> StreamsDatabase {
     let db_path = dir.join("transcripts.db");
-    TranscriptsDatabase::open(&db_path).unwrap()
+    StreamsDatabase::open(&db_path).unwrap()
 }
 
-fn make_session_record(
+fn make_stream_record(
     session_id: &str,
     tool: &str,
-    transcript_path: &Path,
+    stream_path: &Path,
     repo_work_dir: Option<&str>,
-) -> SessionRecord {
-    SessionRecord {
+) -> StreamRecord {
+    StreamRecord {
         session_id: session_id.to_string(),
+        stream_kind: "transcript".to_string(),
         tool: tool.to_string(),
-        transcript_path: transcript_path.display().to_string(),
-        transcript_format: "ClaudeJsonl".to_string(),
+        stream_path: stream_path.display().to_string(),
+        stream_format: "ClaudeJsonl".to_string(),
         watermark_type: "ByteOffset".to_string(),
         watermark_value: "0".to_string(),
         external_session_id: format!("ext-{}", session_id),
@@ -236,9 +237,12 @@ fn test_db_new_schema_has_repo_work_dir() {
     let transcript = temp_dir.path().join("t.jsonl");
     fs::write(&transcript, "").unwrap();
 
-    let record = make_session_record("test-1", "claude", &transcript, Some("/Users/dev/project"));
-    db.insert_session(&record).unwrap();
-    let retrieved = db.get_session("test-1").unwrap().unwrap();
+    let record = make_stream_record("test-1", "claude", &transcript, Some("/Users/dev/project"));
+    db.insert_stream(&record).unwrap();
+    let retrieved = db
+        .get_stream("test-1", "transcript", &transcript.display().to_string())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         retrieved.repo_work_dir,
         Some("/Users/dev/project".to_string()),
@@ -253,9 +257,12 @@ fn test_db_insert_session_without_repo_work_dir() {
     let transcript = temp_dir.path().join("t.jsonl");
     fs::write(&transcript, "").unwrap();
 
-    let record = make_session_record("test-2", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
-    let retrieved = db.get_session("test-2").unwrap().unwrap();
+    let record = make_stream_record("test-2", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
+    let retrieved = db
+        .get_stream("test-2", "transcript", &transcript.display().to_string())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         retrieved.repo_work_dir, None,
         "repo_work_dir must be None when not provided"
@@ -269,12 +276,20 @@ fn test_db_update_repo_work_dir() {
     let transcript = temp_dir.path().join("t.jsonl");
     fs::write(&transcript, "").unwrap();
 
-    let record = make_session_record("test-3", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("test-3", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
-    db.update_repo_work_dir("test-3", "/Users/dev/my-project")
+    db.update_repo_work_dir(
+        "test-3",
+        "transcript",
+        &transcript.display().to_string(),
+        "/Users/dev/my-project",
+    )
+    .unwrap();
+    let retrieved = db
+        .get_stream("test-3", "transcript", &transcript.display().to_string())
+        .unwrap()
         .unwrap();
-    let retrieved = db.get_session("test-3").unwrap().unwrap();
     assert_eq!(
         retrieved.repo_work_dir,
         Some("/Users/dev/my-project".to_string()),
@@ -295,15 +310,22 @@ fn test_session_events_include_repo_url_from_hook_triggered_checkpoint() {
     write_claude_transcript_with_cwd(&transcript, repo.path().to_str().unwrap());
 
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record(
+    let record = make_stream_record(
         "test-hook-sess",
         "claude",
         &transcript,
         Some(repo.path().to_str().unwrap()),
     );
-    db.insert_session(&record).unwrap();
+    db.insert_stream(&record).unwrap();
 
-    let session = db.get_session("test-hook-sess").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-hook-sess",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let repo_work_dir = session.repo_work_dir.as_ref().map(PathBuf::from);
     let resolved_repo_url = repo_work_dir
         .as_ref()
@@ -344,15 +366,22 @@ fn test_session_events_no_repo_url_when_no_remote() {
     write_claude_transcript_with_cwd(&transcript, repo.path().to_str().unwrap());
 
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record(
+    let record = make_stream_record(
         "test-no-remote",
         "claude",
         &transcript,
         Some(repo.path().to_str().unwrap()),
     );
-    db.insert_session(&record).unwrap();
+    db.insert_stream(&record).unwrap();
 
-    let session = db.get_session("test-no-remote").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-no-remote",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let repo_work_dir = session.repo_work_dir.as_ref().map(PathBuf::from);
     let resolved = repo_work_dir
         .as_ref()
@@ -371,10 +400,17 @@ fn test_session_events_no_repo_url_when_no_work_dir() {
     write_claude_transcript_without_cwd(&transcript);
 
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record("test-no-workdir", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("test-no-workdir", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
-    let session = db.get_session("test-no-workdir").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-no-workdir",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(session.repo_work_dir, None);
 
     let resolved = None::<PathBuf>
@@ -399,17 +435,24 @@ fn test_session_events_repo_url_from_sweep_inferred_cwd() {
 
     let temp_dir = TempDir::new().unwrap();
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record("test-sweep-sess", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("test-sweep-sess", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
-    let session = db.get_session("test-sweep-sess").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-sweep-sess",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(
         session.repo_work_dir, None,
         "Sweep should not have repo_work_dir initially"
     );
 
     let agent = ClaudeAgent::new();
-    let inferred_cwd = agent.infer_cwd(&PathBuf::from(&session.transcript_path));
+    let inferred_cwd = agent.infer_cwd(&PathBuf::from(&session.stream_path));
     assert_eq!(
         inferred_cwd,
         Some(repo.path().to_path_buf()),
@@ -437,15 +480,27 @@ fn test_inferred_cwd_persisted_to_db() {
 
     let temp_dir = TempDir::new().unwrap();
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record("test-persist", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("test-persist", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
     let agent = ClaudeAgent::new();
     let inferred = agent.infer_cwd(&transcript).unwrap();
-    db.update_repo_work_dir("test-persist", &inferred.display().to_string())
-        .unwrap();
+    db.update_repo_work_dir(
+        "test-persist",
+        "transcript",
+        &transcript.display().to_string(),
+        &inferred.display().to_string(),
+    )
+    .unwrap();
 
-    let session = db.get_session("test-persist").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-persist",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(
         session.repo_work_dir,
         Some(repo.path().display().to_string()),
@@ -471,17 +526,24 @@ fn test_repo_work_dir_priority_hook_wins_over_db() {
 
     let temp_dir = TempDir::new().unwrap();
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record(
+    let record = make_stream_record(
         "test-priority",
         "claude",
         &transcript,
         Some(repo_a.path().to_str().unwrap()),
     );
-    db.insert_session(&record).unwrap();
+    db.insert_stream(&record).unwrap();
 
     // Hook provides repo_b's path (should take priority)
     let task_repo_work_dir = Some(repo_b.path().to_path_buf());
-    let session = db.get_session("test-priority").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-priority",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let db_repo_work_dir = session.repo_work_dir.as_ref().map(PathBuf::from);
 
     // Resolution order: task > db > infer
@@ -508,16 +570,23 @@ fn test_repo_work_dir_priority_db_used_when_no_hook() {
 
     let temp_dir = TempDir::new().unwrap();
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record(
+    let record = make_stream_record(
         "test-db-prio",
         "claude",
         &transcript,
         Some(repo.path().to_str().unwrap()),
     );
-    db.insert_session(&record).unwrap();
+    db.insert_stream(&record).unwrap();
 
     let task_repo_work_dir: Option<PathBuf> = None;
-    let session = db.get_session("test-db-prio").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-db-prio",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let db_repo_work_dir = session.repo_work_dir.as_ref().map(PathBuf::from);
 
     let resolved_work_dir = task_repo_work_dir.or(db_repo_work_dir);
@@ -543,15 +612,22 @@ fn test_repo_work_dir_priority_infer_fallback() {
 
     let temp_dir = TempDir::new().unwrap();
     let db = setup_test_db(temp_dir.path());
-    let record = make_session_record("test-infer-prio", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("test-infer-prio", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
     let task_repo_work_dir: Option<PathBuf> = None;
-    let session = db.get_session("test-infer-prio").unwrap().unwrap();
+    let session = db
+        .get_stream(
+            "test-infer-prio",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let db_repo_work_dir = session.repo_work_dir.as_ref().map(PathBuf::from);
 
     let agent = ClaudeAgent::new();
-    let inferred_cwd = agent.infer_cwd(&PathBuf::from(&session.transcript_path));
+    let inferred_cwd = agent.infer_cwd(&PathBuf::from(&session.stream_path));
 
     let resolved_work_dir = task_repo_work_dir.or(db_repo_work_dir).or(inferred_cwd);
     let resolved_url = resolved_work_dir
@@ -569,7 +645,7 @@ fn test_repo_work_dir_priority_infer_fallback() {
 
 #[test]
 fn test_cursor_infer_cwd_returns_none() {
-    use git_ai::transcripts::agents::CursorAgent;
+    use git_ai::streams::agents::CursorAgent;
 
     let temp_dir = TempDir::new().unwrap();
     let transcript = temp_dir.path().join("session.jsonl");
@@ -584,7 +660,7 @@ fn test_cursor_infer_cwd_returns_none() {
 
 #[test]
 fn test_copilot_infer_cwd_returns_none() {
-    use git_ai::transcripts::agents::CopilotAgent;
+    use git_ai::streams::agents::CopilotAgent;
 
     let temp_dir = TempDir::new().unwrap();
     let transcript = temp_dir.path().join("session.json");
@@ -611,21 +687,28 @@ fn test_full_pipeline_session_events_carry_repo_url() {
     let transcript = temp_dir.path().join("session.jsonl");
     write_claude_transcript_with_cwd(&transcript, repo.path().to_str().unwrap());
 
-    let record = make_session_record(
+    let record = make_stream_record(
         "pipeline-test",
         "claude",
         &transcript,
         Some(repo.path().to_str().unwrap()),
     );
-    db.insert_session(&record).unwrap();
+    db.insert_stream(&record).unwrap();
 
     // Replicate process_session_blocking logic
-    let retrieved = db.get_session("pipeline-test").unwrap().unwrap();
+    let retrieved = db
+        .get_stream(
+            "pipeline-test",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let agent = ClaudeAgent::new();
     let watermark = Box::new(ByteOffsetWatermark::new(0));
     let batch = agent
         .read_incremental(
-            &PathBuf::from(&retrieved.transcript_path),
+            &PathBuf::from(&retrieved.stream_path),
             watermark,
             &retrieved.session_id,
         )
@@ -701,22 +784,29 @@ fn test_full_pipeline_session_events_no_repo_url_when_unavailable() {
     let transcript = temp_dir.path().join("session.jsonl");
     write_claude_transcript_without_cwd(&transcript);
 
-    let record = make_session_record("no-repo-test", "claude", &transcript, None);
-    db.insert_session(&record).unwrap();
+    let record = make_stream_record("no-repo-test", "claude", &transcript, None);
+    db.insert_stream(&record).unwrap();
 
-    let retrieved = db.get_session("no-repo-test").unwrap().unwrap();
+    let retrieved = db
+        .get_stream(
+            "no-repo-test",
+            "transcript",
+            &transcript.display().to_string(),
+        )
+        .unwrap()
+        .unwrap();
     let agent = ClaudeAgent::new();
     let watermark = Box::new(ByteOffsetWatermark::new(0));
     let batch = agent
         .read_incremental(
-            &PathBuf::from(&retrieved.transcript_path),
+            &PathBuf::from(&retrieved.stream_path),
             watermark,
             &retrieved.session_id,
         )
         .unwrap();
 
     let repo_work_dir = retrieved.repo_work_dir.as_ref().map(PathBuf::from);
-    let inferred = agent.infer_cwd(&PathBuf::from(&retrieved.transcript_path));
+    let inferred = agent.infer_cwd(&PathBuf::from(&retrieved.stream_path));
     let resolved_work_dir = repo_work_dir.or(inferred);
     let resolved_url = resolved_work_dir
         .as_ref()
@@ -762,7 +852,7 @@ fn test_full_pipeline_session_events_no_repo_url_when_unavailable() {
 
 #[test]
 fn test_codex_infer_cwd_from_session_meta() {
-    use git_ai::transcripts::agents::CodexAgent;
+    use git_ai::streams::agents::CodexAgent;
 
     let temp_dir = TempDir::new().unwrap();
     let transcript = temp_dir.path().join("session.jsonl");
@@ -789,7 +879,7 @@ fn test_codex_infer_cwd_from_session_meta() {
 
 #[test]
 fn test_codex_infer_cwd_no_cwd() {
-    use git_ai::transcripts::agents::CodexAgent;
+    use git_ai::streams::agents::CodexAgent;
 
     let temp_dir = TempDir::new().unwrap();
     let transcript = temp_dir.path().join("session.jsonl");

@@ -1,12 +1,13 @@
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, TranscriptFormat, TranscriptSource,
+    PresetContext, StreamFormat, StreamSource,
 };
 use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
+use crate::mdm::utils::gemini_config_dir;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -27,14 +28,17 @@ impl AgentPreset for GeminiPreset {
         let is_bash = tool_name
             .map(|n| bash_tool::classify_tool(Agent::Gemini, n) == ToolClass::Bash)
             .unwrap_or(false);
+        let mut file_paths = parse::file_paths_from_tool_input(&data, cwd);
+        let internal_tmp_dir = gemini_config_dir().join("tmp");
+        file_paths.retain(|path| !path.starts_with(&internal_tmp_dir));
 
         let context = PresetContext {
             agent_id: AgentId {
                 tool: "gemini".to_string(),
                 id: session_id.clone(),
-                model: crate::transcripts::model_extraction::extract_model(
+                model: crate::streams::model_extraction::extract_model(
                     Path::new(transcript_path),
-                    crate::transcripts::sweep::TranscriptFormat::GeminiJsonl,
+                    crate::streams::sweep::StreamFormat::GeminiJsonl,
                     None,
                 )
                 .ok()
@@ -47,9 +51,9 @@ impl AgentPreset for GeminiPreset {
             metadata: HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]),
         };
 
-        let transcript_source = Some(TranscriptSource {
+        let stream_source = Some(StreamSource {
             path: PathBuf::from(transcript_path),
-            format: TranscriptFormat::GeminiJsonl,
+            format: StreamFormat::GeminiJsonl,
             session_id: generate_session_id(&context.external_session_id, "gemini"),
             external_session_id: context.external_session_id.clone(),
             external_parent_session_id: None,
@@ -58,27 +62,30 @@ impl AgentPreset for GeminiPreset {
         // Gemini uses "BeforeTool" instead of "PreToolUse"
         let is_pre = matches!(hook_event, Some("BeforeTool") | Some("PreToolUse"));
 
+        let bash_command = parse::bash_command_from_hook_input(&data);
         let event = match (is_pre, is_bash) {
             (true, true) => ParsedHookEvent::PreBashCall(PreBashCall {
                 context,
                 tool_use_id: tool_use_id.to_string(),
+                command: bash_command,
             }),
             (true, false) => ParsedHookEvent::PreFileEdit(PreFileEdit {
                 context,
-                file_paths: parse::file_paths_from_tool_input(&data, cwd),
+                file_paths,
                 dirty_files: None,
                 tool_use_id: Some(tool_use_id.to_string()),
             }),
             (false, true) => ParsedHookEvent::PostBashCall(PostBashCall {
                 context,
                 tool_use_id: tool_use_id.to_string(),
-                transcript_source,
+                command: bash_command,
+                stream_source,
             }),
             (false, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
                 context,
-                file_paths: parse::file_paths_from_tool_input(&data, cwd),
+                file_paths,
                 dirty_files: None,
-                transcript_source,
+                stream_source,
                 tool_use_id: Some(tool_use_id.to_string()),
             }),
         };
@@ -139,9 +146,9 @@ mod tests {
                     vec![PathBuf::from("/home/user/project/src/main.rs")]
                 );
                 assert!(matches!(
-                    e.transcript_source,
-                    Some(TranscriptSource {
-                        format: TranscriptFormat::GeminiJsonl,
+                    e.stream_source,
+                    Some(StreamSource {
+                        format: StreamFormat::GeminiJsonl,
                         ..
                     })
                 ));

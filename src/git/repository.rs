@@ -1,11 +1,9 @@
-use crate::authorship::rebase_authorship::rewrite_authorship_if_needed;
 use crate::config;
 use crate::error::GitAiError;
 use crate::git::repo_state::{
-    common_dir_for_git_dir, git_dir_for_worktree, worktree_root_for_path,
+    common_dir_for_git_dir, git_dir_for_worktree, is_valid_git_dir, worktree_root_for_path,
 };
 use crate::git::repo_storage::RepoStorage;
-use crate::git::rewrite_log::RewriteLogEvent;
 use crate::git::status::MAX_PATHSPEC_ARGS;
 use crate::git::sync_authorship::push_authorship_notes;
 #[cfg(windows)]
@@ -16,8 +14,9 @@ use gix_index::entry::Stage;
 use regex::Regex;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(windows)]
@@ -914,7 +913,7 @@ impl<'a> Iterator for References<'a> {
     }
 }
 
-/// The effective git author identity (name + email) for the current repository.
+/// A Git identity (name + email) for the current repository.
 ///
 /// Resolved via `git var GIT_COMMITTER_IDENT` which respects the full git precedence
 /// chain (env vars > config > system defaults), unlike a raw `git config user.name`
@@ -927,6 +926,14 @@ pub struct GitAuthorIdentity {
 }
 
 impl GitAuthorIdentity {
+    /// Apply git-ai's optional author config as a partial override.
+    pub fn with_author_config(&self, author: &config::AuthorConfig) -> Self {
+        GitAuthorIdentity {
+            name: author.name.clone().or_else(|| self.name.clone()),
+            email: author.email.clone().or_else(|| self.email.clone()),
+        }
+    }
+
     /// Format as `"Name <email>"`, `"Name"`, `"<email>"`, or `None`.
     pub fn formatted(&self) -> Option<String> {
         match (&self.name, &self.email) {
@@ -941,6 +948,19 @@ impl GitAuthorIdentity {
     pub fn formatted_or_unknown(&self) -> String {
         self.formatted().unwrap_or_else(|| "unknown".to_string())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GitIdentityResolution {
+    pub raw_git_var: Option<String>,
+    pub identity: GitAuthorIdentity,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GitConfigIdentityResolution {
+    pub raw_name: Option<String>,
+    pub raw_email: Option<String>,
+    pub identity: GitAuthorIdentity,
 }
 
 /// Parse `git var GIT_COMMITTER_IDENT` output into name and email.
@@ -981,6 +1001,74 @@ pub fn parse_git_var_identity(output: &str) -> GitAuthorIdentity {
                 email: None,
             }
         }
+    }
+}
+
+pub fn global_git_config_committer_identity() -> Result<GitAuthorIdentity, GitAiError> {
+    Ok(global_git_config_identity_resolution()?.identity)
+}
+
+pub fn global_git_config_identity_resolution() -> Result<GitConfigIdentityResolution, GitAiError> {
+    let config =
+        gix_config::File::from_globals().map_err(|e| GitAiError::GixError(e.to_string()))?;
+    Ok(git_config_identity_resolution_from_config(&config))
+}
+
+pub fn current_git_committer_identity_resolution() -> GitIdentityResolution {
+    resolve_git_var_identity_with_args(Vec::new(), "GIT_COMMITTER_IDENT", || {
+        global_git_config_committer_identity().unwrap_or_default()
+    })
+}
+
+fn git_config_identity_resolution_from_config(
+    config: &gix_config::File<'_>,
+) -> GitConfigIdentityResolution {
+    let raw_name = config.string("user.name").map(|cow| cow.to_string());
+    let raw_email = config.string("user.email").map(|cow| cow.to_string());
+    let name = raw_name
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+    let email = raw_email
+        .as_deref()
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+
+    GitConfigIdentityResolution {
+        raw_name,
+        raw_email,
+        identity: GitAuthorIdentity { name, email },
+    }
+}
+
+fn resolve_git_var_identity_with_args<F>(
+    mut args: Vec<String>,
+    git_var: &str,
+    fallback_identity: F,
+) -> GitIdentityResolution
+where
+    F: FnOnce() -> GitAuthorIdentity,
+{
+    args.push("var".to_string());
+    args.push(git_var.to_string());
+
+    if let Ok(output) = exec_git(&args)
+        && let Ok(stdout) = String::from_utf8(output.stdout)
+    {
+        let identity = parse_git_var_identity(&stdout);
+        if identity.name.is_some() || identity.email.is_some() {
+            return GitIdentityResolution {
+                raw_git_var: Some(stdout.trim().to_string()),
+                identity,
+            };
+        }
+    }
+
+    GitIdentityResolution {
+        raw_git_var: None,
+        identity: fallback_identity(),
     }
 }
 
@@ -1027,43 +1115,6 @@ impl Repository {
             let refname = head_ref.name().map(|n| n.to_string());
             self.pre_command_base_commit = Some(target_string);
             self.pre_command_refname = refname;
-        }
-    }
-
-    pub fn handle_rewrite_log_event(
-        &mut self,
-        rewrite_log_event: RewriteLogEvent,
-        commit_author: String,
-        supress_output: bool,
-        apply_side_effects: bool,
-    ) {
-        let log = self
-            .storage
-            .append_rewrite_event(rewrite_log_event.clone())
-            .expect("Error writing .git/ai/rewrite_log");
-
-        if apply_side_effects
-            && let Err(error) = rewrite_authorship_if_needed(
-                self,
-                &rewrite_log_event,
-                commit_author,
-                &log,
-                supress_output,
-            )
-        {
-            tracing::debug!(
-                "rewrite_authorship_if_needed failed for {:?}: {}",
-                rewrite_log_event,
-                error
-            );
-            crate::observability::log_error(
-                &error,
-                Some(serde_json::json!({
-                    "component": "repository",
-                    "operation": "handle_rewrite_log_event",
-                    "rewrite_event": rewrite_log_event,
-                })),
-            );
         }
     }
 
@@ -1268,7 +1319,7 @@ impl Repository {
             .map(|cfg| cfg.string(key).map(|cow| cow.to_string()))
     }
 
-    /// Get the effective git user identity for this repository.
+    /// Get the effective raw Git user identity for this repository.
     ///
     /// Uses `git var GIT_COMMITTER_IDENT` which respects the full git identity precedence:
     /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars > `user.name`/`user.email` config >
@@ -1277,11 +1328,24 @@ impl Repository {
     /// Falls back to `git config user.name` / `user.email` if `git var` fails.
     /// The result is cached per Repository instance for performance.
     ///
-    /// Use this for "who is the current user" lookups (blame, status, prompts, etc.).
-    /// For commit authorship specifically, use [`Self::git_commit_author_identity`] instead.
+    /// For git-ai authorship metadata, use [`Self::effective_author_identity`] so the
+    /// git-ai author config can override this raw Git identity.
     pub fn git_author_identity(&self) -> &GitAuthorIdentity {
         self.cached_author_identity
             .get_or_init(|| self.resolve_git_var_identity("GIT_COMMITTER_IDENT"))
+    }
+
+    pub fn git_author_identity_resolution(&self) -> GitIdentityResolution {
+        self.resolve_git_var_identity_resolution("GIT_COMMITTER_IDENT")
+    }
+
+    /// Get the git-ai effective author identity for metadata and display.
+    ///
+    /// This starts from Git's effective committer identity, then overlays any
+    /// configured `author.name` and/or `author.email` from git-ai config.
+    pub fn effective_author_identity(&self) -> GitAuthorIdentity {
+        let git_id = self.git_author_identity();
+        git_id.with_author_config(&config::Config::fresh_author_cached())
     }
 
     /// Get the effective git commit author identity for this repository.
@@ -1300,34 +1364,16 @@ impl Repository {
 
     /// Internal: resolve git identity via the specified `git var` variable.
     fn resolve_git_var_identity(&self, git_var: &str) -> GitAuthorIdentity {
-        let mut args = self.global_args_for_exec();
-        args.push("var".to_string());
-        args.push(git_var.to_string());
+        self.resolve_git_var_identity_resolution(git_var).identity
+    }
 
-        if let Ok(output) = exec_git(&args)
-            && let Ok(stdout) = String::from_utf8(output.stdout)
-        {
-            let identity = parse_git_var_identity(&stdout);
-            if identity.name.is_some() || identity.email.is_some() {
-                return identity;
-            }
-        }
-
-        // Fall back to git config user.name / user.email
-        let name = self
-            .config_get_str("user.name")
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
-        let email = self
-            .config_get_str("user.email")
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string());
-
-        GitAuthorIdentity { name, email }
+    fn resolve_git_var_identity_resolution(&self, git_var: &str) -> GitIdentityResolution {
+        resolve_git_var_identity_with_args(self.global_args_for_exec(), git_var, || {
+            self.get_git_config_file()
+                .ok()
+                .map(|config| git_config_identity_resolution_from_config(&config).identity)
+                .unwrap_or_default()
+        })
     }
 
     /// Get all config values matching a regex pattern.
@@ -1594,7 +1640,7 @@ impl Repository {
         const MAX_CONCURRENT: usize = 30;
 
         let repo_global_args = self.global_args_for_exec();
-        let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
 
         let futures: Vec<_> = file_paths
             .iter()
@@ -1606,17 +1652,23 @@ impl Repository {
                 let semaphore = semaphore.clone();
 
                 async move {
-                    let _permit = semaphore.acquire().await;
-                    let result = exec_git(&args).and_then(|output| {
-                        String::from_utf8(output.stdout)
-                            .map_err(|e| GitAiError::Utf8Error(e.utf8_error()))
-                    });
+                    let _permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("staged file semaphore was closed");
+                    let result = crate::tokio_runtime::spawn_blocking_result(move || {
+                        exec_git(&args).and_then(|output| {
+                            String::from_utf8(output.stdout)
+                                .map_err(|e| GitAiError::Utf8Error(e.utf8_error()))
+                        })
+                    })
+                    .await;
                     (file_path, result)
                 }
             })
             .collect();
 
-        let results = smol::block_on(async { join_all(futures).await });
+        let results = crate::tokio_runtime::block_on(async { join_all(futures).await });
 
         let mut staged_files = HashMap::new();
         for (file_path, result) in results {
@@ -2120,7 +2172,7 @@ fn discover_repository_paths_no_git_exec(
     };
 
     if start.file_name().and_then(|name| name.to_str()) == Some(".git") {
-        if start.is_dir() {
+        if is_valid_git_dir(&start) {
             let workdir = start.parent().ok_or_else(|| {
                 GitAiError::Generic(format!(
                     "Git directory has no parent workdir: {}",
@@ -2428,8 +2480,8 @@ fn has_intervening_git_dir(file_path: &Path, workdir: &Path) -> bool {
             break;
         }
         let potential_git = workdir.join(parent).join(".git");
-        if potential_git.is_dir() {
-            // A .git directory always indicates a separate independent repo.
+        if is_valid_git_dir(&potential_git) {
+            // A valid .git directory indicates a separate independent repo.
             return true;
         }
         if potential_git.is_file() {
@@ -2524,10 +2576,15 @@ pub fn find_repository_for_file(
 
         // Check for .git directory or file (file for submodules/worktrees)
         let git_path = dir.join(".git");
-        if git_path.exists() {
+        let git_path_metadata = std::fs::metadata(&git_path).ok();
+        let git_path_is_file = git_path_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file());
+        let git_path_is_dir = git_path_metadata.is_some_and(|metadata| metadata.is_dir());
+        if git_path_is_file || (git_path_is_dir && is_valid_git_dir(&git_path)) {
             // Found a .git - but we need to check if this is a submodule
             // Submodules have a .git file (not directory) that points to the parent's .git/modules
-            if git_path.is_file() {
+            if git_path_is_file {
                 // This is a submodule - read the file to check if it points to modules/
                 if let Ok(content) = std::fs::read_to_string(&git_path)
                     && content.contains("gitdir:")
@@ -2616,12 +2673,54 @@ pub fn exec_git_allow_nonzero_with_profile(
     args: &[String],
     profile: InternalGitProfile,
 ) -> Result<Output, GitAiError> {
+    exec_git_allow_nonzero_with_profile_and_env(args, profile, &[])
+}
+
+pub fn exec_git_allow_nonzero_with_env(
+    args: &[String],
+    envs: &[(&str, &OsStr)],
+) -> Result<Output, GitAiError> {
+    exec_git_allow_nonzero_with_profile_and_env(args, InternalGitProfile::General, envs)
+}
+
+#[cfg(feature = "test-support")]
+fn spawn_probe_log(effective_args: &[String]) {
+    let Ok(path) = std::env::var("GIT_AI_SPAWN_LOG") else {
+        return;
+    };
+    let sub = effective_args
+        .iter()
+        .find(|a| !a.starts_with('-') && !a.contains('=') && !a.contains('/') && !a.contains('\\'))
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", sub);
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+#[inline]
+fn spawn_probe_log(_effective_args: &[String]) {}
+
+fn exec_git_allow_nonzero_with_profile_and_env(
+    args: &[String],
+    profile: InternalGitProfile,
+    envs: &[(&str, &OsStr)],
+) -> Result<Output, GitAiError> {
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    spawn_probe_log(&effective_args);
     let mut cmd = Command::new(config::Config::get().git_cmd());
     cmd.args(&effective_args);
-    cmd.env_remove("GIT_EXTERNAL_DIFF");
-    cmd.env_remove("GIT_DIFF_OPTS");
+    apply_internal_git_env(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
 
     #[cfg(windows)]
     {
@@ -2631,6 +2730,85 @@ pub fn exec_git_allow_nonzero_with_profile(
     }
 
     cmd.output().map_err(GitAiError::IoError)
+}
+
+/// Spawn a git command with stdout piped and stderr inherited.
+///
+/// This is used by streaming consumers that cannot call `exec_git*` without
+/// buffering all stdout in memory.
+pub fn spawn_git_stdout(args: &[String]) -> Result<Child, GitAiError> {
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    apply_internal_git_env(&mut cmd);
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    cmd.spawn().map_err(GitAiError::IoError)
+}
+
+/// Spawn a git command with stdin/stdout/stderr inherited from git-ai.
+///
+/// This is used when a command intentionally delegates rendering and paging
+/// behavior to git instead of consuming output internally.
+pub fn spawn_git_passthrough(args: &[String]) -> Result<Child, GitAiError> {
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    apply_internal_git_env(&mut cmd);
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    cmd.spawn().map_err(GitAiError::IoError)
+}
+
+pub(crate) const INTERNAL_GIT_ENV_REMOVE: &[&str] = &[
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_TRACE",
+    "GIT_TRACE2_BRIEF",
+    "GIT_TRACE2_CONFIG_PARAMS",
+    "GIT_TRACE2_ENV_VARS",
+    "GIT_TRACE2_EVENT_NESTING",
+    "GIT_TRACE2_PARENT_NAME",
+    "GIT_TRACE2_PARENT_SID",
+];
+
+pub(crate) const INTERNAL_GIT_ENV_SET: &[(&str, &str)] = &[
+    ("GIT_TRACE2", "0"),
+    ("GIT_TRACE2_EVENT", "0"),
+    ("GIT_TRACE2_PERF", "0"),
+];
+
+pub(crate) fn apply_internal_git_env(cmd: &mut Command) {
+    for key in INTERNAL_GIT_ENV_REMOVE {
+        cmd.env_remove(key);
+    }
+    for (key, value) in INTERNAL_GIT_ENV_SET {
+        cmd.env(key, value);
+    }
 }
 
 /// Helper to execute a git command with an explicit internal profile.
@@ -2660,6 +2838,175 @@ pub fn exec_git_stdin(args: &[String], stdin_data: &[u8]) -> Result<Output, GitA
     exec_git_stdin_with_profile(args, stdin_data, InternalGitProfile::General)
 }
 
+/// Spawn a fully-piped git child for `effective_args` and start a thread
+/// writing `stdin_data` to it. Writing stdin in a separate thread avoids
+/// deadlock: if we wrote all stdin before reading stdout, the child's stdout
+/// pipe buffer could fill up, causing the child to block on write, which
+/// prevents it from consuming more stdin, which would block our write_all.
+type StdinWriterHandle = std::thread::JoinHandle<std::io::Result<()>>;
+
+fn spawn_git_piped(effective_args: &[String]) -> Result<Child, GitAiError> {
+    spawn_probe_log(effective_args);
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(effective_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    apply_internal_git_env(&mut cmd);
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    cmd.spawn().map_err(GitAiError::IoError)
+}
+
+fn spawn_git_stdin_piped(
+    effective_args: &[String],
+    stdin_data: &[u8],
+) -> Result<(Child, Option<StdinWriterHandle>), GitAiError> {
+    let mut child = spawn_git_piped(effective_args)?;
+    let stdin_handle = child.stdin.take().map(|mut stdin| {
+        let data = stdin_data.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            stdin.write_all(&data)
+        })
+    });
+
+    Ok((child, stdin_handle))
+}
+
+/// Execute a git command while producing its stdin incrementally.
+///
+/// The producer runs on a scoped thread so it may borrow caller-owned data
+/// without copying it. A bounded buffer amortizes writes while stdout and
+/// stderr are drained concurrently by `wait_with_output`.
+pub(crate) fn exec_git_with_stdin_writer(
+    args: &[String],
+    write_stdin: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()> + Send,
+) -> Result<Output, GitAiError> {
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let mut child = spawn_git_piped(&effective_args)?;
+    let stdin = child.stdin.take().expect("git child stdin is piped");
+
+    let (output, stdin_result) = std::thread::scope(|scope| {
+        let stdin_handle = scope.spawn(move || {
+            use std::io::Write;
+
+            let mut stdin = std::io::BufWriter::new(stdin);
+            write_stdin(&mut stdin)?;
+            stdin.flush()
+        });
+        let output = child.wait_with_output();
+        let stdin_result = stdin_handle.join().expect("stdin writer thread panicked");
+        (output, stdin_result)
+    });
+    let output = output.map_err(GitAiError::IoError)?;
+
+    if let Err(e) = stdin_result
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(GitAiError::IoError(e));
+    }
+
+    if !output.status.success() {
+        return Err(GitAiError::GitCliError {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            args: effective_args,
+        });
+    }
+
+    Ok(output)
+}
+
+/// Like `exec_git_stdin`, but streams the child's stdout to `on_line` one line
+/// at a time instead of buffering the entire output in memory. Use this for
+/// commands whose output can be arbitrarily large (e.g. batched
+/// `diff-tree --stdin -p`), where `wait_with_output()` would hold the full
+/// output (plus a lossy-conversion copy) in memory at once.
+///
+/// Each line is lossily UTF-8 converted individually and passed without its
+/// trailing `\n` (and at most one preceding `\r`), matching `str::lines()`.
+pub fn exec_git_stdin_streaming(
+    args: &[String],
+    stdin_data: &[u8],
+    mut on_line: impl FnMut(&str),
+) -> Result<(), GitAiError> {
+    use std::io::BufRead;
+
+    let effective_args = args_with_internal_git_profile(
+        &args_with_disabled_hooks_if_needed(args),
+        InternalGitProfile::General,
+    );
+    let (mut child, stdin_handle) = spawn_git_stdin_piped(&effective_args, stdin_data)?;
+
+    // Drain stderr concurrently so the child can never block on a full stderr
+    // pipe while we are still reading stdout.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::new();
+    let read_result = loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                on_line(&String::from_utf8_lossy(&buf));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    if let Err(e) = read_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(GitAiError::IoError(e));
+    }
+
+    let status = child.wait().map_err(GitAiError::IoError)?;
+
+    if let Some(handle) = stdin_handle
+        && let Err(e) = handle.join().expect("stdin writer thread panicked")
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(GitAiError::IoError(e));
+    }
+
+    if !status.success() {
+        let stderr_bytes = stderr_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        return Err(GitAiError::GitCliError {
+            code: status.code(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+            args: effective_args,
+        });
+    }
+
+    Ok(())
+}
+
 /// Helper to execute a git command with data provided on stdin and an explicit profile.
 pub fn exec_git_stdin_with_profile(
     args: &[String],
@@ -2669,34 +3016,7 @@ pub fn exec_git_stdin_with_profile(
     // TODO Make sure to handle process signals, etc.
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
-    let mut cmd = Command::new(config::Config::get().git_cmd());
-    cmd.args(&effective_args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.env_remove("GIT_EXTERNAL_DIFF");
-    cmd.env_remove("GIT_DIFF_OPTS");
-
-    #[cfg(windows)]
-    {
-        if !is_interactive_terminal() {
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-    }
-
-    let mut child = cmd.spawn().map_err(GitAiError::IoError)?;
-
-    // Write stdin in a separate thread to avoid deadlock: if we write all stdin
-    // before reading stdout, the child's stdout pipe buffer can fill up, causing
-    // the child to block on write, which prevents it from consuming more stdin,
-    // which blocks our write_all. Writing concurrently avoids this.
-    let stdin_handle = child.stdin.take().map(|mut stdin| {
-        let data = stdin_data.to_vec();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            stdin.write_all(&data)
-        })
-    });
+    let (child, stdin_handle) = spawn_git_stdin_piped(&effective_args, stdin_data)?;
 
     let output = child.wait_with_output().map_err(GitAiError::IoError)?;
 
@@ -2718,6 +3038,70 @@ pub fn exec_git_stdin_with_profile(
     }
 
     Ok(output)
+}
+
+pub(crate) fn batch_read_paths_at_treeishes(
+    repo: &Repository,
+    requests: &[(String, String)],
+) -> Result<HashMap<(String, String), String>, GitAiError> {
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "cat-file".to_string(),
+        "--batch-check=%(objectname) %(objecttype)".to_string(),
+    ]);
+
+    let stdin_data = requests
+        .iter()
+        .map(|(treeish, path)| format!("{treeish}:{path}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let output = exec_git_stdin(&args, stdin_data.as_bytes())?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    if lines.len() != requests.len() {
+        return Err(GitAiError::Generic(format!(
+            "git cat-file returned {} records for {} path requests",
+            lines.len(),
+            requests.len()
+        )));
+    }
+
+    let mut request_blob_oids: HashMap<(String, String), String> = HashMap::new();
+    let mut unique_blob_oids = Vec::new();
+    let mut seen_blob_oids = HashSet::new();
+
+    for (request, line) in requests.iter().zip(lines) {
+        let mut parts = line.split_whitespace();
+        let Some(oid) = parts.next() else {
+            continue;
+        };
+        if parts.next() != Some("blob") {
+            continue;
+        }
+        let oid = oid.to_string();
+        request_blob_oids.insert(request.clone(), oid.clone());
+        if seen_blob_oids.insert(oid.clone()) {
+            unique_blob_oids.push(oid);
+        }
+    }
+
+    let blob_contents = crate::git::authorship_traversal::batch_read_blobs_with_oids(
+        &repo.global_args_for_exec(),
+        &unique_blob_oids,
+    )?;
+
+    let mut contents = HashMap::new();
+    for (request, blob_oid) in request_blob_oids {
+        if let Some(content) = blob_contents.get(&blob_oid) {
+            contents.insert(request, content.clone());
+        }
+    }
+    Ok(contents)
 }
 
 /// Parse git version string (e.g., "git version 2.39.3 (Apple Git-146)") to extract major, minor, patch.
@@ -2761,23 +3145,60 @@ pub fn parse_git_version(version_str: &str) -> Option<(u32, u32, u32)> {
 fn parse_diff_added_lines(
     diff_output: &str,
 ) -> Result<(HashMap<String, Vec<u32>>, usize), GitAiError> {
+    let parsed = parse_diff_added_lines_internal(diff_output);
+    Ok((parsed.all_lines, parsed.total_deleted))
+}
+
+struct ParsedDiffAddedLines {
+    all_lines: HashMap<String, Vec<u32>>,
+    insertion_lines: HashMap<String, Vec<u32>>,
+    total_deleted: usize,
+}
+
+struct ActiveDiffHunk {
+    new_line: u32,
+    is_pure_insertion: bool,
+}
+
+fn parse_diff_added_lines_internal(diff_output: &str) -> ParsedDiffAddedLines {
     let mut result: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut insertion_lines: HashMap<String, Vec<u32>> = HashMap::new();
     let mut current_file: Option<String> = None;
+    let mut current_hunk: Option<ActiveDiffHunk> = None;
     let mut total_deleted: usize = 0;
 
     for line in diff_output.lines() {
         if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
             current_file = path_opt;
+            current_hunk = None;
         } else if line.starts_with("@@ ") {
             // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-            if let Some((added_lines, _is_pure_insertion, old_count)) = parse_hunk_header(line) {
+            if let Some((new_start, _new_count, old_count)) = parse_hunk_header_counts(line) {
                 // Count deleted lines for ALL hunks, including those from purely
                 // deleted files (where current_file is None because +++ /dev/null).
                 total_deleted += old_count as usize;
-                // Only record added-line numbers when there is a destination file.
+                current_hunk = Some(ActiveDiffHunk {
+                    new_line: new_start,
+                    is_pure_insertion: old_count == 0,
+                });
+            }
+        } else if let Some(hunk) = current_hunk.as_mut() {
+            if line.starts_with('+') {
                 if let Some(ref file) = current_file {
-                    result.entry(file.clone()).or_default().extend(added_lines);
+                    result.entry(file.clone()).or_default().push(hunk.new_line);
+                    if hunk.is_pure_insertion {
+                        insertion_lines
+                            .entry(file.clone())
+                            .or_default()
+                            .push(hunk.new_line);
+                    }
                 }
+                hunk.new_line += 1;
+            } else if line.starts_with('-') || line.starts_with('\\') {
+                // Removed lines and "\ No newline at end of file" markers do
+                // not advance the new-file line cursor.
+            } else {
+                hunk.new_line += 1;
             }
         }
     }
@@ -2787,8 +3208,16 @@ fn parse_diff_added_lines(
         lines.sort_unstable();
         lines.dedup();
     }
+    for lines in insertion_lines.values_mut() {
+        lines.sort_unstable();
+        lines.dedup();
+    }
 
-    Ok((result, total_deleted))
+    ParsedDiffAddedLines {
+        all_lines: result,
+        insertion_lines,
+        total_deleted,
+    }
 }
 
 /// Parses the unified diff output to extract line numbers of added lines,
@@ -2800,44 +3229,8 @@ fn parse_diff_added_lines(
 pub fn parse_diff_added_lines_with_insertions(
     diff_output: &str,
 ) -> Result<(HashMap<String, Vec<u32>>, HashMap<String, Vec<u32>>), GitAiError> {
-    let mut all_lines: HashMap<String, Vec<u32>> = HashMap::new();
-    let mut insertion_lines: HashMap<String, Vec<u32>> = HashMap::new();
-    let mut current_file: Option<String> = None;
-
-    for line in diff_output.lines() {
-        if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
-            current_file = path_opt;
-        } else if line.starts_with("@@ ") {
-            // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-            if let Some(ref file) = current_file
-                && let Some((added_lines, is_pure_insertion, _old_count)) = parse_hunk_header(line)
-            {
-                all_lines
-                    .entry(file.clone())
-                    .or_default()
-                    .extend(added_lines.clone());
-
-                if is_pure_insertion {
-                    insertion_lines
-                        .entry(file.clone())
-                        .or_default()
-                        .extend(added_lines);
-                }
-            }
-        }
-    }
-
-    // Sort and deduplicate line numbers for each file
-    for lines in all_lines.values_mut() {
-        lines.sort_unstable();
-        lines.dedup();
-    }
-    for lines in insertion_lines.values_mut() {
-        lines.sort_unstable();
-        lines.dedup();
-    }
-
-    Ok((all_lines, insertion_lines))
+    let parsed = parse_diff_added_lines_internal(diff_output);
+    Ok((parsed.all_lines, parsed.insertion_lines))
 }
 
 /// Returns true if any path in the set contains non-ASCII characters.
@@ -2867,17 +3260,7 @@ fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String
     Some(Some(normalize_diff_path_token(raw)))
 }
 
-/// Parse a hunk header line to extract added line numbers and whether it's a pure insertion
-///
-/// Format: @@ -old_start,old_count +new_start,new_count @@
-/// Returns (line numbers that were added, is_pure_insertion)
-/// is_pure_insertion is true when old_count=0, meaning these are new lines, not modifications
-/// Returns `(added_line_numbers, is_pure_insertion, old_count)`.
-///
-/// `old_count` is the number of lines removed in the old file for this hunk
-/// (the value after the comma in `@@ -old_start,old_count …`).  Callers that
-/// only need the added-line numbers can discard it with `_`.
-fn parse_hunk_header(line: &str) -> Option<(Vec<u32>, bool, u32)> {
+fn parse_hunk_header_counts(line: &str) -> Option<(u32, u32, u32)> {
     // Find the part between @@ and @@
     let parts: Vec<&str> = line.split("@@").collect();
     if parts.len() < 2 {
@@ -2921,23 +3304,93 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<u32>, bool, u32)> {
         1 // If no count specified, it's 1 line
     };
 
-    // If count is 0, no lines were added (only deleted)
-    if count == 0 {
-        return Some((Vec::new(), false, old_count));
-    }
-
-    // Generate all line numbers in the range
-    let lines: Vec<u32> = (start..start + count).collect();
-
-    // Pure insertion if old_count is 0 (no lines from old file were modified)
-    let is_pure_insertion = old_count == 0;
-
-    Some((lines, is_pure_insertion, old_count))
+    Some((start, count, old_count))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn explicit_command_env(cmd: &Command, key: &str) -> Option<Option<String>> {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().to_string()))
+    }
+
+    #[test]
+    fn internal_git_env_disables_trace2_targets() {
+        let mut cmd = Command::new("git");
+        for key in INTERNAL_GIT_ENV_REMOVE {
+            cmd.env(key, "inherited");
+        }
+        for (key, _) in INTERNAL_GIT_ENV_SET {
+            cmd.env(key, "inherited");
+        }
+
+        apply_internal_git_env(&mut cmd);
+
+        for key in INTERNAL_GIT_ENV_REMOVE {
+            assert_eq!(explicit_command_env(&cmd, key), Some(None));
+        }
+        for (key, value) in INTERNAL_GIT_ENV_SET {
+            assert_eq!(
+                explicit_command_env(&cmd, key),
+                Some(Some((*value).to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn author_config_overlays_full_identity() {
+        let git_identity = GitAuthorIdentity {
+            name: Some("Git User".to_string()),
+            email: Some("git@example.com".to_string()),
+        };
+        let author = config::AuthorConfig {
+            name: Some("Config User".to_string()),
+            email: Some("config@example.com".to_string()),
+        };
+
+        assert_eq!(
+            git_identity
+                .with_author_config(&author)
+                .formatted()
+                .as_deref(),
+            Some("Config User <config@example.com>")
+        );
+    }
+
+    #[test]
+    fn author_config_supports_partial_overrides() {
+        let git_identity = GitAuthorIdentity {
+            name: Some("Git User".to_string()),
+            email: Some("git@example.com".to_string()),
+        };
+
+        let name_only = config::AuthorConfig {
+            name: Some("Config User".to_string()),
+            email: None,
+        };
+        assert_eq!(
+            git_identity
+                .with_author_config(&name_only)
+                .formatted()
+                .as_deref(),
+            Some("Config User <git@example.com>")
+        );
+
+        let email_only = config::AuthorConfig {
+            name: None,
+            email: Some("config@example.com".to_string()),
+        };
+        assert_eq!(
+            git_identity
+                .with_author_config(&email_only)
+                .formatted()
+                .as_deref(),
+            Some("Git User <config@example.com>")
+        );
+    }
 
     #[test]
     fn test_parse_git_version_standard() {

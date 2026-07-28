@@ -1,9 +1,14 @@
 use crate::test_utils::fixture_path;
+use git_ai::authorship::authorship_log_serialization::generate_session_id;
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::error::GitAiError;
+use git_ai::metrics::attrs::attr_pos;
+use git_ai::metrics::db::MetricsDatabase;
+use git_ai::metrics::types::MetricEventId;
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 fn parse_opencode(hook_input: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
     resolve_preset("opencode")?.parse(hook_input, "t_test")
@@ -16,10 +21,10 @@ fn opencode_sqlite_fixture_path() -> std::path::PathBuf {
 #[test]
 fn test_opencode_raw_event_fidelity() {
     use chrono::{DateTime, Utc};
-    use git_ai::transcripts::agent::Agent;
-    use git_ai::transcripts::agents::OpenCodeAgent;
-    use git_ai::transcripts::watermark::TimestampWatermark;
-    use rusqlite::{Connection, OpenFlags};
+    use git_ai::streams::agent::Agent;
+    use git_ai::streams::agents::OpenCodeAgent;
+    use git_ai::streams::watermark::TimestampWatermark;
+    use rusqlite::OpenFlags;
 
     let opencode_root = opencode_sqlite_fixture_path();
     let fixture = opencode_root.join("opencode.db");
@@ -32,7 +37,11 @@ fn test_opencode_raw_event_fidelity() {
         .unwrap();
 
     // Independently query the SQLite DB to construct the same expected events.
-    let conn = Connection::open_with_flags(&fixture, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let conn = git_ai::sqlite::open_with_flags_and_memory_limits(
+        &fixture,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
 
     let watermark_millis = DateTime::<Utc>::UNIX_EPOCH.timestamp_millis();
 
@@ -207,7 +216,7 @@ fn test_opencode_preset_posttooluse_returns_ai_checkpoint() {
     match &events[0] {
         ParsedHookEvent::PostFileEdit(e) => {
             assert!(
-                e.transcript_source.is_some(),
+                e.stream_source.is_some(),
                 "Transcript should be present for AI checkpoint"
             );
             assert!(
@@ -356,7 +365,12 @@ fn test_opencode_preset_extracts_apply_patch_paths() {
 fn test_opencode_e2e_checkpoint_and_commit() {
     use crate::repos::test_repo::TestRepo;
 
-    let mut repo = TestRepo::new();
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_db_path = metrics_dir.path().join("metrics.db");
+    let mut repo = TestRepo::new_with_daemon_env(&[(
+        "GIT_AI_TEST_METRICS_DB_PATH",
+        metrics_db_path.to_str().unwrap(),
+    )]);
 
     repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
@@ -412,6 +426,34 @@ fn test_opencode_e2e_checkpoint_and_commit() {
     repo.git_ai(&["checkpoint", "opencode", "--hook-input", &post_hook_input])
         .unwrap();
 
+    let session_id = generate_session_id("test-session-123", "opencode");
+    repo.sync_daemon_force();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let emitted_session_event = loop {
+        let metrics = MetricsDatabase::open_at_path(Path::new(&metrics_db_path)).unwrap();
+        let session_events = metrics
+            .get_metric_history(0, None, &[MetricEventId::SessionEvent as u16])
+            .unwrap();
+        if session_events.iter().any(|record| {
+            record
+                .event
+                .attrs
+                .get(&attr_pos::SESSION_ID.to_string())
+                .and_then(|value| value.as_str())
+                == Some(session_id.as_str())
+        }) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        emitted_session_event,
+        "OpenCode post-checkpoint should emit transcript events for its generated session ID"
+    );
+
     unsafe {
         std::env::remove_var("GIT_AI_OPENCODE_STORAGE_PATH");
     }
@@ -444,9 +486,9 @@ fn test_opencode_e2e_checkpoint_and_commit() {
 #[test]
 fn test_opencode_transcript_ids_extracted_from_fixture() {
     use chrono::{DateTime, Utc};
-    use git_ai::transcripts::agent::Agent;
-    use git_ai::transcripts::agents::OpenCodeAgent;
-    use git_ai::transcripts::watermark::TimestampWatermark;
+    use git_ai::streams::agent::Agent;
+    use git_ai::streams::agents::OpenCodeAgent;
+    use git_ai::streams::watermark::TimestampWatermark;
 
     let fixture = fixture_path("opencode-sqlite/opencode.db");
     let agent = OpenCodeAgent::new();
@@ -473,9 +515,9 @@ fn test_opencode_transcript_ids_extracted_from_fixture() {
 #[test]
 fn test_opencode_tool_use_id_matches_hook_and_transcript() {
     use chrono::{DateTime, Utc};
-    use git_ai::transcripts::agent::Agent;
-    use git_ai::transcripts::agents::OpenCodeAgent;
-    use git_ai::transcripts::watermark::TimestampWatermark;
+    use git_ai::streams::agent::Agent;
+    use git_ai::streams::agents::OpenCodeAgent;
+    use git_ai::streams::watermark::TimestampWatermark;
 
     let fixture = fixture_path("opencode-sqlite/opencode.db");
     let agent = OpenCodeAgent::new();
@@ -500,9 +542,9 @@ fn test_opencode_tool_use_id_matches_hook_and_transcript() {
 fn test_opencode_checkpoint_tool_use_id_matches_transcript_callid() {
     use crate::repos::test_repo::TestRepo;
     use chrono::{DateTime, Utc};
-    use git_ai::transcripts::agent::Agent;
-    use git_ai::transcripts::agents::OpenCodeAgent;
-    use git_ai::transcripts::watermark::TimestampWatermark;
+    use git_ai::streams::agent::Agent;
+    use git_ai::streams::agents::OpenCodeAgent;
+    use git_ai::streams::watermark::TimestampWatermark;
 
     let mut repo = TestRepo::new();
     repo.patch_git_ai_config(|patch| {
@@ -620,7 +662,7 @@ fn test_opencode_checkpoint_sets_parent_session_id_from_db() {
     match &events[0] {
         ParsedHookEvent::PostFileEdit(e) => {
             let ts = e
-                .transcript_source
+                .stream_source
                 .as_ref()
                 .expect("should have transcript source");
             assert_eq!(

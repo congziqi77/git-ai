@@ -24,6 +24,10 @@ impl Spinner {
         // Spinner starts automatically when created
     }
 
+    pub fn finish_and_clear(&self) {
+        self.pb.finish_and_clear();
+    }
+
     #[allow(dead_code)]
     pub fn update_message(&self, message: &str) {
         self.pb.set_message(message.to_string());
@@ -31,7 +35,7 @@ impl Spinner {
 
     #[allow(dead_code)]
     pub async fn wait_for(&self, duration_ms: u64) {
-        smol::Timer::after(std::time::Duration::from_millis(duration_ms)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
     }
 
     pub fn success(&self, message: &str) {

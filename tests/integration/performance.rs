@@ -15,13 +15,13 @@ fn setup() {
 
     // Test that we can override feature flags
     let test_flags = FeatureFlags {
-        rewrite_stash: true,
         auth_keyring: false,
-        git_hooks_enabled: false,
-        git_hooks_externally_managed: false,
         transcript_streaming: true,
         transcript_sweep: true,
         checkpoint_debug_log: false,
+        bash_checkpoints_v2: false,
+        daemon_log_upload: true,
+        rewrite_metrics_events: false,
     };
 
     git_ai::config::Config::set_test_feature_flags(test_flags.clone());

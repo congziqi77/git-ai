@@ -78,13 +78,13 @@ macro_rules! define_feature_flags {
 // Define all feature flags in one place
 // Format: struct_field: file_and_env_name, debug = <bool>, release = <bool>
 define_feature_flags!(
-    rewrite_stash: rewrite_stash, debug = true, release = true,
     auth_keyring: auth_keyring, debug = false, release = false,
-    git_hooks_enabled: git_hooks_enabled, debug = false, release = false,
-    git_hooks_externally_managed: git_hooks_externally_managed, debug = false, release = false,
     transcript_streaming: transcript_streaming, debug = true, release = true,
-    transcript_sweep: transcript_sweep, debug = true, release = false,
+    transcript_sweep: transcript_sweep, debug = true, release = true,
     checkpoint_debug_log: checkpoint_debug_log, debug = false, release = false,
+    bash_checkpoints_v2: bash_checkpoints_v2, debug = false, release = false,
+    daemon_log_upload: daemon_log_upload, debug = true, release = true,
+    rewrite_metrics_events: rewrite_metrics_events, debug = true, release = false,
 );
 
 impl FeatureFlags {
@@ -95,7 +95,7 @@ impl FeatureFlags {
 
     /// Build FeatureFlags from environment variables
     /// Reads from GIT_AI_* prefixed environment variables
-    /// Example: GIT_AI_REWRITE_STASH=true, GIT_AI_AUTH_KEYRING=false
+    /// Example: GIT_AI_AUTH_KEYRING=true
     /// Falls back to defaults for any invalid or missing values
     #[allow(dead_code)]
     pub fn from_env() -> Self {
@@ -132,120 +132,145 @@ mod tests {
     #[test]
     fn test_default_feature_flags() {
         let flags = FeatureFlags::default();
-        // Test that defaults are set correctly based on debug/release mode
         #[cfg(debug_assertions)]
         {
-            assert!(flags.rewrite_stash);
             assert!(!flags.auth_keyring);
-            assert!(!flags.git_hooks_enabled);
-            assert!(!flags.git_hooks_externally_managed);
             assert!(flags.transcript_streaming);
             assert!(flags.transcript_sweep);
             assert!(!flags.checkpoint_debug_log);
+            assert!(!flags.bash_checkpoints_v2);
+            assert!(flags.daemon_log_upload);
+            assert!(flags.rewrite_metrics_events);
         }
         #[cfg(not(debug_assertions))]
         {
-            assert!(flags.rewrite_stash);
             assert!(!flags.auth_keyring);
-            assert!(!flags.git_hooks_enabled);
-            assert!(!flags.git_hooks_externally_managed);
             assert!(flags.transcript_streaming);
-            assert!(!flags.transcript_sweep);
+            assert!(flags.transcript_sweep);
             assert!(!flags.checkpoint_debug_log);
+            assert!(!flags.bash_checkpoints_v2);
+            assert!(flags.daemon_log_upload);
+            assert!(!flags.rewrite_metrics_events);
         }
     }
 
     #[test]
     fn test_from_deserializable() {
         let deserializable = DeserializableFeatureFlags {
-            rewrite_stash: Some(false),
             auth_keyring: Some(true),
             ..Default::default()
         };
 
         let flags = FeatureFlags::from_deserializable(deserializable);
-        assert!(!flags.rewrite_stash);
         assert!(flags.auth_keyring);
+    }
+
+    #[test]
+    fn test_rewrite_metrics_events_file_override() {
+        let deserializable = DeserializableFeatureFlags {
+            rewrite_metrics_events: Some(false),
+            ..Default::default()
+        };
+
+        let flags = FeatureFlags::from_deserializable(deserializable);
+        assert!(!flags.rewrite_metrics_events);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_from_env_and_file_defaults_only() {
-        // No file flags, env should be empty
         unsafe {
-            std::env::remove_var("GIT_AI_REWRITE_STASH");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
+            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
         }
 
         let flags = FeatureFlags::from_env_and_file(None);
         let defaults = FeatureFlags::default();
-        assert_eq!(flags.rewrite_stash, defaults.rewrite_stash);
         assert_eq!(flags.auth_keyring, defaults.auth_keyring);
+        assert_eq!(
+            flags.rewrite_metrics_events,
+            defaults.rewrite_metrics_events
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn test_from_env_and_file_file_overrides() {
         unsafe {
-            std::env::remove_var("GIT_AI_REWRITE_STASH");
             std::env::remove_var("GIT_AI_AUTH_KEYRING");
+            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
         }
 
         let file_flags = DeserializableFeatureFlags {
-            rewrite_stash: Some(true),
             auth_keyring: Some(true),
             ..Default::default()
         };
 
         let flags = FeatureFlags::from_env_and_file(Some(file_flags));
-        assert!(flags.rewrite_stash);
         assert!(flags.auth_keyring);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_rewrite_metrics_events_env_overrides_file() {
+        unsafe {
+            std::env::set_var("GIT_AI_REWRITE_METRICS_EVENTS", "true");
+        }
+
+        let file_flags = DeserializableFeatureFlags {
+            rewrite_metrics_events: Some(false),
+            ..Default::default()
+        };
+
+        let flags = FeatureFlags::from_env_and_file(Some(file_flags));
+        assert!(flags.rewrite_metrics_events);
+
+        unsafe {
+            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
+        }
     }
 
     #[test]
     fn test_serialization() {
         let flags = FeatureFlags {
-            rewrite_stash: true,
             auth_keyring: true,
-            git_hooks_enabled: false,
-            git_hooks_externally_managed: false,
             transcript_streaming: true,
             transcript_sweep: true,
             checkpoint_debug_log: false,
+            bash_checkpoints_v2: true,
+            daemon_log_upload: true,
+            rewrite_metrics_events: true,
         };
 
         let serialized = serde_json::to_string(&flags).unwrap();
-        assert!(serialized.contains("rewrite_stash"));
         assert!(serialized.contains("auth_keyring"));
-        assert!(serialized.contains("git_hooks_enabled"));
-        assert!(serialized.contains("git_hooks_externally_managed"));
         assert!(serialized.contains("transcript_streaming"));
         assert!(serialized.contains("transcript_sweep"));
         assert!(serialized.contains("checkpoint_debug_log"));
+        assert!(serialized.contains("bash_checkpoints_v2"));
+        assert!(serialized.contains("daemon_log_upload"));
+        assert!(serialized.contains("rewrite_metrics_events"));
     }
 
     #[test]
     fn test_clone_trait() {
         let flags = FeatureFlags {
-            rewrite_stash: true,
             auth_keyring: true,
-            git_hooks_enabled: true,
-            git_hooks_externally_managed: false,
             transcript_streaming: true,
             transcript_sweep: true,
             checkpoint_debug_log: true,
+            bash_checkpoints_v2: true,
+            daemon_log_upload: true,
+            rewrite_metrics_events: true,
         };
         let cloned = flags.clone();
-        assert_eq!(cloned.rewrite_stash, flags.rewrite_stash);
         assert_eq!(cloned.auth_keyring, flags.auth_keyring);
-        assert_eq!(cloned.git_hooks_enabled, flags.git_hooks_enabled);
-        assert_eq!(
-            cloned.git_hooks_externally_managed,
-            flags.git_hooks_externally_managed
-        );
         assert_eq!(cloned.transcript_streaming, flags.transcript_streaming);
         assert_eq!(cloned.transcript_sweep, flags.transcript_sweep);
         assert_eq!(cloned.checkpoint_debug_log, flags.checkpoint_debug_log);
+        assert_eq!(cloned.bash_checkpoints_v2, flags.bash_checkpoints_v2);
+        assert_eq!(cloned.daemon_log_upload, flags.daemon_log_upload);
+        assert_eq!(cloned.rewrite_metrics_events, flags.rewrite_metrics_events);
     }
 
     #[test]

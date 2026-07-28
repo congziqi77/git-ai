@@ -3,14 +3,20 @@ use crate::authorship::authorship_log::{HumanRecord, PromptRecord, SessionRecord
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::working_log::{CHECKPOINT_API_VERSION, Checkpoint, CheckpointKind};
 use crate::error::GitAiError;
-use crate::git::rewrite_log::{RewriteLogEvent, append_event_to_file};
 use crate::utils::normalize_to_posix;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+pub const MAX_CHECKPOINTS_JSONL_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[cfg(feature = "test-support")]
+const TEST_CHECKPOINTS_JSONL_MAX_BYTES_ENV: &str = "GIT_AI_TEST_CHECKPOINTS_JSONL_MAX_BYTES";
 
 /// Initial attributions data structure stored in the INITIAL file
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,7 +41,6 @@ pub struct RepoStorage {
     pub ai_dir: PathBuf,
     pub repo_workdir: PathBuf,
     pub working_logs: PathBuf,
-    pub rewrite_log: PathBuf,
     pub logs: PathBuf,
 }
 
@@ -53,14 +58,12 @@ impl RepoStorage {
 
     fn for_ai_dir(ai_dir: &Path, repo_workdir: &Path) -> Result<RepoStorage, GitAiError> {
         let working_logs_dir = ai_dir.join("working_logs");
-        let rewrite_log_file = ai_dir.join("rewrite_log");
         let logs_dir = ai_dir.join("logs");
 
         let config = RepoStorage {
             ai_dir: ai_dir.to_path_buf(),
             repo_workdir: repo_workdir.to_path_buf(),
             working_logs: working_logs_dir,
-            rewrite_log: rewrite_log_file,
             logs: logs_dir,
         };
 
@@ -77,10 +80,6 @@ impl RepoStorage {
 
         // Create logs directory for Sentry events
         fs::create_dir_all(&self.logs)?;
-
-        if !&self.rewrite_log.exists() && !&self.rewrite_log.is_file() {
-            fs::write(&self.rewrite_log, "")?;
-        }
 
         Ok(())
     }
@@ -186,39 +185,100 @@ impl RepoStorage {
         }
     }
 
-    /// Rename a working log directory from one commit SHA to another.
-    /// Used when fast-forward pull changes HEAD but preserves working directory state.
-    /// Only renames if old directory exists and new directory doesn't exist.
+    /// Move a working log directory from one commit SHA to another.
+    /// If the destination already has checkpoints, preserve the old-base entries first and
+    /// append the destination entries after them.
     pub fn rename_working_log(&self, old_sha: &str, new_sha: &str) -> Result<(), GitAiError> {
         let old_dir = self.working_logs.join(old_sha);
         let new_dir = self.working_logs.join(new_sha);
-        if old_dir.exists() && !new_dir.exists() {
+        if !old_dir.exists() {
+            return Ok(());
+        }
+        if !new_dir.exists() {
             fs::rename(&old_dir, &new_dir)?;
             tracing::debug!("Renamed working log from {} to {}", old_sha, new_sha);
+        } else {
+            self.merge_working_log_dirs(old_sha, new_sha, &old_dir, &new_dir)?;
+            fs::remove_dir_all(&old_dir)?;
+            tracing::debug!("Merged working log from {} into {}", old_sha, new_sha);
         }
         Ok(())
     }
 
-    /* Rewrite Log Persistance */
-
-    /// Append a rewrite event to the rewrite log file and return the full log
-    pub fn append_rewrite_event(
+    fn merge_working_log_dirs(
         &self,
-        event: RewriteLogEvent,
-    ) -> Result<Vec<RewriteLogEvent>, GitAiError> {
-        append_event_to_file(&self.rewrite_log, event)?;
-        self.read_rewrite_events()
-    }
+        old_sha: &str,
+        new_sha: &str,
+        old_dir: &Path,
+        new_dir: &Path,
+    ) -> Result<(), GitAiError> {
+        copy_dir_contents(&old_dir.join("blobs"), &new_dir.join("blobs"))?;
 
-    /// Read all rewrite events from the rewrite log file
-    pub fn read_rewrite_events(&self) -> Result<Vec<RewriteLogEvent>, GitAiError> {
-        if !self.rewrite_log.exists() {
-            return Ok(Vec::new());
+        let canonical = self
+            .repo_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| self.repo_workdir.clone());
+        let old_log = PersistedWorkingLog::new(
+            old_dir.to_path_buf(),
+            old_sha,
+            self.repo_workdir.clone(),
+            canonical.clone(),
+            None,
+        );
+        let new_log = PersistedWorkingLog::new(
+            new_dir.to_path_buf(),
+            new_sha,
+            self.repo_workdir.clone(),
+            canonical,
+            None,
+        );
+
+        // Preserve OLD-base entries first (per rename_working_log's contract):
+        // start from the old INITIAL and only insert a new-base entry when its
+        // key is absent, so old wins on any shared key. HashMap::extend would do
+        // the opposite (new clobbers old). The checkpoints Vec below is already
+        // old-then-new, so it needs no such guard.
+        let mut merged_initial = old_log.read_initial_attributions();
+        let new_initial = new_log.read_initial_attributions();
+        for (k, v) in new_initial.files {
+            merged_initial.files.entry(k).or_insert(v);
         }
+        for (k, v) in new_initial.prompts {
+            merged_initial.prompts.entry(k).or_insert(v);
+        }
+        for (k, v) in new_initial.file_blobs {
+            merged_initial.file_blobs.entry(k).or_insert(v);
+        }
+        for (k, v) in new_initial.humans {
+            merged_initial.humans.entry(k).or_insert(v);
+        }
+        for (k, v) in new_initial.sessions {
+            merged_initial.sessions.entry(k).or_insert(v);
+        }
+        new_log.write_initial(merged_initial)?;
 
-        let content = fs::read_to_string(&self.rewrite_log)?;
-        crate::git::rewrite_log::deserialize_events_from_jsonl(&content)
+        let mut checkpoints = old_log.read_all_checkpoints()?;
+        checkpoints.extend(new_log.read_all_checkpoints()?);
+        new_log.write_all_checkpoints(&checkpoints)?;
+        Ok(())
     }
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), GitAiError> {
+    if !src.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)?.flatten() {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_contents(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -231,7 +291,7 @@ pub struct PersistedWorkingLog {
     /// On Windows, this uses the \\?\ UNC prefix format
     #[allow(dead_code)]
     pub canonical_workdir: PathBuf,
-    pub dirty_files: Option<HashMap<String, String>>,
+    pub dirty_files: Option<HashMap<String, Arc<str>>>,
     pub initial_file: PathBuf,
 }
 
@@ -241,7 +301,7 @@ impl PersistedWorkingLog {
         base_commit: &str,
         repo_root: PathBuf,
         canonical_workdir: PathBuf,
-        dirty_files: Option<HashMap<String, String>>,
+        dirty_files: Option<HashMap<String, Arc<str>>>,
     ) -> Self {
         let initial_file = dir.join("INITIAL");
         Self {
@@ -254,7 +314,7 @@ impl PersistedWorkingLog {
         }
     }
 
-    pub fn set_dirty_files(&mut self, dirty_files: Option<HashMap<String, String>>) {
+    pub fn set_dirty_files(&mut self, dirty_files: Option<HashMap<String, Arc<str>>>) {
         let normalized_dirty_files = dirty_files.map(|map| {
             map.into_iter()
                 .map(|(file_path, content)| {
@@ -276,7 +336,7 @@ impl PersistedWorkingLog {
         }
 
         // Clear checkpoints by truncating the JSONL file
-        let checkpoints_file = self.dir.join("checkpoints.jsonl");
+        let checkpoints_file = self.checkpoints_file();
         fs::write(&checkpoints_file, "")?;
 
         // Clear INITIAL attributions file so stale attributions from a
@@ -286,6 +346,10 @@ impl PersistedWorkingLog {
         }
 
         Ok(())
+    }
+
+    pub fn checkpoints_file(&self) -> PathBuf {
+        self.dir.join("checkpoints.jsonl")
     }
 
     /* blob storage */
@@ -374,7 +438,7 @@ impl PersistedWorkingLog {
         file_path.to_string()
     }
 
-    pub fn read_current_file_content(&self, file_path: &str) -> Result<String, GitAiError> {
+    pub fn read_current_file_content(&self, file_path: &str) -> Result<Arc<str>, GitAiError> {
         if let Some(ref dirty_files) = self.dirty_files
             && let Some(content) = dirty_files.get(&file_path.to_string())
         {
@@ -408,22 +472,47 @@ impl PersistedWorkingLog {
     }
 
     pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, GitAiError> {
-        let checkpoints_file = self.dir.join("checkpoints.jsonl");
+        self.read_all_checkpoints_with_size_limit(Self::checkpoints_file_size_limit_bytes())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn read_all_checkpoints_with_size_limit_for_test(
+        &self,
+        max_bytes: u64,
+    ) -> Result<Vec<Checkpoint>, GitAiError> {
+        self.read_all_checkpoints_with_size_limit(max_bytes)
+    }
+
+    pub fn ensure_checkpoints_file_size_limit(&self) -> Result<(), GitAiError> {
+        self.truncate_oversized_checkpoints_file(Self::checkpoints_file_size_limit_bytes())?;
+        Ok(())
+    }
+
+    fn read_all_checkpoints_with_size_limit(
+        &self,
+        max_bytes: u64,
+    ) -> Result<Vec<Checkpoint>, GitAiError> {
+        let checkpoints_file = self.checkpoints_file();
 
         if !checkpoints_file.exists() {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&checkpoints_file)?;
+        if self.truncate_oversized_checkpoints_file(max_bytes)? {
+            return Ok(Vec::new());
+        }
+
+        let input = fs::File::open(&checkpoints_file)?;
         let mut checkpoints = Vec::new();
 
         // Parse JSONL file - each line is a separate JSON object
-        for line in content.lines() {
+        for line in BufReader::new(input).lines() {
+            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
 
-            let checkpoint: Checkpoint = serde_json::from_str(line)
+            let checkpoint: Checkpoint = serde_json::from_str(&line)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             if checkpoint.api_version != CHECKPOINT_API_VERSION {
@@ -484,6 +573,63 @@ impl PersistedWorkingLog {
         Ok(migrated_checkpoints)
     }
 
+    fn checkpoints_file_size_limit_bytes() -> u64 {
+        #[cfg(feature = "test-support")]
+        if let Ok(raw) = std::env::var(TEST_CHECKPOINTS_JSONL_MAX_BYTES_ENV)
+            && let Ok(value) = raw.parse::<u64>()
+            && value > 0
+        {
+            return value;
+        }
+
+        MAX_CHECKPOINTS_JSONL_BYTES
+    }
+
+    fn truncate_oversized_checkpoints_file(&self, max_bytes: u64) -> Result<bool, GitAiError> {
+        let checkpoints_file = self.checkpoints_file();
+        let metadata = match fs::metadata(&checkpoints_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let size_bytes = metadata.len();
+        if size_bytes <= max_bytes {
+            return Ok(false);
+        }
+
+        let message = format!(
+            "checkpoints.jsonl exceeded maximum size: {} bytes > {} bytes; deleting and recreating {}",
+            size_bytes,
+            max_bytes,
+            checkpoints_file.display()
+        );
+        tracing::error!(
+            base_commit = %self.base_commit,
+            path = %checkpoints_file.display(),
+            size_bytes,
+            max_bytes,
+            "checkpoints.jsonl exceeded maximum size; deleting and recreating empty file"
+        );
+        crate::observability::log_error(
+            &GitAiError::Generic(message),
+            Some(serde_json::json!({
+                "event": "checkpoints_jsonl_oversized_reset",
+                "base_commit": self.base_commit,
+                "path": checkpoints_file.to_string_lossy(),
+                "size_bytes": size_bytes,
+                "max_bytes": max_bytes,
+            })),
+        );
+
+        match fs::remove_file(&checkpoints_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::File::create(&checkpoints_file)?;
+        Ok(true)
+    }
+
     /// Remove char-level attributions from all but the most recent checkpoint per file.
     /// This reduces storage size while preserving precision for the entries that matter.
     /// Only the most recent checkpoint entry for each file is used when computing new entries.
@@ -517,23 +663,15 @@ impl PersistedWorkingLog {
     /// by post-commit after transcripts have been refetched and need to be preserved
     /// for from_just_working_log() to read them.
     pub fn write_all_checkpoints(&self, checkpoints: &[Checkpoint]) -> Result<(), GitAiError> {
-        let checkpoints_file = self.dir.join("checkpoints.jsonl");
+        let checkpoints_file = self.checkpoints_file();
+        let mut output = BufWriter::new(fs::File::create(&checkpoints_file)?);
 
-        // Serialize all checkpoints to JSONL
-        let mut lines = Vec::new();
         for checkpoint in checkpoints {
-            let json_line = serde_json::to_string(checkpoint)?;
-            lines.push(json_line);
+            serde_json::to_writer(&mut output, checkpoint)?;
+            output.write_all(b"\n")?;
         }
 
-        // Write all lines to file
-        let content = lines.join("\n");
-        if !content.is_empty() {
-            fs::write(&checkpoints_file, format!("{}\n", content))?;
-        } else {
-            fs::write(&checkpoints_file, "")?;
-        }
-
+        output.flush()?;
         Ok(())
     }
 
@@ -558,6 +696,32 @@ impl PersistedWorkingLog {
         Ok(touched_files)
     }
 
+    pub fn observed_file_snapshot(&self) -> Result<HashMap<String, String>, GitAiError> {
+        let initial = self.read_initial_attributions();
+        let mut snapshot = HashMap::new();
+
+        for file_path in initial.files.keys() {
+            let content = self
+                .stored_initial_file_content_from(&initial, file_path)
+                .ok_or_else(|| {
+                    GitAiError::Generic(format!(
+                        "INITIAL missing persisted file snapshot for {}",
+                        file_path
+                    ))
+                })?;
+            snapshot.insert(file_path.clone(), content);
+        }
+
+        for checkpoint in self.read_all_checkpoints()? {
+            for entry in checkpoint.entries {
+                let content = self.get_file_version(&entry.blob_sha)?;
+                snapshot.insert(entry.file, content);
+            }
+        }
+
+        Ok(snapshot)
+    }
+
     #[allow(dead_code)]
     pub fn all_ai_touched_files(&self) -> Result<HashSet<String>, GitAiError> {
         let checkpoints = self.read_all_checkpoints()?;
@@ -580,23 +744,6 @@ impl PersistedWorkingLog {
 
     /* INITIAL attributions file */
 
-    /// Write initial attributions to the INITIAL file.
-    /// This seeds the working log with known attributions from rewrite operations.
-    /// Only writes files that have non-empty attributions.
-    pub fn write_initial_attributions(
-        &self,
-        attributions: HashMap<String, Vec<LineAttribution>>,
-        prompts: HashMap<String, PromptRecord>,
-    ) -> Result<(), GitAiError> {
-        self.write_initial(InitialAttributions {
-            files: attributions,
-            prompts,
-            file_blobs: HashMap::new(),
-            humans: std::collections::BTreeMap::new(),
-            sessions: std::collections::BTreeMap::new(),
-        })
-    }
-
     /// Persist INITIAL attributions plus exact file snapshots for the target working log.
     pub fn write_initial_attributions_with_contents(
         &self,
@@ -612,10 +759,14 @@ impl PersistedWorkingLog {
             .collect();
         let mut file_blobs = HashMap::new();
         for file_path in filtered.keys() {
-            if let Some(content) = file_contents.get(file_path) {
-                let blob_sha = self.persist_file_version(content)?;
-                file_blobs.insert(file_path.clone(), blob_sha);
-            }
+            let content = file_contents.get(file_path).ok_or_else(|| {
+                GitAiError::Generic(format!(
+                    "INITIAL missing file content snapshot for {}",
+                    file_path
+                ))
+            })?;
+            let blob_sha = self.persist_file_version(content)?;
+            file_blobs.insert(file_path.clone(), blob_sha);
         }
 
         self.write_initial(InitialAttributions {
@@ -668,16 +819,10 @@ impl PersistedWorkingLog {
             return Ok(Some(content));
         }
         if initial.files.contains_key(file_path) {
-            // Graceful skip for legacy INITIAL data (pre-March-2026) that lacks file_blobs.
-            // The checkpoint flow sets dirty_files to only the files being checkpointed, but
-            // this function iterates ALL files in INITIAL (including ones not in the current
-            // checkpoint). For those files, read_current_file_content will error since they're
-            // not in dirty_files — returning None is safe because it just means we can't provide
-            // supplementary context for that file's prior state.
-            match self.read_current_file_content(file_path) {
-                Ok(content) => return Ok(Some(content)),
-                Err(_) => return Ok(None),
-            }
+            return Err(GitAiError::Generic(format!(
+                "INITIAL missing persisted file snapshot for {}",
+                file_path
+            )));
         }
         Ok(None)
     }
@@ -735,5 +880,84 @@ impl PersistedWorkingLog {
                 InitialAttributions::default()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn attr(author: &str) -> Vec<LineAttribution> {
+        vec![LineAttribution::new(1, 1, author.to_string(), None)]
+    }
+
+    /// Regression (#9): merge_working_log_dirs (via rename_working_log when the
+    /// destination already exists) must preserve OLD-base INITIAL entries on a
+    /// shared key, per the documented "preserve the old-base entries first".
+    /// The old code used HashMap::extend(new), so `new` clobbered `old` for any
+    /// shared path. Each side's unique entries must also survive.
+    #[test]
+    fn test_merge_working_log_dirs_old_base_wins_on_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let ai_dir = tmp.path().join("ai");
+        let storage = RepoStorage::for_repo_path(&ai_dir, &workdir).unwrap();
+
+        let old_sha = "1111111111111111111111111111111111111111";
+        let new_sha = "2222222222222222222222222222222222222222";
+
+        // OLD base: shared.txt -> old author, plus a unique old-only file.
+        let old_log = storage.working_log_for_base_commit(old_sha).unwrap();
+        let mut old_initial = InitialAttributions::default();
+        old_initial.files.insert("shared.txt".into(), attr("h_OLD"));
+        old_initial
+            .files
+            .insert("old_only.txt".into(), attr("h_OLD"));
+        old_initial
+            .file_blobs
+            .insert("shared.txt".into(), "OLD CONTENT".into());
+        old_log.write_initial(old_initial).unwrap();
+
+        // NEW base: shared.txt -> new author (conflict), plus a unique new-only file.
+        let new_log = storage.working_log_for_base_commit(new_sha).unwrap();
+        let mut new_initial = InitialAttributions::default();
+        new_initial
+            .files
+            .insert("shared.txt".into(), attr("ai_NEW"));
+        new_initial
+            .files
+            .insert("new_only.txt".into(), attr("ai_NEW"));
+        new_initial
+            .file_blobs
+            .insert("shared.txt".into(), "NEW CONTENT".into());
+        new_log.write_initial(new_initial).unwrap();
+
+        // Merge old into new (destination already exists).
+        storage.rename_working_log(old_sha, new_sha).unwrap();
+
+        let merged = storage
+            .working_log_for_base_commit(new_sha)
+            .unwrap()
+            .read_initial_attributions();
+
+        // Shared key: OLD base wins.
+        assert_eq!(
+            merged
+                .files
+                .get("shared.txt")
+                .map(|a| a[0].author_id.as_str()),
+            Some("h_OLD"),
+            "old-base attribution must win on a shared path"
+        );
+        assert_eq!(
+            merged.file_blobs.get("shared.txt").map(|s| s.as_str()),
+            Some("OLD CONTENT"),
+            "old-base blob must win on a shared path (kept consistent with files)"
+        );
+        // Both sides' unique entries survive.
+        assert!(merged.files.contains_key("old_only.txt"));
+        assert!(merged.files.contains_key("new_only.txt"));
     }
 }

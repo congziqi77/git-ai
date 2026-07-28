@@ -1,7 +1,7 @@
 use crate::auth::{CredentialStore, OAuthClient};
 use crate::config;
 use crate::error::GitAiError;
-use crate::git::repository::{exec_git, parse_git_var_identity};
+use crate::git::repository::{current_git_committer_identity_resolution, parse_git_var_identity};
 use crate::http;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -61,22 +61,25 @@ fn try_load_auth_token() -> Option<String> {
     // Mutex guard is automatically released when _guard is dropped
 }
 
-/// Resolve the git author identity without requiring a Repository instance.
+/// Resolve the git-ai effective author identity without requiring a Repository instance.
 ///
-/// Runs `git var GIT_COMMITTER_IDENT` to get the current user's identity,
-/// respecting the full git precedence chain (env vars > config > system defaults).
+/// Uses the shared git identity helper to get the current user's identity,
+/// respecting the full git precedence chain (env vars > config > system defaults),
+/// then overlays any configured git-ai author fields.
 /// Falls back to the system hostname if git identity is unavailable.
 fn resolve_git_identity() -> Option<String> {
-    let args = vec!["var".to_string(), "GIT_COMMITTER_IDENT".to_string()];
-    if let Ok(output) = exec_git(&args)
-        && let Ok(stdout) = String::from_utf8(output.stdout)
-    {
-        let identity = parse_git_var_identity(&stdout);
-        if let Some(formatted) = identity.formatted() {
-            return Some(encode_for_header(&formatted));
-        }
+    let author_config = config::Config::fresh_author_cached();
+    let identity = current_git_committer_identity_resolution()
+        .identity
+        .with_author_config(&author_config);
+    if let Some(formatted) = identity.formatted() {
+        return Some(encode_for_header(&formatted));
     }
-    resolve_fallback_identity().map(|id| encode_for_header(&id))
+
+    resolve_fallback_identity()
+        .map(|id| parse_git_var_identity(&id).with_author_config(&author_config))
+        .and_then(|identity| identity.formatted())
+        .map(|id| encode_for_header(&id))
 }
 
 /// Build a fallback identity matching git's format: `"Username <username@hostname>"`.
@@ -185,30 +188,39 @@ impl ApiContext {
     /// Create a GET request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP GET requests to ensure consistent headers.
     /// The returned (Agent, Request) pair uses the system's native certificate store.
-    pub fn http_get(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+    pub fn http_get(
+        url: &str,
+        timeout_secs: Option<u64>,
+    ) -> (
+        ureq::Agent,
+        ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    ) {
         let agent = http::build_agent(timeout_secs);
         let request = agent
             .get(url)
-            .set(
+            .header(
                 "User-Agent",
                 &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+            .header("X-Distinct-ID", &config::get_or_create_distinct_id());
         (agent, request)
     }
 
     /// Create a POST request with common headers (User-Agent, X-Distinct-ID)
     /// Use this for all HTTP POST requests to ensure consistent headers.
     /// The returned (Agent, Request) pair uses the system's native certificate store.
-    pub fn http_post(url: &str, timeout_secs: Option<u64>) -> (ureq::Agent, ureq::Request) {
+    pub fn http_post(
+        url: &str,
+        timeout_secs: Option<u64>,
+    ) -> (ureq::Agent, ureq::RequestBuilder<ureq::typestate::WithBody>) {
         let agent = http::build_agent(timeout_secs);
         let request = agent
             .post(url)
-            .set(
+            .header(
                 "User-Agent",
                 &format!("git-ai/{}", env!("CARGO_PKG_VERSION")),
             )
-            .set("X-Distinct-ID", &config::get_or_create_distinct_id());
+            .header("X-Distinct-ID", &config::get_or_create_distinct_id());
         (agent, request)
     }
 
@@ -310,16 +322,16 @@ impl ApiContext {
         let body_json = serde_json::to_string(body).map_err(GitAiError::JsonError)?;
 
         let (_agent, mut request) = Self::http_post(&url, self.timeout_secs);
-        request = request.set("Content-Type", "application/json");
+        request = request.header("Content-Type", "application/json");
 
         if let Some(api_key) = &self.api_key {
-            request = request.set("X-API-Key", api_key);
+            request = request.header("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.set("X-Author-Identity", identity);
+                request = request.header("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.set("Authorization", &format!("Bearer {}", token));
+            request = request.header("Authorization", &format!("Bearer {}", token));
         }
 
         http::send_with_body(request, &body_json)
@@ -333,13 +345,13 @@ impl ApiContext {
         let (_agent, mut request) = Self::http_get(&url, self.timeout_secs);
 
         if let Some(api_key) = &self.api_key {
-            request = request.set("X-API-Key", api_key);
+            request = request.header("X-API-Key", api_key);
             if let Some(identity) = &self.author_identity {
-                request = request.set("X-Author-Identity", identity);
+                request = request.header("X-Author-Identity", identity);
             }
         }
         if let Some(token) = &self.auth_token {
-            request = request.set("Authorization", &format!("Bearer {}", token));
+            request = request.header("Authorization", &format!("Bearer {}", token));
         }
 
         http::send(request).map_err(|e| GitAiError::Generic(format!("HTTP request failed: {}", e)))

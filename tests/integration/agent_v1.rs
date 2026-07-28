@@ -83,7 +83,7 @@ fn test_agent_v1_ai_agent_checkpoint_with_dirty_files() {
                 "console.log('hello');"
             );
             // Inline transcripts removed - should now be None
-            assert!(e.transcript_source.is_none());
+            assert!(e.stream_source.is_none());
         }
         _ => panic!("Expected PostFileEdit for ai_agent checkpoint"),
     }
@@ -241,9 +241,6 @@ fn test_agent_v1_dirty_files_relative_paths_resolved_to_absolute() {
     }
 }
 
-/// Regression test: JetBrains plugin sends relative paths in dirty_files via agent-v1.
-/// Without resolving to absolute, the dirty_files content override silently fails and
-/// AI attribution is lost because the checkpoint reads stale disk content instead.
 #[test]
 fn test_agent_v1_relative_dirty_files_e2e_attribution() {
     let repo = TestRepo::new();
@@ -254,10 +251,8 @@ fn test_agent_v1_relative_dirty_files_e2e_attribution() {
     let mut file = repo.filename("test.txt");
     file.assert_committed_lines(crate::lines!["original line".unattributed_human(),]);
 
-    // Simulate JetBrains plugin flow: sends relative paths in dirty_files
     let repo_dir = repo.path().to_string_lossy().to_string();
 
-    // 1. Pre-edit (human) checkpoint with relative path + dirty_files
     let pre_edit_content = "original line\n";
     let human_payload = json!({
         "type": "human",
@@ -271,11 +266,9 @@ fn test_agent_v1_relative_dirty_files_e2e_attribution() {
     repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &human_payload])
         .unwrap();
 
-    // 2. AI edits the file
     let post_edit_content = "original line\nAI added line\n";
     fs::write(&file_path, post_edit_content).unwrap();
 
-    // 3. Post-edit (ai_agent) checkpoint with relative path + dirty_files
     let ai_payload = json!({
         "type": "ai_agent",
         "repo_working_dir": repo_dir,
@@ -291,10 +284,56 @@ fn test_agent_v1_relative_dirty_files_e2e_attribution() {
     repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &ai_payload])
         .unwrap();
 
-    // 4. Commit and verify attribution
     repo.stage_all_and_commit("AI edit").unwrap();
     file.assert_committed_lines(crate::lines![
         "original line".unattributed_human(),
         "AI added line".ai(),
+    ]);
+}
+
+#[test]
+fn test_agent_v1_shell_command_e2e_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("script-output.txt");
+
+    fs::write(&file_path, "base line\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("script-output.txt");
+    file.assert_committed_lines(crate::lines!["base line".unattributed_human(),]);
+
+    let repo_dir = repo.canonical_path().to_string_lossy().to_string();
+
+    let pre_payload = json!({
+        "type": "pre_shell_command",
+        "repo_working_dir": repo_dir,
+        "agent_name": "agent-v1-test",
+        "model": "test-model",
+        "conversation_id": "shell-session-123",
+        "tool_use_id": "shell-tool-1",
+        "command": "printf 'created by shell\\n' >> script-output.txt"
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &pre_payload])
+        .unwrap();
+
+    fs::write(&file_path, "base line\ncreated by shell\n").unwrap();
+
+    let post_payload = json!({
+        "type": "post_shell_command",
+        "repo_working_dir": repo_dir,
+        "agent_name": "agent-v1-test",
+        "model": "test-model",
+        "conversation_id": "shell-session-123",
+        "tool_use_id": "shell-tool-1",
+        "command": "printf 'created by shell\\n' >> script-output.txt"
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &post_payload])
+        .unwrap();
+
+    repo.stage_all_and_commit("Agent v1 shell edit").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "base line".unattributed_human(),
+        "created by shell".ai(),
     ]);
 }

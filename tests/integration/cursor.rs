@@ -3,9 +3,9 @@ use crate::repos::test_repo::{TestRepo, real_git_executable};
 use crate::test_utils::fixture_path;
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::error::GitAiError;
-use git_ai::transcripts::agent::Agent;
-use git_ai::transcripts::agents::CursorAgent;
-use git_ai::transcripts::watermark::ByteOffsetWatermark;
+use git_ai::streams::agent::Agent;
+use git_ai::streams::agents::CursorAgent;
+use git_ai::streams::watermark::ByteOffsetWatermark;
 use std::path::PathBuf;
 
 const TEST_CONVERSATION_ID: &str = "de751938-f32b-4441-8239-a31d60aa4cf0";
@@ -243,6 +243,61 @@ fn test_cursor_checkpoint_stdin_with_utf8_bom() {
         !output.contains("Invalid JSON in hook_input"),
         "Should not fail JSON parsing when stdin has UTF-8 BOM. Output: {output}"
     );
+}
+
+fn utf16le_bytes(input: &str) -> Vec<u8> {
+    input
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn test_cursor_checkpoint_stdin_with_utf16le_odd_cjk_content() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    let src_dir = repo.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let file_path = repo.path().join("src/文案文.js");
+    fs::write(&file_path, "const a = \"base\";\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let mut file = repo.filename("src/文案文.js");
+    file.assert_committed_lines(crate::lines!["const a = \"base\";".unattributed_human(),]);
+
+    let edited_content = "const a = \"文案文\"; // 3 chars\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    let hook_input = serde_json::json!({
+        "conversation_id": TEST_CONVERSATION_ID,
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "postToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": file_path.to_string_lossy().to_string(),
+            "content": edited_content,
+        },
+        "model": "model-name-from-hook-test"
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai_with_stdin(
+            &["checkpoint", "cursor", "--hook-input", "stdin"],
+            &utf16le_bytes(&hook_input),
+        )
+        .expect("checkpoint should parse UTF-16LE stdin payload with odd CJK content");
+
+    assert!(
+        !output.contains("Invalid JSON in hook_input"),
+        "Should not fail JSON parsing for odd CJK content in UTF-16LE stdin. Output: {output}"
+    );
+
+    repo.stage_all_and_commit("Add cursor CJK edit").unwrap();
+
+    file.assert_lines_and_blame(crate::lines!["const a = \"文案文\"; // 3 chars".ai(),]);
 }
 
 #[test]

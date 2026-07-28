@@ -5,7 +5,7 @@ use crate::authorship::authorship_log_serialization::generate_session_id;
 #[cfg(not(any(test, feature = "test-support")))]
 use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::imara_diff_utils::{
-    LineChangeTag, compute_line_changes, normalize_line_endings,
+    LineChangeTag, compute_line_changes, content_eq_ignoring_line_endings,
 };
 use crate::authorship::working_log::CheckpointKind;
 use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
@@ -48,7 +48,7 @@ const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
 const KNOWN_HUMAN_MIN_SECS_AFTER_AI: u64 = 1;
 
 #[cfg(not(any(test, feature = "test-support")))]
-pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(agent_id: &AgentId) -> bool {
     let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -68,8 +68,19 @@ pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(_agent_id: &AgentId) -> bool {
     false
+}
+
+fn should_emit_agent_usage_with_throttle(
+    agent_id: &AgentId,
+    should_emit_real_agent_usage: impl FnOnce(&AgentId) -> bool,
+) -> bool {
+    agent_id.tool != "mock_ai" && should_emit_real_agent_usage(agent_id)
+}
+
+pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+    should_emit_agent_usage_with_throttle(agent_id, should_emit_real_agent_usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +95,7 @@ pub struct ResolvedCheckpointExecution {
     pub base_commit: String,
     pub ts: u128,
     pub files: Vec<String>,
-    pub dirty_files: HashMap<String, String>,
+    pub dirty_files: HashMap<String, Arc<str>>,
 }
 
 /// Build EventAttributes for AgentUsage events.
@@ -188,14 +199,21 @@ fn execute_resolved_checkpoint(
     kind: CheckpointKind,
     quiet: bool,
     checkpoint_request: CheckpointRequest,
-    resolved: ResolvedCheckpointExecution,
+    mut resolved: ResolvedCheckpointExecution,
     checkpoint_start: Instant,
 ) -> Result<(usize, usize, usize), GitAiError> {
+    if kind.is_ai() && checkpoint_request.agent_id.is_none() {
+        return Err(GitAiError::Generic(
+            "AI checkpoint is missing agent_id".to_string(),
+        ));
+    }
+
     let mut working_log = repo
         .storage
         .working_log_for_base_commit(&resolved.base_commit)?;
+
     if !resolved.dirty_files.is_empty() {
-        working_log.set_dirty_files(Some(resolved.dirty_files.clone()));
+        working_log.set_dirty_files(Some(std::mem::take(&mut resolved.dirty_files)));
     }
 
     let read_checkpoints_start = Instant::now();
@@ -257,7 +275,7 @@ fn execute_resolved_checkpoint(
     let trace_id = checkpoint_request.trace_id.clone();
 
     let entries_start = Instant::now();
-    let (entries, file_stats) = smol::block_on(get_checkpoint_entries(
+    let (entries, file_stats) = crate::tokio_runtime::block_on(get_checkpoint_entries(
         kind,
         author,
         repo,
@@ -432,21 +450,24 @@ fn save_current_file_states(
 
     let blobs_dir = working_log.dir.join("blobs");
     let dirty_files = working_log.dirty_files.clone();
+    let files = files.to_vec();
 
-    let file_content_hashes = smol::block_on(async {
-        let semaphore = Arc::new(smol::lock::Semaphore::new(8));
+    let file_content_hashes = crate::tokio_runtime::block_on(async {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
         let blobs_dir = Arc::new(blobs_dir);
         let dirty_files = Arc::new(dirty_files);
 
-        let futures = files.iter().map(|file_path| {
-            let file_path = file_path.clone();
+        let mut futures = Vec::with_capacity(files.len());
+        for file_path in files {
             let blobs_dir = Arc::clone(&blobs_dir);
             let dirty_files = Arc::clone(&dirty_files);
             let semaphore = Arc::clone(&semaphore);
 
-            async move {
-                // Acquire semaphore permit
-                let _permit = semaphore.acquire().await;
+            futures.push(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("file state semaphore was closed");
 
                 // Read file content - check dirty_files first, then filesystem
                 let content = if let Some(ref dirty_map) = *dirty_files {
@@ -461,21 +482,24 @@ fn save_current_file_states(
                     ))
                 })?;
 
-                // Create SHA256 hash of the content
-                let mut hasher = Sha256::new();
-                hasher.update(content.as_bytes());
-                let sha = format!("{:x}", hasher.finalize());
+                crate::tokio_runtime::spawn_blocking_result(move || {
+                    // Create SHA256 hash of the content
+                    let mut hasher = Sha256::new();
+                    hasher.update(content.as_bytes());
+                    let sha = format!("{:x}", hasher.finalize());
 
-                // Ensure blobs directory exists
-                std::fs::create_dir_all(&*blobs_dir)?;
+                    // Ensure blobs directory exists
+                    std::fs::create_dir_all(&*blobs_dir)?;
 
-                // Write content to blob file
-                let blob_path = blobs_dir.join(&sha);
-                std::fs::write(blob_path, content)?;
+                    // Write content to blob file
+                    let blob_path = blobs_dir.join(&sha);
+                    std::fs::write(blob_path, content.as_bytes())?;
 
-                Ok::<(String, String), GitAiError>((file_path, sha))
-            }
-        });
+                    Ok::<(String, String), GitAiError>((file_path, sha))
+                })
+                .await
+            });
+        }
 
         // Collect results from all concurrent operations
         let results: Vec<Result<(String, String), GitAiError>> =
@@ -498,22 +522,17 @@ fn get_previous_content_from_head(
     repo: &Repository,
     file_path: &str,
     head_tree_id: &Option<String>,
-) -> String {
+) -> Arc<str> {
     let Some(tree_id) = head_tree_id.as_ref() else {
-        return String::new();
+        return Arc::from("");
     };
     match repo.read_file_blob_at_tree(tree_id, std::path::Path::new(file_path)) {
-        Ok(content) => String::from_utf8_lossy(&content).to_string(),
-        Err(_) => String::new(),
+        Ok(content) => {
+            let text = String::from_utf8_lossy(&content);
+            Arc::from(text.into_owned())
+        }
+        Err(_) => Arc::from(""),
     }
-}
-
-/// Compare file contents ignoring CRLF/LF differences.
-fn content_eq_normalized(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    normalize_line_endings(a) == normalize_line_endings(b)
 }
 
 #[doc(hidden)]
@@ -571,7 +590,8 @@ fn get_checkpoint_entry_for_file(
     author_id: Arc<String>,
     head_tree_id: Arc<Option<String>>,
     initial_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
-    initial_snapshot_contents: Arc<HashMap<String, String>>,
+    initial_snapshot_contents: Arc<HashMap<String, Arc<str>>>,
+    parent_note_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     ts: u128,
 ) -> Result<Option<(WorkingLogEntry, FileLineStats)>, GitAiError> {
     let file_start = Instant::now();
@@ -586,7 +606,7 @@ fn get_checkpoint_entry_for_file(
 
     let current_content = working_log
         .read_current_file_content(&file_path)
-        .unwrap_or_default();
+        .unwrap_or_else(|_| Arc::<str>::from(""));
 
     // Non-pre-commit fast path:
     // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
@@ -595,14 +615,16 @@ fn get_checkpoint_entry_for_file(
     // that later AI checkpoints can use to identify human-written lines.
     if kind == CheckpointKind::Human && !has_prior_ai_edits && initial_attrs_for_file.is_empty() {
         let previous_content = if let Some(state) = previous_state.as_ref() {
-            working_log
-                .get_file_version(&state.blob_sha)
-                .unwrap_or_default()
+            Arc::<str>::from(
+                working_log
+                    .get_file_version(&state.blob_sha)
+                    .unwrap_or_default(),
+            )
         } else {
             get_previous_content_from_head(&repo, &file_path, head_tree_id.as_ref())
         };
 
-        if content_eq_normalized(&current_content, &previous_content) {
+        if content_eq_ignoring_line_endings(&current_content, &previous_content) {
             return Ok(None);
         }
 
@@ -613,16 +635,17 @@ fn get_checkpoint_entry_for_file(
 
     let from_checkpoint = previous_state.as_ref().map(|state| {
         (
-            working_log
-                .get_file_version(&state.blob_sha)
-                .unwrap_or_default(),
+            Arc::<str>::from(
+                working_log
+                    .get_file_version(&state.blob_sha)
+                    .unwrap_or_default(),
+            ),
             state.attributions.clone(),
         )
     });
 
     let is_from_checkpoint = from_checkpoint.is_some();
     let (previous_content, prev_attributions) = if let Some((content, attrs)) = from_checkpoint {
-        // File exists in a previous checkpoint - use that
         (content, attrs)
     } else {
         // File doesn't exist in any previous checkpoint - need to initialize from git + INITIAL
@@ -631,7 +654,7 @@ fn get_checkpoint_entry_for_file(
 
         // Skip if no changes, UNLESS we have INITIAL attributions for this file
         // (in which case we need to create an entry to record those attributions)
-        if content_eq_normalized(&current_content, &previous_content)
+        if content_eq_ignoring_line_endings(&current_content, &previous_content)
             && initial_attrs_for_file.is_empty()
         {
             return Ok(None);
@@ -645,12 +668,32 @@ fn get_checkpoint_entry_for_file(
             }
         }
 
-        // Start with INITIAL attributions (they win)
+        // Start with INITIAL attributions (they win), augmented by parent note
         let mut prev_line_attributions = initial_attrs_for_file.clone();
+
+        // Parent note seeding removed — handled at post-commit via inheritance.
+        let _ = &parent_note_attributions;
+
         let mut blamed_lines: HashSet<u32> = HashSet::new();
 
-        // Default all previous-content lines to "human" (no cross-commit blame)
-        let prev_total_lines = previous_content.lines().count() as u32;
+        // Default all previous-content lines to "human" (no cross-commit blame).
+        // When INITIAL has a snapshot that DIFFERS from current content, use its
+        // line count (that's what the diff will compare against). When the snapshot
+        // matches current content (no edits after INITIAL), use the HEAD content
+        // line count so the AI fallback can fire for uncovered lines.
+        let effective_prev_content = if !initial_attrs_for_file.is_empty() {
+            let snapshot = initial_snapshot_content
+                .as_deref()
+                .unwrap_or(&previous_content);
+            if content_eq_ignoring_line_endings(snapshot, &current_content) {
+                &previous_content
+            } else {
+                snapshot
+            }
+        } else {
+            &previous_content
+        };
+        let prev_total_lines = effective_prev_content.lines().count() as u32;
         for line_num in 1..=prev_total_lines {
             blamed_lines.insert(line_num);
         }
@@ -703,7 +746,7 @@ fn get_checkpoint_entry_for_file(
 
     // Skip if no changes (but we already checked this earlier, accounting for INITIAL attributions)
     // For files from previous checkpoints, check if content has changed
-    if is_from_checkpoint && content_eq_normalized(&current_content, &previous_content) {
+    if is_from_checkpoint && content_eq_ignoring_line_endings(&current_content, &previous_content) {
         if current_content == previous_content {
             // Byte-identical — truly no change.
             return Ok(None);
@@ -744,6 +787,7 @@ fn get_checkpoint_entry_for_file(
         content: &current_content,
         ts,
     })?;
+
     tracing::debug!(
         "[BENCHMARK] Processing file {} took {:?}",
         file_path,
@@ -771,13 +815,13 @@ async fn get_checkpoint_entries(
     // Read INITIAL attributions from working log (empty if file doesn't exist)
     let initial_read_start = Instant::now();
     let initial_data = working_log.read_initial_attributions();
-    let initial_snapshot_contents: HashMap<String, String> = {
+    let initial_snapshot_contents: HashMap<String, Arc<str>> = {
         let mut map = HashMap::new();
         for file_path in initial_data.files.keys() {
             if let Some(content) =
                 working_log.initial_file_content_from(&initial_data, file_path)?
             {
-                map.insert(file_path.clone(), content);
+                map.insert(file_path.clone(), Arc::<str>::from(content));
             }
         }
         map
@@ -831,10 +875,12 @@ async fn get_checkpoint_entries(
         .and_then(|c| c.tree().ok())
         .map(|t| t.id().to_string());
 
+    let parent_note_attributions: HashMap<String, Vec<LineAttribution>> = HashMap::new();
+
     const MAX_CONCURRENT: usize = 30;
 
     // Create a semaphore to limit concurrent tasks
-    let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
 
     // Move other repeated allocations outside the loop
     let previous_file_state_by_file = Arc::new(previous_file_state_by_file);
@@ -843,6 +889,7 @@ async fn get_checkpoint_entries(
     let head_tree_id = Arc::new(head_tree_id);
     let initial_attributions = Arc::new(initial_attributions);
     let initial_snapshot_contents = Arc::new(initial_snapshot_contents);
+    let parent_note_attributions = Arc::new(parent_note_attributions);
 
     // Spawn tasks for each file
     let spawn_start = Instant::now();
@@ -862,14 +909,16 @@ async fn get_checkpoint_entries(
             .unwrap_or_default();
         let initial_attributions = Arc::clone(&initial_attributions);
         let initial_snapshot_contents = Arc::clone(&initial_snapshot_contents);
+        let parent_note_attributions = Arc::clone(&parent_note_attributions);
         let semaphore = Arc::clone(&semaphore);
 
-        let task = smol::spawn(async move {
-            // Acquire semaphore permit to limit concurrency
-            let _permit = semaphore.acquire().await;
+        let task = async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("checkpoint entry semaphore was closed");
 
-            // Wrap all the blocking git operations in smol::unblock
-            smol::unblock(move || {
+            crate::tokio_runtime::spawn_blocking_result(move || {
                 get_checkpoint_entry_for_file(
                     file_path,
                     kind,
@@ -882,11 +931,12 @@ async fn get_checkpoint_entries(
                     head_tree_id.clone(),
                     initial_attributions.clone(),
                     initial_snapshot_contents.clone(),
+                    parent_note_attributions.clone(),
                     ts,
                 )
             })
             .await
-        });
+        };
 
         tasks.push(task);
     }
@@ -1073,4 +1123,25 @@ fn compute_line_stats(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_ai_skips_agent_usage_throttle() {
+        let mut agent_id = AgentId {
+            tool: "mock_ai".to_string(),
+            id: "debug-self-check".to_string(),
+            model: "unknown".to_string(),
+        };
+
+        assert!(!should_emit_agent_usage_with_throttle(&agent_id, |_| {
+            panic!("mock checkpoints must not evaluate the real throttle")
+        }));
+
+        agent_id.tool = "claude".to_string();
+        assert!(should_emit_agent_usage_with_throttle(&agent_id, |_| true));
+    }
 }

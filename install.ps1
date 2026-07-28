@@ -350,6 +350,70 @@ if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
     $downloadUrlNoExt = "https://github.com/$Repo/releases/latest/download/$binaryName"
 }
 
+# ============================================================
+# Warn when installing as Administrator (not recommended).
+# Running elevated creates files that normal-user processes
+# cannot access, causing persistent daemon lock failures.
+# ============================================================
+$isElevated = $false
+try {
+    # Detect explicit UAC elevation ("Run as Administrator") via TokenElevationType.
+    # Type 1 (Default) = no split token (UAC disabled or built-in Admin) -> no warn
+    # Type 2 (Full)    = elevated half of a split token -> WARN (this is the danger case)
+    # Type 3 (Limited) = non-elevated half of a split token -> no warn
+    # We only warn on type 2: user explicitly elevated, so files will be admin-owned
+    # but normal processes won't be, causing the daemon.lock mismatch from issue #1287.
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class GitAiElevation {
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool GetTokenInformation(IntPtr token, int cls, ref int info, int len, out int ret);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr h);
+    public static bool IsElevated() {
+        IntPtr tok;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out tok)) return false;
+        try {
+            int elevType = 0; int sz;
+            // TokenElevationType = class 18; returns 1/2/3
+            if (!GetTokenInformation(tok, 18, ref elevType, 4, out sz)) return false;
+            return elevType == 2; // TokenElevationTypeFull
+        } finally { CloseHandle(tok); }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+    $isElevated = [GitAiElevation]::IsElevated()
+} catch { }
+
+if ($isElevated -and $env:GIT_AI_ALLOW_SUPERUSER -ne '1') {
+    # Auto-allow in CI environments and daemon-triggered self-updates
+    $isCi = $env:CI -or $env:GITHUB_ACTIONS -or $env:GITLAB_CI -or $env:JENKINS_URL `
+        -or $env:BUILDKITE -or $env:CIRCLECI -or $env:CODEBUILD_BUILD_ID `
+        -or $env:AGENT_OS -or $env:KUBERNETES_SERVICE_HOST `
+        -or $env:GIT_AI_DAEMON_UPGRADE -or $env:container
+
+    if (-not $isCi) {
+        Write-Host ''
+        Write-Host 'Warning: installing git-ai as Administrator is not recommended.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Running with elevated privileges creates files owned by Administrator that'
+        Write-Host 'become inaccessible to your normal user account, causing persistent daemon'
+        Write-Host 'lock failures. A future version may refuse to install in this configuration.'
+        Write-Host ''
+        Write-Host 'To suppress this warning, either:'
+        Write-Host '  - Run this installer from a normal (non-elevated) PowerShell window (recommended), or'
+        Write-Host '  - Set $env:GIT_AI_ALLOW_SUPERUSER = "1"' -ForegroundColor Yellow
+        Write-Host ''
+    }
+    # Propagate to child git-ai invocations (install-hooks, exchange-nonce, login)
+    $env:GIT_AI_ALLOW_SUPERUSER = '1'
+}
+
 # Install directory: %USERPROFILE%\.git-ai\bin
 $installDir = Join-Path $HOME ".git-ai\bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null

@@ -70,7 +70,8 @@ impl NotesDatabase {
                 eprintln!("[Error] Failed to initialize notes database: {}", e);
                 // Fall back to a temp file so the process can continue running.
                 let temp_path = std::env::temp_dir().join("git-ai-notes-db-failed");
-                let conn = Connection::open(&temp_path).expect("Failed to create temp DB");
+                let conn = crate::sqlite::open_with_memory_limits(&temp_path)
+                    .expect("Failed to create temp DB");
                 Mutex::new(NotesDatabase { conn })
             }
         });
@@ -83,12 +84,11 @@ impl NotesDatabase {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = crate::sqlite::open_with_memory_limits(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
             "#,
         )?;
@@ -105,12 +105,11 @@ impl NotesDatabase {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(&db_path)?;
+        let conn = crate::sqlite::open_with_memory_limits(&db_path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
             "#,
         )?;
@@ -463,6 +462,21 @@ impl NotesDatabase {
 
     // ----- Read operations -----
 
+    /// Count unsynced notes that can be dequeued for upload right now.
+    pub fn count_pending_uploadable(&self) -> Result<usize, GitAiError> {
+        let now = unix_now();
+        let count: i64 = self.conn.query_row(
+            r#"SELECT COUNT(*) FROM notes
+               WHERE synced = 0
+                 AND processing_started_at IS NULL
+                 AND next_retry_at <= ?1
+                 AND attempts < 6"#,
+            params![now],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// Retrieve the note content for a single commit SHA.
     pub fn get_note(&self, commit_sha: &str) -> Result<Option<String>, GitAiError> {
         match self.conn.query_row(
@@ -540,6 +554,27 @@ impl NotesDatabase {
         Ok(result)
     }
 
+    /// Return the commit SHAs of notes whose content contains `needle` as a
+    /// literal substring (LIKE wildcards in the needle are escaped).
+    pub fn search_notes_content(&self, needle: &str) -> Result<Vec<String>, GitAiError> {
+        let escaped = needle
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
+        let pattern = format!("%{}%", escaped);
+
+        let mut stmt = self
+            .conn
+            .prepare(r"SELECT commit_sha FROM notes WHERE content LIKE ?1 ESCAPE '\'")?;
+        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Evict synced cache entries older than `max_age_secs` when the total row
     /// count exceeds `max_rows`. Returns the number of rows deleted.
     pub fn evict_stale_cache(
@@ -581,7 +616,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test-notes.db");
 
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -768,6 +803,35 @@ mod tests {
             batch.is_empty(),
             "cache_synced_notes rows must not appear in dequeue_pending"
         );
+    }
+
+    #[test]
+    fn test_count_pending_uploadable_excludes_deferred_and_processing_rows() {
+        let (mut db, _tmp) = create_test_db();
+
+        for sha in ["ready", "backoff", "processing", "permanent"] {
+            db.upsert_note(sha, "content").unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE notes SET attempts = 1, next_retry_at = ?1 WHERE commit_sha = 'backoff'",
+                params![unix_now() + 3_600],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE notes SET processing_started_at = ?1 WHERE commit_sha = 'processing'",
+                params![unix_now()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE notes SET attempts = 6 WHERE commit_sha = 'permanent'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.count_pending_uploadable().unwrap(), 1);
     }
 
     // --- cache_synced_notes ---

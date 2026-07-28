@@ -13,7 +13,18 @@ use std::process::{Command, Stdio};
 
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
-const TRACE2_EVENT_NESTING_VALUE: &str = "10";
+const TRACE2_EVENT_NESTING_VALUE: &str = "0";
+const VISUAL_STUDIO_INSTALLER_ID: &str = "visual-studio";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InstallOptions {
+    dry_run: bool,
+    verbose: bool,
+    install_skills: bool,
+    include_visual_studio_extension: bool,
+    api_base: Option<String>,
+    api_key: Option<String>,
+}
 
 /// Installation status for a tool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,11 +200,14 @@ fn find_running_pids(process_names: &[&str]) -> Vec<(u32, String)> {
 }
 
 fn set_global_git_config_value(git_cmd: &str, key: &str, value: &str) -> Result<(), GitAiError> {
-    let status = Command::new(git_cmd)
+    let mut command = Command::new(git_cmd);
+    command
         .args(["config", "--global", key, value])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+        .stderr(Stdio::null());
+    crate::git::repository::apply_internal_git_env(&mut command);
+
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {
@@ -220,11 +234,14 @@ fn ensure_global_git_config_dirs() -> Result<(), GitAiError> {
 }
 
 fn remove_global_git_config_section(git_cmd: &str, section: &str) -> Result<(), GitAiError> {
-    let status = Command::new(git_cmd)
+    let mut command = Command::new(git_cmd);
+    command
         .args(["config", "--global", "--remove-section", section])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+        .stderr(Stdio::null());
+    crate::git::repository::apply_internal_git_env(&mut command);
+
+    let status = command.status()?;
     // Exit code 128 means the section doesn't exist, which is fine.
     if status.success() || status.code() == Some(128) {
         Ok(())
@@ -294,59 +311,124 @@ fn ensure_daemon(dry_run: bool) {
 
 /// Main entry point for install-hooks command
 pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
-    // Parse flags
-    let mut dry_run = false;
-    let mut verbose = false;
-    let mut install_skills = false;
-    for arg in args {
-        if arg == "--dry-run" || arg == "--dry-run=true" {
-            dry_run = true;
-        }
-        if arg == "--verbose" || arg == "-v" {
-            verbose = true;
-        }
-        if arg == "--skills" {
-            install_skills = true;
-        }
-    }
+    let options = parse_install_options(args)?;
+    let install_config = InstallConfig {
+        api_base: options.api_base.clone().or_else(|| {
+            std::env::var("API_BASE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        }),
+        api_key: options.api_key.clone().or_else(|| {
+            std::env::var("API_KEY")
+                .ok()
+                .filter(|value| !value.is_empty())
+        }),
+    };
 
     // Daemon trace2 config must be in place before any install work starts.
     // Non-fatal: the global git config may be read-only (e.g. Nix store symlink).
-    if let Err(e) = configure_daemon_trace2(dry_run) {
+    if let Err(e) = configure_daemon_trace2(options.dry_run) {
         eprintln!("Warning: could not configure trace2 (non-fatal): {e}");
     }
-    ensure_daemon(dry_run);
+    ensure_daemon(options.dry_run);
 
     // Now that the daemon is (re)started, initialize the telemetry handle so
     // that install-hooks metrics and observability events route through it.
-    if !dry_run {
+    if !options.dry_run {
         let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
     }
 
     // Get absolute path to the current binary
     let binary_path = get_current_binary_path()?;
-    persist_install_config(&binary_path, dry_run)?;
+    persist_install_config_with_values(&binary_path, options.dry_run, &install_config)?;
     let params = HookInstallerParams { binary_path };
 
-    // Run async operations with smol and convert result
-    let statuses = smol::block_on(async_run_install(&params, dry_run, verbose, install_skills))?;
+    // Run async operations and convert result.
+    let statuses = crate::tokio_runtime::block_on(async_run_install(&params, &options))?;
 
     // Clean up legacy envelope logs directory and related artifacts.
     // These are no longer used — all telemetry now routes through the daemon.
-    if !dry_run {
+    if !options.dry_run {
         cleanup_legacy_envelope_logs();
     }
 
     Ok(to_hashmap(statuses))
 }
 
+fn parse_install_options(args: &[String]) -> Result<InstallOptions, GitAiError> {
+    let mut options = InstallOptions::default();
+
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dry-run" | "--dry-run=true" => options.dry_run = true,
+            "--verbose" | "-v" => options.verbose = true,
+            "--skills" => options.install_skills = true,
+            "--visual-studio-extension" => options.include_visual_studio_extension = true,
+            value if value.starts_with("--api-base=") => {
+                options.api_base = non_empty_value(&value[11..]);
+            }
+            "--api-base" => {
+                let value = args.next().ok_or_else(|| {
+                    GitAiError::Generic("missing value for --api-base".to_string())
+                })?;
+                options.api_base = non_empty_value(value);
+            }
+            value if value.starts_with("--api-key=") => {
+                options.api_key = non_empty_value(&value[10..]);
+            }
+            "--api-key" => {
+                let value = args.next().ok_or_else(|| {
+                    GitAiError::Generic("missing value for --api-key".to_string())
+                })?;
+                options.api_key = non_empty_value(value);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(options)
+}
+
+fn non_empty_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn should_include_installer(id: &str, options: &InstallOptions) -> bool {
+    options.include_visual_studio_extension || id != VISUAL_STUDIO_INSTALLER_ID
+}
+
+#[derive(Default)]
+struct InstallConfig {
+    api_base: Option<String>,
+    api_key: Option<String>,
+}
+
+#[cfg(test)]
 fn persist_install_config(binary_path: &Path, dry_run: bool) -> Result<bool, GitAiError> {
+    persist_install_config_with_values(binary_path, dry_run, &install_config_from_environment())
+}
+
+#[cfg(test)]
+fn install_config_from_environment() -> InstallConfig {
+    InstallConfig {
+        api_base: std::env::var("API_BASE").ok().filter(|s| !s.is_empty()),
+        api_key: std::env::var("API_KEY").ok().filter(|s| !s.is_empty()),
+    }
+}
+
+fn persist_install_config_with_values(
+    binary_path: &Path,
+    dry_run: bool,
+    install_config: &InstallConfig,
+) -> Result<bool, GitAiError> {
     if dry_run {
         return Ok(false);
     }
 
-    let api_base = std::env::var("API_BASE").ok().filter(|s| !s.is_empty());
-    let api_key = std::env::var("API_KEY").ok().filter(|s| !s.is_empty());
+    let api_base = &install_config.api_base;
+    let api_key = &install_config.api_key;
 
     if api_base.is_none() && api_key.is_none() {
         return Ok(false);
@@ -355,14 +437,14 @@ fn persist_install_config(binary_path: &Path, dry_run: bool) -> Result<bool, Git
     let mut file_config = crate::config::load_file_config_public().map_err(GitAiError::Generic)?;
     let mut changed = false;
 
-    if let Some(ref api_base) = api_base
+    if let Some(api_base) = api_base
         && file_config.api_base_url.as_deref() != Some(api_base.as_str())
     {
         file_config.api_base_url = Some(api_base.clone());
         changed = true;
     }
 
-    if let Some(ref api_key) = api_key
+    if let Some(api_key) = api_key
         && file_config.api_key.as_deref() != Some(api_key.as_str())
     {
         file_config.api_key = Some(api_key.clone());
@@ -437,16 +519,14 @@ pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, GitAiEr
     let binary_path = get_current_binary_path()?;
     let params = HookInstallerParams { binary_path };
 
-    // Run async operations with smol and convert result
-    let statuses = smol::block_on(async_run_uninstall(&params, dry_run, verbose))?;
+    // Run async operations and convert result.
+    let statuses = crate::tokio_runtime::block_on(async_run_uninstall(&params, dry_run, verbose))?;
     Ok(to_hashmap(statuses))
 }
 
 async fn async_run_install(
     params: &HookInstallerParams,
-    dry_run: bool,
-    verbose: bool,
-    install_skills: bool,
+    options: &InstallOptions,
 ) -> Result<HashMap<String, InstallStatus>, GitAiError> {
     let mut any_checked = false;
     let mut has_changes = false;
@@ -466,6 +546,10 @@ async fn async_run_install(
         let name = installer.name();
         let id = installer.id();
 
+        if !should_include_installer(id, options) {
+            continue;
+        }
+
         // Check if tool is installed and hooks status
         match installer.check_hooks(params) {
             Ok(check_result) => {
@@ -483,15 +567,15 @@ async fn async_run_install(
                     let spinner = Spinner::new(&format!("{}: checking hooks", name));
                     spinner.start();
 
-                    match installer.install_hooks(params, dry_run) {
+                    match installer.install_hooks(params, options.dry_run) {
                         Ok(Some(diff)) => {
-                            if dry_run {
+                            if options.dry_run {
                                 spinner.pending(&format!("{}: Pending updates", name));
                             } else {
                                 spinner.success(&format!("{}: Hooks updated", name));
                                 print_amp_plugins_note(id);
                             }
-                            if verbose {
+                            if options.verbose {
                                 println!();
                                 print_diff(&diff);
                             }
@@ -500,7 +584,7 @@ async fn async_run_install(
                             detailed_results.push((id.to_string(), InstallResult::installed()));
 
                             // Track this agent for restart detection (skip in dry-run)
-                            if !dry_run {
+                            if !options.dry_run {
                                 let pnames: Vec<String> = installer
                                     .process_names()
                                     .iter()
@@ -522,7 +606,7 @@ async fn async_run_install(
                             let error_msg = e.to_string();
                             spinner.error(&format!("{}: Failed to update hooks", name));
                             eprintln!("  Error: {}", error_msg);
-                            statuses.insert(id.to_string(), InstallStatus::NotFound);
+                            statuses.insert(id.to_string(), InstallStatus::Failed);
                             detailed_results
                                 .push((id.to_string(), InstallResult::failed(error_msg)));
                         }
@@ -530,7 +614,7 @@ async fn async_run_install(
                 }
 
                 // Install extras (extensions, git.path, etc.)
-                match installer.install_extras(params, dry_run) {
+                match installer.install_extras(params, options.dry_run) {
                     Ok(results) => {
                         let mut extras_changed = false;
                         for result in results {
@@ -538,11 +622,11 @@ async fn async_run_install(
                                 has_changes = true;
                                 extras_changed = true;
                             }
-                            if result.changed && !dry_run {
+                            if result.changed && !options.dry_run {
                                 let extra_spinner = Spinner::new(&result.message);
                                 extra_spinner.start();
                                 extra_spinner.success(&result.message);
-                            } else if result.changed && dry_run {
+                            } else if result.changed && options.dry_run {
                                 let extra_spinner = Spinner::new(&result.message);
                                 extra_spinner.start();
                                 extra_spinner.pending(&result.message);
@@ -557,7 +641,9 @@ async fn async_run_install(
                                 extra_spinner.start();
                                 extra_spinner.pending(&result.message);
                             }
-                            if verbose && let Some(diff) = result.diff {
+                            if options.verbose
+                                && let Some(diff) = result.diff
+                            {
                                 println!();
                                 print_diff(&diff);
                             }
@@ -576,7 +662,7 @@ async fn async_run_install(
 
                         // Track restart detection for extras-only agents (e.g. JetBrains, VS Code)
                         if extras_changed
-                            && !dry_run
+                            && !options.dry_run
                             && !updated_agents.iter().any(|(n, _)| n == name)
                         {
                             let pnames: Vec<String> = installer
@@ -601,27 +687,27 @@ async fn async_run_install(
                     }
                 }
             }
-            Err(version_error) => {
-                let error_msg = version_error.to_string();
+            Err(check_error) => {
+                let error_msg = check_error.to_string();
                 any_checked = true;
-                let spinner = Spinner::new(&format!("{}: checking version", name));
+                let spinner = Spinner::new(&format!("{}: checking hooks", name));
                 spinner.start();
-                spinner.error(&format!("{}: Version check failed", name));
+                spinner.error(&format!("{}: Hook check failed", name));
                 eprintln!("  Error: {}", error_msg);
-                eprintln!("  Please update {} to continue using git-ai hooks", name);
-                statuses.insert(id.to_string(), InstallStatus::NotFound);
+                statuses.insert(id.to_string(), InstallStatus::Failed);
                 detailed_results.push((id.to_string(), InstallResult::failed(error_msg)));
             }
         }
     }
 
-    if install_skills {
-        if let Ok(result) = skills_installer::install_skills(dry_run, verbose, &installed_tools)
+    if options.install_skills {
+        if let Ok(result) =
+            skills_installer::install_skills(options.dry_run, options.verbose, &installed_tools)
             && result.changed
         {
             has_changes = true;
         }
-    } else if let Ok(result) = skills_installer::uninstall_skills(dry_run, verbose)
+    } else if let Ok(result) = skills_installer::uninstall_skills(options.dry_run, options.verbose)
         && result.changed
     {
         has_changes = true;
@@ -629,14 +715,14 @@ async fn async_run_install(
 
     if !any_checked {
         println!("No compatible IDEs or agent configurations detected. Nothing to install.");
-    } else if has_changes && dry_run {
+    } else if has_changes && options.dry_run {
         println!("\n\x1b[33m⚠ Dry-run mode (default). No changes were made.\x1b[0m");
         println!("To apply these changes, run:");
         println!("\x1b[1m  git-ai install-hooks --dry-run=false\x1b[0m");
     }
 
     // Check for running agents that had hooks updated and warn about restart
-    if !dry_run && !updated_agents.is_empty() {
+    if !options.dry_run && !updated_agents.is_empty() {
         let mut any_running = false;
 
         for (agent_name, pnames) in &updated_agents {
@@ -676,7 +762,7 @@ async fn async_run_install(
     }
 
     // Emit metrics for each agent/git_client result (only if not dry-run)
-    if !dry_run {
+    if !options.dry_run {
         emit_install_hooks_metrics(&detailed_results);
     }
 
@@ -705,11 +791,14 @@ fn parse_git_version(output: &str) -> Option<(u32, u32, u32)> {
 
 /// Print a loud warning if the installed git version is older than MIN_GIT_VERSION.
 fn warn_if_git_version_too_old() {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["--version"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    crate::git::repository::apply_internal_git_env(&mut command);
+
+    let output = command.output();
 
     let version = match output {
         Ok(o) => {
@@ -837,7 +926,7 @@ async fn async_run_uninstall(
                     Err(e) => {
                         spinner.error(&format!("{}: Failed to remove hooks", name));
                         eprintln!("  Error: {}", e);
-                        statuses.insert(id.to_string(), InstallStatus::NotFound);
+                        statuses.insert(id.to_string(), InstallStatus::Failed);
                     }
                 }
 
@@ -870,7 +959,7 @@ async fn async_run_uninstall(
             }
             Err(e) => {
                 eprintln!("  Error checking {}: {}", name, e);
-                statuses.insert(id.to_string(), InstallStatus::NotFound);
+                statuses.insert(id.to_string(), InstallStatus::Failed);
             }
         }
     }
@@ -982,6 +1071,100 @@ mod tests {
         {
             std::os::unix::fs::symlink(git_path, install_dir.join("git-og")).unwrap();
         }
+    }
+
+    #[test]
+    fn parse_install_options_defaults_visual_studio_extension_to_disabled() {
+        let options = parse_install_options(&[]).unwrap();
+
+        assert!(!options.include_visual_studio_extension);
+        assert!(!should_include_installer(
+            VISUAL_STUDIO_INSTALLER_ID,
+            &options
+        ));
+        assert!(should_include_installer("vscode", &options));
+    }
+
+    #[test]
+    fn parse_install_options_enables_visual_studio_extension_flag() {
+        let args = vec![
+            "--dry-run".to_string(),
+            "--visual-studio-extension".to_string(),
+            "--skills".to_string(),
+            "-v".to_string(),
+        ];
+        let options = parse_install_options(&args).unwrap();
+
+        assert!(options.dry_run);
+        assert!(options.verbose);
+        assert!(options.install_skills);
+        assert!(options.include_visual_studio_extension);
+        assert!(should_include_installer(
+            VISUAL_STUDIO_INSTALLER_ID,
+            &options
+        ));
+    }
+
+    #[test]
+    fn parse_install_options_accepts_package_api_configuration() {
+        let args = vec![
+            "--api-base=https://enterprise.example".to_string(),
+            "--api-key".to_string(),
+            "sk-enterprise-key".to_string(),
+        ];
+
+        let options = parse_install_options(&args).unwrap();
+
+        assert_eq!(
+            options.api_base.as_deref(),
+            Some("https://enterprise.example")
+        );
+        assert_eq!(options.api_key.as_deref(), Some("sk-enterprise-key"));
+    }
+
+    #[test]
+    fn parse_install_options_rejects_missing_package_api_value() {
+        let args = vec!["--api-base".to_string()];
+
+        let err = parse_install_options(&args).unwrap_err();
+
+        assert!(err.to_string().contains("missing value for --api-base"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    #[serial]
+    fn install_reports_cline_hook_check_errors_as_failed() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path().join("cline-storage");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(temp.path().join("Documents"), "not a directory").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        let _cline_storage =
+            EnvVarGuard::set("GIT_AI_CLINE_STORAGE_PATH", storage.to_str().unwrap());
+
+        let statuses = run(&["--dry-run".to_string()]).unwrap();
+
+        assert_eq!(statuses.get("cline").map(String::as_str), Some("failed"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    #[serial]
+    fn uninstall_reports_cline_hook_check_errors_as_failed() {
+        let temp = tempdir().unwrap();
+        let storage = temp.path().join("cline-storage");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(temp.path().join("Documents"), "not a directory").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        let _cline_storage =
+            EnvVarGuard::set("GIT_AI_CLINE_STORAGE_PATH", storage.to_str().unwrap());
+
+        let statuses = run_uninstall(&["--dry-run".to_string()]).unwrap();
+
+        assert_eq!(statuses.get("cline").map(String::as_str), Some("failed"));
     }
 
     #[test]

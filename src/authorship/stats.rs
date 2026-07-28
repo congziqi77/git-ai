@@ -1,10 +1,18 @@
 use crate::authorship::authorship_log::LineRange;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::error::GitAiError;
-use crate::git::notes_api::read_authorship as get_authorship;
-use crate::git::repository::Repository;
+use crate::git::notes_api::read_authorship;
+use crate::git::repository::{Repository, exec_git};
+use crate::mdm::spinner::Spinner;
+use crate::utils::is_interactive_terminal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const RECENT_COMMIT_WINDOW: Duration = Duration::from_secs(60);
+const AUTHORSHIP_NOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHORSHIP_NOTE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WAIT_MESSAGE: &str = "Waiting for git-ai to process this commit";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolModelHeadlineStats {
@@ -65,7 +73,13 @@ pub fn stats_command(
         refname
     );
 
-    let stats = stats_for_commit_stats(repo, &target, ignore_patterns)?;
+    let authorship_log = wait_for_recent_authorship(repo, &target)?;
+    let stats = stats_for_commit_stats_with_authorship(
+        repo,
+        &target,
+        ignore_patterns,
+        authorship_log.as_ref(),
+    )?;
 
     if json {
         let json_str = serde_json::to_string(&stats)?;
@@ -75,6 +89,72 @@ pub fn stats_command(
     }
 
     Ok(())
+}
+
+fn wait_for_recent_authorship(
+    repo: &Repository,
+    commit_sha: &str,
+) -> Result<Option<crate::authorship::authorship_log_serialization::AuthorshipLog>, GitAiError> {
+    if let Some(authorship_log) = read_authorship(repo, commit_sha) {
+        return Ok(Some(authorship_log));
+    }
+
+    let commit_timestamp = commit_timestamp(repo, commit_sha)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            GitAiError::Generic(format!("System clock is before Unix epoch: {error}"))
+        })?
+        .as_secs();
+    if now.abs_diff(commit_timestamp) > RECENT_COMMIT_WINDOW.as_secs() {
+        return Ok(None);
+    }
+
+    let force_tty = std::env::var_os("GIT_AI_TEST_FORCE_TTY").is_some();
+    let spinner = if force_tty {
+        // Indicatif intentionally hides itself when stderr is captured. Keep the
+        // existing test-only TTY override useful for subprocess assertions.
+        eprintln!("{WAIT_MESSAGE}");
+        None
+    } else {
+        is_interactive_terminal().then(|| Spinner::new(WAIT_MESSAGE))
+    };
+    let started = Instant::now();
+    let authorship_log = loop {
+        let remaining = AUTHORSHIP_NOTE_WAIT_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break None;
+        }
+        std::thread::sleep(AUTHORSHIP_NOTE_POLL_INTERVAL.min(remaining));
+        if let Some(authorship_log) = read_authorship(repo, commit_sha) {
+            break Some(authorship_log);
+        }
+    };
+    if let Some(spinner) = spinner {
+        spinner.finish_and_clear();
+    }
+
+    Ok(authorship_log)
+}
+
+fn commit_timestamp(repo: &Repository, commit_sha: &str) -> Result<u64, GitAiError> {
+    let mut args = repo.global_args_for_exec();
+    args.extend([
+        "show".to_string(),
+        "-s".to_string(),
+        "--no-notes".to_string(),
+        "--format=%ct".to_string(),
+        commit_sha.to_string(),
+    ]);
+    let output = exec_git(&args)?;
+    String::from_utf8(output.stdout)?
+        .trim()
+        .parse()
+        .map_err(|error| {
+            GitAiError::Generic(format!(
+                "Invalid commit timestamp for {commit_sha}: {error}"
+            ))
+        })
 }
 
 pub fn write_stats_to_terminal(stats: &CommitStats, is_interactive: bool) -> String {
@@ -379,38 +459,61 @@ pub fn stats_for_commit_stats(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<CommitStats, GitAiError> {
-    use crate::commands::diff::get_diff_with_line_numbers;
+    let authorship_log = read_authorship(repo, commit_sha);
+    stats_for_commit_stats_with_authorship(
+        repo,
+        commit_sha,
+        ignore_patterns,
+        authorship_log.as_ref(),
+    )
+}
 
+pub fn stats_for_commit_stats_with_authorship(
+    repo: &Repository,
+    commit_sha: &str,
+    ignore_patterns: &[String],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+) -> Result<CommitStats, GitAiError> {
     let commit_obj = repo.revparse_single(commit_sha)?.peel_to_commit()?;
     let parent_count = commit_obj.parent_count()?;
 
     if parent_count > 1 {
-        let authorship_log = get_authorship(repo, commit_sha);
         return stats_for_commit_stats_from_hunks(
             repo,
             commit_sha,
             ignore_patterns,
             &[],
-            authorship_log.as_ref(),
+            authorship_log,
         );
     }
 
-    let from_ref = if parent_count == 0 {
-        "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+    let parent_sha = if parent_count == 0 {
+        None
     } else {
-        commit_obj.parent(0)?.id()
+        Some(commit_obj.parent(0)?.id())
     };
 
-    let hunks = get_diff_with_line_numbers(repo, &from_ref, commit_sha)?;
-    let authorship_log = get_authorship(repo, commit_sha);
-
-    stats_for_commit_stats_from_hunks(
+    stats_for_commit_stats_with_parent_and_authorship(
         repo,
         commit_sha,
+        parent_sha.as_deref(),
         ignore_patterns,
-        &hunks,
-        authorship_log.as_ref(),
+        authorship_log,
     )
+}
+
+pub fn stats_for_commit_stats_with_parent_and_authorship(
+    repo: &Repository,
+    commit_sha: &str,
+    parent_sha: Option<&str>,
+    ignore_patterns: &[String],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+) -> Result<CommitStats, GitAiError> {
+    use crate::commands::diff::get_diff_with_line_numbers;
+
+    let from_ref = parent_sha.unwrap_or("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    let hunks = get_diff_with_line_numbers(repo, from_ref, commit_sha)?;
+    stats_for_commit_stats_from_hunks(repo, commit_sha, ignore_patterns, &hunks, authorship_log)
 }
 
 #[doc(hidden)]
@@ -511,6 +614,20 @@ pub fn stats_for_commit_stats_from_hunks(
     let parent_count = commit_obj.parent_count()?;
     let is_merge_commit = parent_count > 1;
 
+    Ok(stats_for_commit_stats_from_hunks_with_merge_flag(
+        ignore_patterns,
+        hunks,
+        authorship_log,
+        is_merge_commit,
+    ))
+}
+
+pub(crate) fn stats_for_commit_stats_from_hunks_with_merge_flag(
+    ignore_patterns: &[String],
+    hunks: &[crate::commands::diff::DiffHunk],
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+    is_merge_commit: bool,
+) -> CommitStats {
     let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     let mut git_diff_added_lines = 0u32;
@@ -540,14 +657,14 @@ pub fn stats_for_commit_stats_from_hunks(
     let (ai_accepted, known_human_accepted, ai_accepted_by_tool) =
         accepted_lines_from_attestations(authorship_log, &added_lines_by_file, is_merge_commit);
 
-    Ok(stats_from_authorship_log(
+    stats_from_authorship_log(
         authorship_log,
         git_diff_added_lines,
         git_diff_deleted_lines,
         ai_accepted,
         known_human_accepted,
         &ai_accepted_by_tool,
-    ))
+    )
 }
 
 /// Get git diff statistics between commit and its parent
