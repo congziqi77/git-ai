@@ -416,7 +416,8 @@ pub(crate) fn handle_rewrite_event_with_metrics(
             if mappings.is_empty() {
                 return Ok(RewriteOutcome::empty());
             }
-            let source_shas: Vec<String> = mappings.iter().map(|(src, _)| src.clone()).collect();
+            let source_shas: Vec<String> =
+                mappings.iter().map(|(source, _)| source.clone()).collect();
             crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(
                 repo,
                 &source_shas,
@@ -462,7 +463,7 @@ pub(crate) fn handle_non_fast_forward_rewrite_with_operation(
     if mappings.is_empty() {
         return Ok(RewriteOutcome::empty());
     }
-    let source_shas: Vec<String> = mappings.iter().map(|(src, _)| src.clone()).collect();
+    let source_shas: Vec<String> = mappings.iter().map(|(source, _)| source.clone()).collect();
     crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, &source_shas);
     let shifted_notes = shift_authorship_notes_merging_existing_with_notes(repo, &mappings)?;
     if !rewrite_metrics_enabled() {

@@ -69,8 +69,8 @@ fn test_stats_json_classifies_file_additions_by_authorship() {
     assert_eq!(file_stats["src/human.py"]["unknown_additions"], 0);
 
     assert_eq!(file_stats["settings.json"]["ai_accepted"], 0);
-    assert_eq!(file_stats["settings.json"]["human_additions"], 0);
-    assert_eq!(file_stats["settings.json"]["unknown_additions"], 3);
+    assert_eq!(file_stats["settings.json"]["human_additions"], 3);
+    assert_eq!(file_stats["settings.json"]["unknown_additions"], 0);
 
     for field in ["ai_accepted", "human_additions", "unknown_additions"] {
         let file_total: u64 = file_stats
@@ -79,6 +79,28 @@ fn test_stats_json_classifies_file_additions_by_authorship() {
             .sum();
         assert_eq!(json[field].as_u64().unwrap(), file_total, "{field}");
     }
+}
+
+#[test]
+fn test_stats_json_preserves_unknown_when_commit_has_ai_but_no_known_human() {
+    let repo = TestRepo::new();
+    fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+
+    repo.git_ai(&["checkpoint", "human", "ai.rs"]).unwrap();
+    fs::write(repo.path().join("ai.rs"), "generated\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "ai.rs"]).unwrap();
+    fs::write(repo.path().join("unknown.txt"), "uncheckpointed\n").unwrap();
+    repo.stage_all_and_commit("AI with unknown hole").unwrap();
+
+    let json = stats_json_from_args(&repo, &["stats", "HEAD", "--json"]);
+    let file_stats = json["file_stats"]
+        .as_object()
+        .expect("stats JSON should include file_stats");
+
+    assert_eq!(file_stats["ai.rs"]["ai_accepted"], 1);
+    assert_eq!(file_stats["unknown.txt"]["human_additions"], 0);
+    assert_eq!(file_stats["unknown.txt"]["unknown_additions"], 1);
 }
 
 #[test]
@@ -109,7 +131,8 @@ fn test_stats_range_json_classifies_file_additions_by_authorship() {
 
     assert_eq!(file_stats["src/lib.rs"]["ai_accepted"], 1);
     assert_eq!(file_stats["config.py"]["human_additions"], 1);
-    assert_eq!(file_stats["data.json"]["unknown_additions"], 1);
+    assert_eq!(file_stats["data.json"]["human_additions"], 1);
+    assert_eq!(file_stats["data.json"]["unknown_additions"], 0);
     for field in ["ai_accepted", "human_additions", "unknown_additions"] {
         let file_total: u64 = file_stats
             .values()

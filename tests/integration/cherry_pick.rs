@@ -1,5 +1,6 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
+use git_ai::authorship::authorship_log::LineRange;
 use git_ai::authorship::authorship_log::PromptRecord;
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::working_log::AgentId;
@@ -829,6 +830,185 @@ fn test_cherry_pick_from_remote_without_prefetched_notes() {
 }
 
 #[test]
+#[ignore = "temporarily restored by the stacked transport-aware notes sync follow-up"]
+fn test_cherry_pick_preserves_authoritative_remote_target_note() {
+    let (repo, upstream) = TestRepo::new_with_remote();
+    let file_path = repo.path().join("file.txt");
+
+    fs::write(&file_path, "base\n").unwrap();
+    let base_commit = repo.stage_all_and_commit("initial").unwrap();
+    let main_branch = repo.current_branch();
+    let mut file = repo.filename("file.txt");
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    repo.git_ai(&["checkpoint", "human", "file.txt"]).unwrap();
+    fs::write(&file_path, "base\nold AI line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
+    fs::write(&file_path, "base\nold AI line\nremote AI line\n").unwrap();
+    let source_commit = repo.stage_all_and_commit("feature").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "old AI line".ai(),
+        "remote AI line".ai(),
+    ]);
+    let source_note = repo
+        .read_authorship_note(&source_commit.commit_sha)
+        .expect("source note should exist locally");
+    let mut source_log =
+        AuthorshipLog::deserialize_from_string(&source_note).expect("parse source note");
+    let source_attestation = source_log
+        .attestations
+        .iter_mut()
+        .find(|file_attestation| file_attestation.file_path == "file.txt")
+        .expect("source note should contain file.txt");
+    for entry in &mut source_attestation.entries {
+        entry.remove_line_ranges(&[LineRange::Single(3)]);
+    }
+    source_attestation
+        .entries
+        .retain(|entry| !entry.line_ranges.is_empty());
+    assert!(
+        source_attestation
+            .entries
+            .iter()
+            .all(|entry| entry.line_ranges.iter().all(|range| !range.contains(3))),
+        "stale source note should not attribute the remote-only line"
+    );
+    let source_note = source_log
+        .serialize_to_string()
+        .expect("serialize stale source note");
+    let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("find repository");
+    write_note(&git_ai_repo, &source_commit.commit_sha, &source_note)
+        .expect("write stale source note");
+
+    repo.git_og(&["push", "origin", "feature"]).unwrap();
+    repo.git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+    let source_notes_ref = repo.git_og(&["rev-parse", "refs/notes/ai"]).unwrap();
+    let source_notes_ref = source_notes_ref.trim();
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    let deterministic_date = "2030-01-03T00:00:00Z";
+    repo.git_og_with_env(
+        &["cherry-pick", &source_commit.commit_sha],
+        &[("GIT_COMMITTER_DATE", deterministic_date)],
+    )
+    .unwrap();
+    let target_commit = repo.git_og(&["rev-parse", "HEAD"]).unwrap();
+    let target_commit = target_commit.trim();
+
+    let mut target_log =
+        AuthorshipLog::deserialize_from_string(&source_note).expect("parse source note");
+    target_log.metadata.base_commit_sha = target_commit.to_string();
+    let target_entry = target_log
+        .attestations
+        .iter_mut()
+        .find(|file_attestation| file_attestation.file_path == "file.txt")
+        .and_then(|file_attestation| {
+            file_attestation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.line_ranges.iter().any(|range| range.contains(2)))
+        })
+        .expect("source note should attribute the old AI line");
+    target_entry.line_ranges.push(LineRange::Single(3));
+    let target_note = target_log
+        .serialize_to_string()
+        .expect("serialize authoritative target note");
+    write_note(&git_ai_repo, target_commit, &target_note).expect("write authoritative target note");
+    repo.git_og(&["push", "--force", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+
+    repo.git_og(&["reset", "--hard", &base_commit.commit_sha])
+        .unwrap();
+    repo.git_og(&["update-ref", "refs/notes/ai", source_notes_ref])
+        .unwrap();
+    repo.git_og(&["update-ref", "-d", "refs/notes/ai-remote/origin"])
+        .unwrap();
+
+    assert!(
+        repo.read_authorship_note(&source_commit.commit_sha)
+            .is_some(),
+        "precondition: stale source note should already exist locally"
+    );
+    assert!(
+        upstream.read_authorship_note(target_commit).is_some(),
+        "precondition: authoritative target note should exist remotely"
+    );
+    assert!(
+        repo.read_authorship_note(target_commit).is_none(),
+        "precondition: target note should not exist locally"
+    );
+
+    repo.git_with_env(
+        &["cherry-pick", &source_commit.commit_sha],
+        &[("GIT_COMMITTER_DATE", deterministic_date)],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        repo.git(&["rev-parse", "HEAD"]).unwrap().trim(),
+        target_commit,
+        "deterministic cherry-pick should recreate the remotely noted target"
+    );
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "old AI line".ai(),
+        "remote AI line".ai(),
+    ]);
+}
+
+#[test]
+fn test_local_cherry_pick_does_not_fetch_notes_for_fresh_destination() {
+    let (repo, _upstream) = TestRepo::new_with_remote();
+    let file_path = repo.path().join("file.txt");
+
+    fs::write(&file_path, "base\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+    let main_branch = repo.current_branch();
+    let mut file = repo.filename("file.txt");
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    repo.git_ai(&["checkpoint", "human", "file.txt"]).unwrap();
+    fs::write(&file_path, "base\nAI picked line\n").unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
+    let source_commit = repo.stage_all_and_commit("AI source").unwrap();
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "AI picked line".ai(),
+    ]);
+
+    repo.git_og(&["push", "origin", "refs/notes/ai:refs/notes/ai"])
+        .unwrap();
+    repo.git(&["checkout", &main_branch]).unwrap();
+    file.assert_committed_lines(crate::lines!["base".unattributed_human()]);
+
+    let tracking_ref = "refs/notes/ai-remote/origin";
+    repo.git_og(&["update-ref", "-d", tracking_ref]).unwrap();
+    assert!(
+        repo.git_og(&["show-ref", "--verify", "--quiet", tracking_ref])
+            .is_err(),
+        "precondition: the remote notes tracking ref should be absent"
+    );
+
+    repo.git(&["cherry-pick", &source_commit.commit_sha])
+        .unwrap();
+    repo.sync_daemon_force();
+    file.assert_committed_lines(crate::lines![
+        "base".unattributed_human(),
+        "AI picked line".ai(),
+    ]);
+    assert!(
+        repo.git_og(&["show-ref", "--verify", "--quiet", tracking_ref])
+            .is_err(),
+        "a local cherry-pick with a locally noted source must not fetch remote notes"
+    );
+}
+
+#[test]
 fn test_cherry_pick_local_remote_tracking_ref_missing_from_daemon_snapshot() {
     let repo = TestRepo::new();
     let mut file = repo.filename("file.txt");
@@ -1304,9 +1484,15 @@ crate::reuse_tests_in_worktree!(
     test_cherry_pick_bad_args_dont_corrupt_subsequent_attribution,
     test_cherry_pick_skip_preserves_subsequent_attribution,
     test_cherry_pick_from_remote_without_prefetched_notes,
+    test_local_cherry_pick_does_not_fetch_notes_for_fresh_destination,
     test_cherry_pick_from_remote_continues_when_notes_import_fails,
     test_cherry_pick_no_commit_defers_to_final_commit_tree,
     test_cherry_pick_skip_failed_next_conflict_advances_pending_remote_tracking_source,
     test_cherry_pick_skip_then_continue_applies_remaining_commits,
     test_cherry_pick_skip_failed_next_conflict_does_not_double_skip_refcursor_sources,
+);
+
+crate::reuse_tests_in_worktree_with_attrs!(
+    (#[ignore = "temporarily restored by the stacked transport-aware notes sync follow-up"])
+    test_cherry_pick_preserves_authoritative_remote_target_note,
 );
