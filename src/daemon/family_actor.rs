@@ -110,6 +110,10 @@ pub fn spawn_family_actor(family_key: FamilyKey) -> FamilyActorHandle {
             match msg {
                 FamilyMsg::Apply(cmd, respond_to) => {
                     let mut cmd = *cmd;
+                    let root_sid = cmd.root_sid.clone();
+                    let primary = cmd.primary_command.clone();
+                    let started_at_ns = cmd.started_at_ns;
+                    let finished_at_ns = cmd.finished_at_ns;
                     let result = ref_cursor.enrich_command(&mut cmd, &state).and_then(
                         |command_start_refs| {
                             reducer::reduce_family_command_with_ref_snapshot(
@@ -121,6 +125,31 @@ pub fn spawn_family_actor(family_key: FamilyKey) -> FamilyActorHandle {
                             .map(|(applied, _)| applied)
                         },
                     );
+                    if crate::daemon::rewrite_diagnostics_enabled() {
+                        match &result {
+                            Ok(applied) => tracing::info!(
+                                event = "family.command_applied",
+                                root_sid = %root_sid,
+                                family = %state.family_key.0,
+                                family_seq = applied.seq,
+                                primary = ?primary,
+                                started_at_ns = %started_at_ns,
+                                finished_at_ns = %finished_at_ns,
+                                ref_changes = ?applied.command.ref_changes,
+                                semantic_events = ?applied.analysis.events,
+                                confidence = ?applied.command.confidence,
+                                "family command applied"
+                            ),
+                            Err(error) => tracing::info!(
+                                event = "family.command_failed",
+                                root_sid = %root_sid,
+                                family = %state.family_key.0,
+                                primary = ?primary,
+                                error = %error,
+                                "family command failed"
+                            ),
+                        }
+                    }
                     let _ = respond_to.send(result);
                 }
                 FamilyMsg::ApplyCheckpoint(respond_to) => {

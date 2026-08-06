@@ -76,6 +76,11 @@ pub mod test_sync;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
 
+pub(crate) fn rewrite_diagnostics_enabled() -> bool {
+    std::env::var("GIT_AI_REWRITE_DIAGNOSTICS").as_deref() != Ok("0")
+        || std::env::var("GIT_AI_DEBUG_DAEMON_TRACE").as_deref() == Ok("1")
+}
+
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
     FamilyStatus, TelemetryEnvelope,
@@ -4674,6 +4679,10 @@ impl ActorDaemonCoordinator {
                     // Wrap the entire command + side-effect pipeline in catch_unwind
                     // so that a panic (e.g. from UTF-8 boundary issues in diff parsing)
                     // does not kill the daemon process.
+                    let diagnostic_root_sid = command.root_sid.clone();
+                    let diagnostic_primary = command.primary_command.clone();
+                    let diagnostic_started_at =
+                        rewrite_diagnostics_enabled().then(std::time::Instant::now);
                     let side_effect_result = {
                         let future = async {
                             let root_sid = command.root_sid.clone();
@@ -4692,6 +4701,24 @@ impl ActorDaemonCoordinator {
                         let caught = std::panic::AssertUnwindSafe(future);
                         futures::FutureExt::catch_unwind(caught).await
                     };
+                    if let Some(started_at) = diagnostic_started_at {
+                        let status = match &side_effect_result {
+                            Ok(Ok((_, Ok(())))) => "ok",
+                            Ok(Ok((_, Err(_)))) => "side_effect_error",
+                            Ok(Err(_)) => "apply_error",
+                            Err(_) => "panic",
+                        };
+                        tracing::info!(
+                            event = "family.command_pipeline",
+                            root_sid = %diagnostic_root_sid,
+                            family,
+                            order,
+                            primary = ?diagnostic_primary,
+                            status,
+                            duration_ms = started_at.elapsed().as_millis() as u64,
+                            "family command pipeline complete"
+                        );
+                    }
                     match side_effect_result {
                         Ok(Ok((applied, side_effect_result))) => {
                             if let Err(error) = &side_effect_result {
@@ -5330,9 +5357,21 @@ impl ActorDaemonCoordinator {
         &self,
         cmd: &crate::daemon::domain::NormalizedCommand,
     ) -> Result<(), GitAiError> {
+        let diagnostics_enabled = rewrite_diagnostics_enabled();
         let worktree = match cmd.worktree.as_ref() {
             Some(w) => w,
-            None => return Ok(()),
+            None => {
+                if diagnostics_enabled {
+                    tracing::info!(
+                        event = "rewrite.decision",
+                        root_sid = %cmd.root_sid,
+                        primary = ?cmd.primary_command,
+                        decision = "skipped_missing_worktree",
+                        "rewrite detection skipped"
+                    );
+                }
+                return Ok(());
+            }
         };
 
         let repo = find_repository_in_path(&worktree.to_string_lossy())?;
@@ -5346,6 +5385,19 @@ impl ActorDaemonCoordinator {
         } else {
             None
         };
+
+        if diagnostics_enabled {
+            tracing::info!(
+                event = "rewrite.detection_input",
+                root_sid = %cmd.root_sid,
+                primary = ?cmd.primary_command,
+                worktree = %worktree.display(),
+                exit_code = cmd.exit_code,
+                ref_changes = ?cmd.ref_changes,
+                pending_original_head = ?pending_original_head,
+                "rewrite detection input"
+            );
+        }
 
         // Collect branch ref changes (skip notes, tags, etc.)
         let mut branch_changes: Vec<_> = cmd
@@ -5373,6 +5425,16 @@ impl ActorDaemonCoordinator {
         }
 
         if branch_changes.is_empty() && pending_original_head.is_none() {
+            if diagnostics_enabled {
+                tracing::info!(
+                    event = "rewrite.decision",
+                    root_sid = %cmd.root_sid,
+                    primary = ?cmd.primary_command,
+                    decision = "skipped_no_valid_ref_changes",
+                    ref_changes = ?cmd.ref_changes,
+                    "rewrite detection skipped"
+                );
+            }
             return Ok(());
         }
 
@@ -5480,6 +5542,18 @@ impl ActorDaemonCoordinator {
                             && is_ancestor_commit(&repo, onto, &new_tip)
                     })
                     .or(command_rebase_onto);
+                if diagnostics_enabled {
+                    tracing::info!(
+                        event = "rewrite.decision",
+                        root_sid = %cmd.root_sid,
+                        primary = ?cmd.primary_command,
+                        decision = "candidate_pending_rebase",
+                        old_tip = %pending.original_head,
+                        new_tip = %new_tip,
+                        onto = ?rebase_onto,
+                        "rewrite detection candidate"
+                    );
+                }
                 let outcome =
                     crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
                         &repo,
@@ -5516,11 +5590,33 @@ impl ActorDaemonCoordinator {
 
         for (reference, (old_tip, new_tip)) in &collapsed {
             if *old_tip == *new_tip {
+                if diagnostics_enabled {
+                    tracing::info!(
+                        event = "rewrite.decision",
+                        root_sid = %cmd.root_sid,
+                        reference,
+                        decision = "skipped_same_tip",
+                        old_tip,
+                        new_tip,
+                        "rewrite detection skipped"
+                    );
+                }
                 continue;
             }
 
             // Fast-forward — not a rewrite
             if is_ancestor_commit(&repo, old_tip, new_tip) {
+                if diagnostics_enabled {
+                    tracing::info!(
+                        event = "rewrite.decision",
+                        root_sid = %cmd.root_sid,
+                        reference,
+                        decision = "skipped_fast_forward",
+                        old_tip,
+                        new_tip,
+                        "rewrite detection skipped"
+                    );
+                }
                 continue;
             }
 
@@ -5529,6 +5625,19 @@ impl ActorDaemonCoordinator {
             } else {
                 onto_hint.clone()
             };
+            if diagnostics_enabled {
+                tracing::info!(
+                    event = "rewrite.decision",
+                    root_sid = %cmd.root_sid,
+                    primary = ?cmd.primary_command,
+                    reference,
+                    decision = "candidate_non_fast_forward",
+                    old_tip,
+                    new_tip,
+                    onto = ?rewrite_onto,
+                    "rewrite detection candidate"
+                );
+            }
             let outcome = if is_rebase_cmd {
                 crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
                     &repo,
@@ -5696,6 +5805,15 @@ impl ActorDaemonCoordinator {
 
         let cmd = &applied.command;
         let events = &applied.analysis.events;
+        let diagnostic_span = rewrite_diagnostics_enabled().then(|| {
+            tracing::info_span!(
+                "rewrite_diagnostics",
+                root_sid = %cmd.root_sid,
+                family_seq = applied.seq,
+                primary = ?cmd.primary_command
+            )
+        });
+        let _diagnostic_span_guard = diagnostic_span.as_ref().map(|span| span.enter());
 
         let primary = cmd.primary_command.as_deref().unwrap_or("unknown");
         let lite_mode = config::Config::get().get_feature_flags().lite_mode;

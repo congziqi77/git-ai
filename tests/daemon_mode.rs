@@ -3229,6 +3229,66 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
 }
 
 #[test]
+fn daemon_rebase_diagnostics_cover_command_cursor_mapping_and_notes() {
+    let repo = TestRepo::new();
+
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(lines!["base".human()]);
+    repo.stage_all_and_commit("initial")
+        .expect("initial commit should succeed");
+    base_file.assert_committed_lines(lines!["base".human()]);
+    let default_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"])
+        .expect("feature checkout should succeed");
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(lines!["AI feature".ai()]);
+    let source_commit = repo
+        .stage_all_and_commit("AI feature")
+        .expect("feature commit should succeed");
+    feature_file.assert_committed_lines(lines!["AI feature".ai()]);
+
+    repo.git(&["checkout", &default_branch])
+        .expect("default branch checkout should succeed");
+    let mut upstream_file = repo.filename("upstream.txt");
+    upstream_file.set_contents(lines!["upstream".human()]);
+    repo.stage_all_and_commit("upstream advances")
+        .expect("upstream commit should succeed");
+    upstream_file.assert_committed_lines(lines!["upstream".human()]);
+
+    repo.git(&["checkout", "feature"])
+        .expect("feature checkout should succeed");
+    repo.git(&["rebase", &default_branch])
+        .expect("feature rebase should succeed");
+    repo.sync_daemon();
+
+    let target_commit = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .expect("rebased HEAD should resolve")
+        .trim()
+        .to_string();
+    assert_ne!(source_commit.commit_sha, target_commit);
+    feature_file.assert_committed_lines(lines!["AI feature".ai()]);
+
+    let logs = wait_for_daemon_log(&repo, "rewrite notes migration complete");
+    for expected in [
+        "trace normalized command",
+        "ref cursor enrichment complete",
+        "family command applied",
+        "rewrite detection candidate",
+        "rewrite range-diff mappings",
+        "rewrite notes migration complete",
+        &source_commit.commit_sha,
+        &target_commit,
+    ] {
+        assert!(
+            logs.contains(expected),
+            "daemon diagnostics should contain {expected:?}:\n{logs}"
+        );
+    }
+}
+
+#[test]
 #[serial]
 fn daemon_trace_ingest_treats_atexit_as_terminal_for_reflog_capture() {
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);

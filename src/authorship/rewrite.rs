@@ -459,13 +459,79 @@ pub(crate) fn handle_non_fast_forward_rewrite_with_operation(
     onto: Option<&str>,
     operation: RewriteMetricOperation,
 ) -> Result<RewriteOutcome, GitAiError> {
-    let mappings = derive_mappings_from_range_diff(repo, old_tip, new_tip, onto)?;
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        tracing::info!(
+            event = "rewrite.mapping_input",
+            ?operation,
+            old_tip,
+            new_tip,
+            onto,
+            "rewrite mapping input"
+        );
+    }
+    let mappings = match derive_mappings_from_range_diff(repo, old_tip, new_tip, onto) {
+        Ok(mappings) => mappings,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.mapping_result",
+                    ?operation,
+                    old_tip,
+                    new_tip,
+                    onto,
+                    decision = "failed",
+                    error = %error,
+                    "rewrite range-diff mapping failed"
+                );
+            }
+            return Err(error);
+        }
+    };
     if mappings.is_empty() {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.mapping_result",
+                ?operation,
+                old_tip,
+                new_tip,
+                onto,
+                decision = "empty_mapping",
+                "rewrite range-diff mappings"
+            );
+        }
         return Ok(RewriteOutcome::empty());
     }
     let source_shas: Vec<String> = mappings.iter().map(|(source, _)| source.clone()).collect();
     crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, &source_shas);
-    let shifted_notes = shift_authorship_notes_merging_existing_with_notes(repo, &mappings)?;
+    let shifted_notes = match shift_authorship_notes_merging_existing_with_notes(repo, &mappings) {
+        Ok(notes) => notes,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.notes_result",
+                    ?operation,
+                    mapping_count = mappings.len(),
+                    mappings = ?mappings,
+                    decision = "failed",
+                    error = %error,
+                    "rewrite notes migration failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        tracing::info!(
+            event = "rewrite.notes_result",
+            ?operation,
+            mapping_count = mappings.len(),
+            mappings = ?mappings,
+            source_shas = ?source_shas,
+            written_note_count = shifted_notes.len(),
+            written_targets = ?shifted_notes.iter().map(|(sha, _)| sha).collect::<Vec<_>>(),
+            "rewrite notes migration complete"
+        );
+    }
     if !rewrite_metrics_enabled() {
         return Ok(RewriteOutcome::empty());
     }
@@ -758,13 +824,57 @@ fn shift_authorship_notes_with_existing_mode(
         .iter()
         .flat_map(|(src, dst)| [src.clone(), dst.clone()])
         .collect();
-    let notes_map = notes_api::read_notes_batch(repo, &all_shas)?;
+    let notes_map = match notes_api::read_notes_batch(repo, &all_shas) {
+        Ok(notes) => notes,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.notes_read",
+                    mapping_count = mappings.len(),
+                    mappings = ?mappings,
+                    requested_sha_count = all_shas.len(),
+                    decision = "failed",
+                    error = %error,
+                    "rewrite notes batch read failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        let source_notes_found = mappings
+            .iter()
+            .filter(|(source, _)| notes_map.contains_key(source))
+            .count();
+        let target_notes_found = mappings
+            .iter()
+            .filter(|(_, target)| notes_map.contains_key(target))
+            .count();
+        tracing::info!(
+            event = "rewrite.notes_read",
+            mapping_count = mappings.len(),
+            mappings = ?mappings,
+            requested_sha_count = all_shas.len(),
+            returned_note_count = notes_map.len(),
+            source_notes_found,
+            source_notes_missing = mappings.len().saturating_sub(source_notes_found),
+            target_notes_found,
+            merge_existing_targets,
+            "rewrite notes batch read"
+        );
+    }
 
     // Determine which mappings need processing
     let mut pending: Vec<PendingShift> = Vec::new();
     let mut verbatim_writes: Vec<(String, String)> = Vec::new();
     let mut diff_pairs: Vec<(String, String)> = Vec::new();
     let mut existing_by_target: HashMap<String, AuthorshipLog> = HashMap::new();
+    let mut skipped_existing_targets = 0usize;
+    let mut corrupt_target_notes = 0usize;
+    let mut missing_source_notes = 0usize;
+    let mut corrupt_source_notes = 0usize;
+    let mut source_attestation_files = 0usize;
 
     for (source_sha, new_sha) in mappings {
         if let Some(existing_raw) = notes_map.get(new_sha) {
@@ -775,24 +885,29 @@ fn shift_authorship_notes_with_existing_mode(
                             .entry(new_sha.clone())
                             .or_insert(existing_log);
                     } else {
+                        skipped_existing_targets += 1;
                         continue;
                     }
                 }
             } else {
+                corrupt_target_notes += 1;
                 continue;
             }
         }
 
         let Some(raw_note) = notes_map.get(source_sha) else {
+            missing_source_notes += 1;
             continue;
         };
 
         let Ok(log) = AuthorshipLog::deserialize_from_string(raw_note) else {
+            corrupt_source_notes += 1;
             if !merge_existing_targets {
                 verbatim_writes.push((new_sha.clone(), raw_note.clone()));
             }
             continue;
         };
+        source_attestation_files += log.attestations.len();
 
         diff_pairs.push((source_sha.clone(), new_sha.clone()));
         pending.push(PendingShift {
@@ -802,7 +917,38 @@ fn shift_authorship_notes_with_existing_mode(
     }
 
     if pending.is_empty() && verbatim_writes.is_empty() {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.notes_plan",
+                decision = "nothing_to_write",
+                mapping_count = mappings.len(),
+                skipped_existing_targets,
+                corrupt_target_notes,
+                missing_source_notes,
+                corrupt_source_notes,
+                source_attestation_files,
+                "rewrite notes migration plan"
+            );
+        }
         return Ok(Vec::new());
+    }
+
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        tracing::info!(
+            event = "rewrite.notes_plan",
+            decision = "write",
+            mapping_count = mappings.len(),
+            pending_shift_count = pending.len(),
+            verbatim_write_count = verbatim_writes.len(),
+            existing_target_count = existing_by_target.len(),
+            diff_pairs = ?diff_pairs,
+            skipped_existing_targets,
+            corrupt_target_notes,
+            missing_source_notes,
+            corrupt_source_notes,
+            source_attestation_files,
+            "rewrite notes migration plan"
+        );
     }
 
     // Stream diff-tree output in bounded chunks from a single git spawn.
@@ -848,6 +994,10 @@ fn shift_authorship_notes_with_existing_mode(
     }
 
     let mut all_writes = verbatim_writes;
+    let shifted_attestation_files = merged_by_target
+        .values()
+        .map(|log| log.attestations.len())
+        .sum::<usize>();
     for (sha, log) in merged_by_target {
         let serialized = log.serialize_to_string().map_err(|e| {
             GitAiError::Generic(format!("failed to serialize shifted authorship log: {}", e))
@@ -856,7 +1006,38 @@ fn shift_authorship_notes_with_existing_mode(
     }
 
     // Single batched write for all notes
-    notes_api::write_notes_batch(repo, &all_writes)?;
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        tracing::info!(
+            event = "rewrite.notes_write",
+            write_count = all_writes.len(),
+            targets = ?all_writes.iter().map(|(sha, _)| sha).collect::<Vec<_>>(),
+            shifted_attestation_files,
+            "rewrite notes batch write started"
+        );
+    }
+    if let Err(error) = notes_api::write_notes_batch(repo, &all_writes) {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.notes_write",
+                write_count = all_writes.len(),
+                targets = ?all_writes.iter().map(|(sha, _)| sha).collect::<Vec<_>>(),
+                decision = "failed",
+                error = %error,
+                "rewrite notes batch write failed"
+            );
+        }
+        return Err(error);
+    }
+
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        tracing::info!(
+            event = "rewrite.notes_write",
+            write_count = all_writes.len(),
+            targets = ?all_writes.iter().map(|(sha, _)| sha).collect::<Vec<_>>(),
+            decision = "written",
+            "rewrite notes batch write complete"
+        );
+    }
 
     Ok(all_writes)
 }
@@ -967,11 +1148,32 @@ fn derive_mappings_from_range_diff(
     onto_hint: Option<&str>,
 ) -> Result<Vec<(String, String)>, GitAiError> {
     let Some(base) = find_merge_base(repo, old_tip, new_tip) else {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.range_diff",
+                old_tip,
+                new_tip,
+                onto_hint,
+                decision = "missing_merge_base",
+                "rewrite range-diff mappings"
+            );
+        }
         return Ok(Vec::new());
     };
 
     // Rewind: branch moved backward
     if base == new_tip {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.range_diff",
+                old_tip,
+                new_tip,
+                base,
+                onto_hint,
+                decision = "backward_reset",
+                "rewrite range-diff mappings"
+            );
+        }
         crate::authorship::rewrite_reset::reconstruct_working_log_after_backward_reset(
             repo, old_tip, new_tip,
         )?;
@@ -980,6 +1182,17 @@ fn derive_mappings_from_range_diff(
 
     // Fast-forward: no rewrite happened
     if base == old_tip {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.range_diff",
+                old_tip,
+                new_tip,
+                base,
+                onto_hint,
+                decision = "fast_forward",
+                "rewrite range-diff mappings"
+            );
+        }
         return Ok(Vec::new());
     }
 
@@ -992,11 +1205,59 @@ fn derive_mappings_from_range_diff(
         }
         _ => &base,
     };
-    let range_diff_output = run_range_diff(repo, &base, old_tip, onto, new_tip)?;
+    let range_diff_output = match run_range_diff(repo, &base, old_tip, onto, new_tip) {
+        Ok(output) => output,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.range_diff",
+                    old_tip,
+                    new_tip,
+                    base,
+                    onto_hint,
+                    selected_onto = onto,
+                    decision = "command_failed",
+                    error = %error,
+                    "rewrite range-diff failed"
+                );
+            }
+            return Err(error);
+        }
+    };
     let mut mappings = parse_range_diff_output(&range_diff_output);
 
     let merge_mappings = derive_merge_commit_mappings(repo, &base, old_tip, new_tip, &mappings)?;
     mappings.extend(merge_mappings);
+
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        const MAX_RANGE_DIFF_LOG_CHARS: usize = 32 * 1024;
+        let range_diff_log = if range_diff_output.chars().count() > MAX_RANGE_DIFF_LOG_CHARS {
+            format!(
+                "{}\n[truncated]",
+                range_diff_output
+                    .chars()
+                    .take(MAX_RANGE_DIFF_LOG_CHARS)
+                    .collect::<String>()
+            )
+        } else {
+            range_diff_output.clone()
+        };
+        tracing::info!(
+            event = "rewrite.range_diff",
+            old_tip,
+            new_tip,
+            base,
+            onto_hint,
+            selected_onto = onto,
+            output_bytes = range_diff_output.len(),
+            output_lines = range_diff_output.lines().count(),
+            output = %range_diff_log,
+            mapping_count = mappings.len(),
+            mappings = ?mappings,
+            decision = if mappings.is_empty() { "empty_mapping" } else { "mapped" },
+            "rewrite range-diff mappings"
+        );
+    }
 
     Ok(mappings)
 }

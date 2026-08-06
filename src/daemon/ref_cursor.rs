@@ -138,23 +138,62 @@ impl RefCursor {
         cmd: &mut NormalizedCommand,
         state: &FamilyState,
     ) -> Result<HashMap<String, String>, GitAiError> {
+        let diagnostics_enabled = crate::daemon::rewrite_diagnostics_enabled();
+        let cursor_before = diagnostics_enabled.then(|| self.offsets.clone());
         cmd.ref_changes.clear();
-        self.initialize_from_command_reflog_start_offsets(cmd)?;
+        if let Err(error) = self.initialize_from_command_reflog_start_offsets(cmd) {
+            self.log_enrichment_result(
+                cmd,
+                cursor_before.as_ref(),
+                "initialization_failed",
+                Some(&error),
+            );
+            return Err(error);
+        }
         let command_start_refs =
-            refs_at_reflog_start_offsets(&self.family, &cmd.reflog_start_offsets)?;
+            match refs_at_reflog_start_offsets(&self.family, &cmd.reflog_start_offsets) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    self.log_enrichment_result(
+                        cmd,
+                        cursor_before.as_ref(),
+                        "start_ref_snapshot_failed",
+                        Some(&error),
+                    );
+                    return Err(error);
+                }
+            };
 
         if cmd.exit_code != 0 && !command_can_move_refs_on_nonzero(cmd.primary_command.as_deref()) {
+            self.log_enrichment_result(
+                cmd,
+                cursor_before.as_ref(),
+                "nonzero_exit_cannot_move_refs",
+                None,
+            );
             return Ok(command_start_refs);
         }
 
         let Some(primary) = cmd.primary_command.as_deref() else {
+            self.log_enrichment_result(
+                cmd,
+                cursor_before.as_ref(),
+                "missing_primary_command",
+                None,
+            );
             return Ok(command_start_refs);
         };
         if !command_uses_ref_cursor(primary) {
+            self.log_enrichment_result(
+                cmd,
+                cursor_before.as_ref(),
+                "command_does_not_use_ref_cursor",
+                None,
+            );
             return Ok(command_start_refs);
         }
 
-        match primary {
+        let enrichment = match primary {
             "commit" => self.enrich_commit(cmd, state),
             "revert" => self.enrich_revert(cmd, state),
             "reset" => {
@@ -199,12 +238,50 @@ impl RefCursor {
             "stash" => self.enrich_stash(cmd, state),
             "update-ref" => self.enrich_update_ref(cmd, state),
             _ => Ok(()),
-        }?;
+        };
+        if let Err(error) = enrichment {
+            self.log_enrichment_result(
+                cmd,
+                cursor_before.as_ref(),
+                "enrichment_failed",
+                Some(&error),
+            );
+            return Err(error);
+        }
 
         if !cmd.ref_changes.is_empty() {
             cmd.confidence = Confidence::High;
         }
+        self.log_enrichment_result(cmd, cursor_before.as_ref(), "complete", None);
         Ok(command_start_refs)
+    }
+
+    fn log_enrichment_result(
+        &self,
+        cmd: &NormalizedCommand,
+        cursor_before: Option<&HashMap<String, u64>>,
+        decision: &str,
+        error: Option<&GitAiError>,
+    ) {
+        if !crate::daemon::rewrite_diagnostics_enabled() {
+            return;
+        }
+        tracing::info!(
+            event = "ref_cursor.enrich",
+            root_sid = %cmd.root_sid,
+            family = %self.family.0,
+            primary = ?cmd.primary_command,
+            exit_code = cmd.exit_code,
+            decision,
+            error = error.map(ToString::to_string),
+            cursor_before = ?cursor_before,
+            ingress_hints = ?cmd.reflog_start_offsets,
+            command_start_hints = ?self.command_start_hints,
+            cursor_after = ?self.offsets,
+            ref_changes = ?cmd.ref_changes,
+            confidence = ?cmd.confidence,
+            "ref cursor enrichment complete"
+        );
     }
 
     fn initialize_from_command_reflog_start_offsets(
@@ -1770,15 +1847,37 @@ impl RefCursor {
     ) -> Result<Option<CursorEntry>, GitAiError> {
         let start = self.reflog_start_offset(&key, path)?;
         let entries = read_reflog_entries(key.clone(), path, reference, start)?;
-        let mut candidates = entries.into_iter().filter(|entry| {
+        let candidates = entries.into_iter().filter(|entry| {
             !self.entry_consumed(entry)
                 && expected.matches(entry)
                 && message_matches(&entry.message, message_prefixes)
         });
-        if use_hint {
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            let candidates = candidates.collect::<Vec<_>>();
+            let selected = if use_hint {
+                self.select_candidate_with_hint(&key, candidates.clone())
+            } else {
+                candidates.first().cloned()
+            };
+            tracing::info!(
+                event = "ref_cursor.candidates",
+                family = %self.family.0,
+                reference,
+                key,
+                cursor_start = ?start,
+                ingress_hint = ?self.command_start_hints.get(&key),
+                use_hint,
+                message_prefixes = ?message_prefixes,
+                candidate_count = candidates.len(),
+                candidates = ?candidates,
+                selected = ?selected,
+                "ref cursor candidate selection"
+            );
+            Ok(selected)
+        } else if use_hint {
             Ok(self.select_candidate_with_hint(&key, candidates))
         } else {
-            Ok(candidates.next())
+            Ok(candidates.into_iter().next())
         }
     }
 

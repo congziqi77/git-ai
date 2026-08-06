@@ -741,6 +741,25 @@ impl<B: GitBackend> TraceNormalizer<B> {
             confidence,
         };
 
+        if crate::daemon::rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "trace.normalized",
+                root_sid = %normalized.root_sid,
+                family = ?normalized.family_key,
+                worktree = ?normalized.worktree,
+                primary = ?normalized.primary_command,
+                invoked_command = ?normalized.invoked_command,
+                invoked_arg_count = normalized.invoked_args.len(),
+                observed_child_count = normalized.observed_child_commands.len(),
+                exit_code = normalized.exit_code,
+                started_at_ns = %normalized.started_at_ns,
+                finished_at_ns = %normalized.finished_at_ns,
+                command_duration_ns = %normalized.finished_at_ns.saturating_sub(normalized.started_at_ns),
+                reflog_start_offsets = ?normalized.reflog_start_offsets,
+                "trace normalized command"
+            );
+        }
+
         trace_debug_lifecycle(&format!(
             "trace normalizer finalized sid={} primary={:?} pending_after_finalize={}",
             root_sid,
