@@ -190,6 +190,9 @@ impl RepoStorage {
     /// If the destination already has checkpoints, preserve the old-base entries first and
     /// append the destination entries after them.
     pub fn rename_working_log(&self, old_sha: &str, new_sha: &str) -> Result<(), GitAiError> {
+        if old_sha == new_sha {
+            return Ok(());
+        }
         let old_dir = self.working_logs.join(old_sha);
         let new_dir = self.working_logs.join(new_sha);
         if !old_dir.exists() {
@@ -461,23 +464,30 @@ impl PersistedWorkingLog {
 
     /* append checkpoint */
     pub fn append_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), GitAiError> {
-        crate::wltrace::wltrace("working_log.append_checkpoint", &self.dir, String::new);
-        // Read existing checkpoints
         let mut checkpoints = self.read_all_checkpoints().unwrap_or_default();
+        self.append_checkpoint_to(&mut checkpoints, checkpoint.clone())
+    }
 
-        // Create a copy, potentially without transcript to reduce storage size.
-        //
-        // Tools that DON'T support refetch (transcript must be kept):
-        // - "mock_ai" - test preset, transcript not stored externally
-        // - Any other agent-v1 custom tools (detected by lack of tool-specific metadata)
-        checkpoints.push(checkpoint.clone());
+    /// Append to a checkpoint collection that the caller has already loaded.
+    ///
+    /// Checkpoint execution needs the prior collection to calculate attribution.
+    /// Reusing it here avoids deserializing the entire working log a second time
+    /// and avoids cloning the new checkpoint's attribution payload.
+    pub fn append_checkpoint_to(
+        &self,
+        checkpoints: &mut Vec<Checkpoint>,
+        checkpoint: Checkpoint,
+    ) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace("working_log.append_checkpoint", &self.dir, String::new);
+
+        checkpoints.push(checkpoint);
 
         // Prune char-level attributions from older checkpoints for the same files
         // Only the most recent checkpoint per file needs char-level precision
-        self.prune_old_char_attributions(&mut checkpoints);
+        self.prune_old_char_attributions(checkpoints);
 
         // Write all checkpoints back
-        self.write_all_checkpoints(&checkpoints)
+        self.write_all_checkpoints(checkpoints)
     }
 
     pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, GitAiError> {
@@ -501,6 +511,7 @@ impl PersistedWorkingLog {
         &self,
         max_bytes: u64,
     ) -> Result<Vec<Checkpoint>, GitAiError> {
+        crate::wltrace::wltrace("working_log.read_checkpoints", &self.dir, String::new);
         let checkpoints_file = self.checkpoints_file();
 
         if !checkpoints_file.exists() {
@@ -981,5 +992,36 @@ mod tests {
         // Both sides' unique entries survive.
         assert!(merged.files.contains_key("old_only.txt"));
         assert!(merged.files.contains_key("new_only.txt"));
+    }
+
+    #[test]
+    fn test_rename_working_log_to_same_sha_preserves_log() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let ai_dir = tmp.path().join("ai");
+        let storage = RepoStorage::for_repo_path(&ai_dir, &workdir).unwrap();
+        let sha = "1111111111111111111111111111111111111111";
+
+        let log = storage.working_log_for_base_commit(sha).unwrap();
+        let mut initial = InitialAttributions::default();
+        initial
+            .files
+            .insert("pending.txt".into(), attr("ai_PENDING"));
+        log.write_initial(initial).unwrap();
+
+        storage.rename_working_log(sha, sha).unwrap();
+
+        let preserved = storage
+            .working_log_for_base_commit(sha)
+            .unwrap()
+            .read_initial_attributions();
+        assert_eq!(
+            preserved
+                .files
+                .get("pending.txt")
+                .map(|attrs| attrs[0].author_id.as_str()),
+            Some("ai_PENDING")
+        );
     }
 }

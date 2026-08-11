@@ -462,6 +462,7 @@ struct DaemonGuard {
     control_socket_path: PathBuf,
     trace_socket_path: PathBuf,
     repo_working_dir: String,
+    stderr_log_path: PathBuf,
 }
 
 impl DaemonGuard {
@@ -473,6 +474,14 @@ impl DaemonGuard {
         let daemon_home = repo.daemon_home_path();
         let control_socket_path = daemon_control_socket_path(repo);
         let trace_socket_path = daemon_trace_socket_path(repo);
+        let stderr_log_path = daemon_home.join("daemon-guard.stderr.log");
+        fs::create_dir_all(&daemon_home).expect("failed to create daemon test home");
+        let stderr_log = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stderr_log_path)
+            .expect("failed to create daemon stderr log");
         let mut command = Command::new(get_binary_path());
         command
             .arg("bg")
@@ -481,7 +490,11 @@ impl DaemonGuard {
             .env("GIT_AI_TEST_DB_PATH", repo.test_db_path())
             .env("GITAI_TEST_DB_PATH", repo.test_db_path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(
+                stderr_log
+                    .try_clone()
+                    .expect("failed to clone daemon stderr log"),
+            );
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -504,6 +517,7 @@ impl DaemonGuard {
                 control_socket_path: control_socket_path.clone(),
                 trace_socket_path: trace_socket_path.clone(),
                 repo_working_dir: repo_workdir_string(repo),
+                stderr_log_path: stderr_log_path.clone(),
             };
             match daemon.wait_until_ready() {
                 Ok(()) => return daemon,
@@ -591,6 +605,10 @@ impl DaemonGuard {
 
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    fn stderr_contents(&self) -> String {
+        fs::read_to_string(&self.stderr_log_path).unwrap_or_default()
     }
 }
 
@@ -1792,9 +1810,7 @@ fn wltrace_captures_daemon_working_log_ops_when_enabled() {
     fs::write(&file_path, "AI content\n").unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "traced.txt"])
         .unwrap();
-    repo.current_working_logs()
-        .read_all_checkpoints()
-        .expect("checkpoint should be readable");
+    repo.sync_daemon();
 
     let trace = fs::read_to_string(trace_file.path()).expect("read wltrace output");
     for op in [
@@ -1806,6 +1822,14 @@ fn wltrace_captures_daemon_working_log_ops_when_enabled() {
     ] {
         assert!(trace.contains(op), "wltrace output missing {op}:\n{trace}");
     }
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("op=working_log.read_checkpoints "))
+            .count(),
+        1,
+        "one checkpoint must deserialize the working log only once:\n{trace}"
+    );
 }
 
 #[test]
@@ -2401,6 +2425,83 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_sync_control_requ
         "sync control request should succeed: {:?}",
         response
     );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn daemon_sync_family_ignores_open_mutating_root_from_other_family() {
+    let first_repo = TestRepo::new_dedicated_daemon();
+    let second_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let trace_socket = daemon_trace_socket_path(&first_repo);
+    let control_socket = daemon_control_socket_path(&first_repo);
+    let first_worktree = repo_workdir_string(&first_repo);
+    let second_worktree = repo_workdir_string(&second_repo);
+    let first_git_dir = first_repo.path().join(".git").to_string_lossy().to_string();
+    let sid = "cross-family-open-mutating-root";
+
+    let mut open_trace =
+        open_local_socket_stream_with_timeout(&trace_socket, DAEMON_TEST_PROBE_TIMEOUT)
+            .expect("failed to connect to trace socket");
+    write_trace_frames_to_stream(
+        &mut open_trace,
+        &[
+            json!({
+                "event": "start",
+                "sid": sid,
+                "argv": ["git", "commit", "-m", "long-running commit"],
+                "time_ns": 1_000u64,
+            }),
+            json!({
+                "event": "def_repo",
+                "sid": sid,
+                "worktree": first_worktree,
+                "repo": first_git_dir,
+                "time_ns": 1_001u64,
+            }),
+        ],
+    );
+    thread::sleep(Duration::from_millis(150));
+
+    let own_control_socket = control_socket.clone();
+    let own_worktree = repo_workdir_string(&first_repo);
+    let (own_sync_tx, own_sync_rx) = mpsc::channel();
+    let own_sync = thread::spawn(move || {
+        let response = send_control_request_with_timeout(
+            &own_control_socket,
+            &ControlRequest::SyncFamily {
+                repo_working_dir: own_worktree,
+            },
+            Duration::from_secs(5),
+        );
+        let _ = own_sync_tx.send(response);
+    });
+    assert!(
+        own_sync_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "sync.family must still wait for an open mutating root in its own family"
+    );
+
+    let unrelated_sync = send_control_request_with_timeout(
+        &control_socket,
+        &ControlRequest::SyncFamily {
+            repo_working_dir: second_worktree,
+        },
+        Duration::from_secs(1),
+    )
+    .expect("an open mutating root from another family must not block sync.family");
+    assert!(
+        unrelated_sync.ok,
+        "unrelated sync.family request failed: {unrelated_sync:?}"
+    );
+
+    write_trace_frames_to_stream(&mut open_trace, &[trace_atexit_frame(sid, 0, 1_002)]);
+    let own_sync_response = own_sync_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("own-family sync should complete after the trace root closes")
+        .expect("own-family sync request failed");
+    assert!(own_sync_response.ok, "own-family sync failed");
+    own_sync.join().unwrap();
 }
 
 #[test]
@@ -5243,6 +5344,153 @@ fn daemon_memory_does_not_grow_unbounded_under_trace_load() {
     }
 
     guard.shutdown();
+}
+
+#[test]
+#[serial]
+fn daemon_memory_threshold_logs_uploads_and_aborts_without_draining() {
+    let mut mock_api = MockApiServer::start();
+    let mut repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    repo.patch_git_ai_config(|patch| {
+        patch.daemon_memory_limit_mb = Some(1024);
+    });
+
+    let file_path = repo.path().join("memory-emergency.txt");
+    fs::write(&file_path, "Untracked base\n").unwrap();
+    repo.git_og(&["add", "memory-emergency.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Initial commit"]).unwrap();
+
+    let mut samples = vec!["100"; 40];
+    samples.push("900");
+    let sample_sequence = samples.join(",");
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            (
+                "GIT_AI_TEST_DAEMON_PEAK_RSS_MB_SEQUENCE",
+                sample_sequence.as_str(),
+            ),
+            ("GIT_AI_TEST_DAEMON_MEMORY_POLL_MS", "25"),
+            (
+                "GIT_AI_TEST_DELAY_CHECKPOINT_ADMISSION",
+                "memory-limit-checkpoint=10000",
+            ),
+            ("GIT_AI_API_BASE_URL", mock_api.base_url()),
+            ("GIT_AI_API_KEY", "test-api-key"),
+        ],
+    );
+    let head = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    fs::write(&file_path, "Untracked base\nAI before emergency\n").unwrap();
+    let request = CheckpointRequest {
+        trace_id: "memory-limit-checkpoint".to_string(),
+        checkpoint_kind: CheckpointKind::AiAgent,
+        agent_id: Some(AgentId {
+            tool: "mock_ai".to_string(),
+            id: "memory-limit-session".to_string(),
+            model: "test".to_string(),
+        }),
+        files: vec![CheckpointFile {
+            path: PathBuf::from("memory-emergency.txt"),
+            content: Some("Untracked base\nAI before emergency\n".to_string()),
+            repo_work_dir: repo.path().to_path_buf(),
+            base_commit: BaseCommit::Sha(head),
+        }],
+        path_role: PreparedPathRole::Edited,
+        stream_source: None,
+        metadata: Default::default(),
+    };
+    let checkpoint_response = send_checkpoint_request_with_timeout(
+        &daemon.control_socket_path,
+        &request,
+        Duration::from_secs(1),
+    )
+    .expect("checkpoint should be acknowledged before emergency shutdown");
+    assert!(
+        checkpoint_response.ok,
+        "checkpoint should be accepted before emergency shutdown: {checkpoint_response:?}"
+    );
+    let started = std::time::Instant::now();
+    let status = daemon.child.wait().expect("wait for emergency daemon stop");
+    assert!(!status.success(), "85% threshold should abort the daemon");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "memory emergency shutdown waited for the delayed checkpoint"
+    );
+    let logs = daemon.stderr_contents();
+    assert!(
+        logs.contains("memory emergency threshold reached"),
+        "missing emergency memory diagnostic:\n{logs}"
+    );
+    let requests = mock_api.collect_requests();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request["path"] == "/worker/logs/upload")
+            .flat_map(|request| request["body"]["events"].as_array().into_iter().flatten())
+            .any(|event| event["message"] == "daemon memory emergency threshold reached"),
+        "emergency diagnostic was not uploaded before shutdown: {requests:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn daemon_memory_limit_below_startup_usage_aborts_without_restart_loop() {
+    let mut repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    repo.patch_git_ai_config(|patch| {
+        patch.daemon_memory_limit_mb = Some(1024);
+    });
+
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("GIT_AI_TEST_DAEMON_PEAK_RSS_MB_SEQUENCE", "1024"),
+            ("GIT_AI_TEST_DAEMON_MEMORY_POLL_MS", "250"),
+        ],
+    );
+    let status = daemon.child.wait().expect("wait for daemon stop");
+
+    assert!(!status.success(), "startup-over-limit should abort");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        send_control_request(&daemon.control_socket_path, &ControlRequest::Ping).is_err(),
+        "startup-over-limit daemon must not respawn"
+    );
+    let logs = daemon.stderr_contents();
+    assert!(
+        logs.contains("memory emergency threshold reached"),
+        "missing startup-limit diagnostic:\n{logs}"
+    );
+}
+
+#[test]
+#[serial]
+fn daemon_memory_hard_limit_aborts_without_restart() {
+    let mut repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    repo.patch_git_ai_config(|patch| {
+        patch.daemon_memory_limit_mb = Some(1024);
+    });
+
+    let mut daemon = DaemonGuard::start_with_env(
+        &repo,
+        &[
+            ("GIT_AI_TEST_DAEMON_PEAK_RSS_MB_SEQUENCE", "100,100,1024"),
+            ("GIT_AI_TEST_DAEMON_MEMORY_POLL_MS", "100"),
+        ],
+    );
+    let status = daemon.child.wait().expect("wait for daemon abort");
+
+    assert!(!status.success(), "hard memory limit must abort the daemon");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        send_control_request(&daemon.control_socket_path, &ControlRequest::Ping).is_err(),
+        "hard-aborted daemon must not respawn"
+    );
+    let logs = daemon.stderr_contents();
+    assert!(
+        logs.contains("memory emergency threshold reached"),
+        "missing hard-limit diagnostic:\n{logs}"
+    );
 }
 
 fn bg_command(repo: &TestRepo, subcommand: &str, extra_args: &[&str]) -> Output {

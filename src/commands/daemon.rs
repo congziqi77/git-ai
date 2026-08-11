@@ -180,6 +180,7 @@ fn handle_run(args: &[String]) -> Result<(), String> {
     if has_flag(args, "--mode") {
         return Err("--mode is no longer supported; daemon always runs in write mode".to_string());
     }
+    crate::tokio_runtime::configure_daemon_allocator()?;
     ensure_daemon_start_allowed()?;
     let config = daemon_config_from_env_or_default_paths()?;
     let runtime_dir = daemon_runtime_dir(&config)?;
@@ -190,10 +191,8 @@ fn handle_run(args: &[String]) -> Result<(), String> {
             e
         )
     })?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let runtime = crate::tokio_runtime::build_daemon_runtime()?;
+    crate::tokio_runtime::initialize();
     let exit_action = runtime
         .block_on(async move { crate::daemon::run_daemon(config).await })
         .map_err(|e| e.to_string())?;

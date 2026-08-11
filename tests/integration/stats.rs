@@ -563,10 +563,12 @@ fn test_stats_cli_empty_tree_range() {
     let mut file = repo.filename("history.txt");
     file.set_contents(crate::lines!["AI Line 1".ai()]);
     let _first = repo.stage_all_and_commit("Initial AI").unwrap();
+    file.assert_committed_lines(crate::lines!["AI Line 1".ai()]);
 
     // Second commit: human line
     file.set_contents(crate::lines!["AI Line 1".ai(), "Human Line 2".human()]);
     repo.stage_all_and_commit("Human adds line").unwrap();
+    file.assert_committed_lines(crate::lines!["AI Line 1".ai(), "Human Line 2".human(),]);
 
     // Git's empty tree OID
     let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
