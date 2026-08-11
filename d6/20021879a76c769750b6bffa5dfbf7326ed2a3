@@ -1,0 +1,118 @@
+flake.nix
+  s_00ef4c450f0d4c::t_73f9f4cfa988e1 39
+tests/integration/range_authorship_unit.rs
+  s_00ef4c450f0d4c::t_a009dc34fae3be 1,227,453,455,969-1290
+  s_00ef4c450f0d4c::t_13e2b7bd0aa43d 1291
+Cargo.toml
+  s_00ef4c450f0d4c::t_73f9f4cfa988e1 3
+src/authorship/range_authorship.rs
+  s_00ef4c450f0d4c::t_a009dc34fae3be 10-11,428-434,441
+src/authorship/diff_ai_accepted.rs
+  s_00ef4c450f0d4c::t_a009dc34fae3be 15,32,34-35,39,53,69,81,85,102,204,215
+.github/workflows/codeql.yml
+  s_00ef4c450f0d4c::t_28b41a4523a6bf 76,109
+.github/workflows/intellij-build.yml
+  s_00ef4c450f0d4c::t_466f69bb77aa3e 50,103,163,170,197
+.github/workflows/intellij-ui-tests.yml
+  s_00ef4c450f0d4c::t_9f47f06d78b496 54
+.github/workflows/release-intellij-plugin.yml
+  s_00ef4c450f0d4c::t_91944f1bc05536 44
+AGENTS.md
+  s_00ef4c450f0d4c::t_4373c591b18513 235
+README.md
+  s_00ef4c450f0d4c::t_1e9e40f0ad1685 194
+agent-support/intellij/build.gradle.kts
+  s_00ef4c450f0d4c::t_75689331824174 12
+agent-support/intellij/gradle/libs.versions.toml
+  s_00ef4c450f0d4c::t_c233700ef6c186 11
+agent-support/opencode/package-lock.json
+  s_00ef4c450f0d4c::t_ed9f2108c68d82 12,110-112,116,138-140
+agent-support/opencode/package.json
+  s_00ef4c450f0d4c::t_3aeb87069e931f 11
+agent-support/vscode/package-lock.json
+  s_00ef4c450f0d4c::t_e50860e42b0ca7 11,803-805,808,812-814,3172-3174,4542-4544,5192-5194,5197,6379-6381
+agent-support/vscode/package.json
+  s_00ef4c450f0d4c::t_f4f9dcda21bb4c 101
+docs/rewrite-ops-spec.md
+  s_00ef4c450f0d4c::t_7462565937c6da 75-86
+docs/rewrite-simplification-spec.md
+  s_00ef4c450f0d4c::t_7f379bcc58158d 238
+src/authorship/attribution_recovery.rs
+  s_00ef4c450f0d4c::t_61f538f48323cd 363-367,369,371,403-405,1523,1531
+src/authorship/rewrite.rs
+  s_00ef4c450f0d4c::t_9b1de03d296061 1057,1059-1060
+src/bin/git-ai-test-git-shim.rs
+  s_00ef4c450f0d4c::t_60e845b8b9b174 100-129,178,204
+src/commands/checkpoint_agent/presets/codex.rs
+  s_00ef4c450f0d4c::t_44c400e17907a4 13,118-130,281-311
+src/commands/checkpoint_agent/presets/github_copilot/ide.rs
+  s_00ef4c450f0d4c::t_1a9ba5df573587 11,107-109,217-219,473-479,483,495,595,637
+src/commands/config.rs
+  s_00ef4c450f0d4c::t_5a00d489cbfd10 5,125,160,211,213,229-231,399-405,545-548,886-902,1263-1269
+src/commands/daemon.rs
+  s_00ef4c450f0d4c::t_1a1694985134d6 183,194-195
+src/config.rs
+  s_00ef4c450f0d4c::t_066404f24ba386 24-25,192,280-281,319-320,349-350,672-676,1228-1232,1262,1296,1300-1313,1687-1689,1769-1771,1816,2062,2211
+src/daemon.rs
+  s_00ef4c450f0d4c::t_ad7c5b518a6cf2 66,1055-1060,2698-2703,2746,3812-3830,4398-4423,5065-5071,5092,5395-5441,5466,5473-5474,5476-5478,5480-5482,5484,5492,5497-5498,5508-5513,5588-5593,5707,5907,6034-6043,6096-6110,6243-6254,6310-6311,6344-6347,6411,6485-6489,6752-6753,8608-8612,10092-10159
+src/daemon/checkpoint.rs
+  s_00ef4c450f0d4c::t_d08ad03c7537fe 19-20,23-28,54-55,60-127,129,131-137,140-141,143-152,381,385-386,429,434-436,459,490,498,526,681-688,1239-1308
+src/daemon/memory_watchdog.rs
+  s_00ef4c450f0d4c::t_59244507ed63da 1-350
+src/daemon/telemetry_worker.rs
+  s_00ef4c450f0d4c::t_3ee7c906110288 37,443,943-946,1068-1119,2270-2308
+src/feature_flags.rs
+  s_00ef4c450f0d4c::t_d6938455a51f45 81,138,149,160-190,270,281,294,304
+src/git/repo_storage.rs
+  s_00ef4c450f0d4c::t_f6867b2ba61f6f 193-195,468-469,471-483,487,490,514,996-1026
+src/streams/model_extraction.rs
+  s_00ef4c450f0d4c::t_ddd5c41d143b23 1,4-5,7,9-18,29,58-78,81-85,90,94,97,101,108-109,113-123,128-239,264-399,401-424,426,428-432,435-688,691-813,871-872,946-947,1035-1051,1169-1423,1640,1649-1915
+src/tokio_runtime.rs
+  s_00ef4c450f0d4c::t_8300e54985af7f 2,6-57,59-61,64-95,97-101,130-216
+tests/async_mode.rs
+  s_00ef4c450f0d4c::t_1249b59413731f 507-509,511-522,645,673
+tests/daemon_mode.rs
+  s_00ef4c450f0d4c::t_ed0f023592bdc5 465,477-484,493-497,520,609-612,1813,1825-1832,2430-2506,5349-5495
+tests/integration/bash_attribution.rs
+  s_00ef4c450f0d4c::t_5e17f96a34f98d 256-355
+tests/integration/codex.rs
+  s_00ef4c450f0d4c::t_c6f3580edc1f2d 883-961
+tests/integration/config_cli_coverage.rs
+  s_00ef4c450f0d4c::t_77488b98bebd5d 115-147,273,340
+tests/integration/daemon_runtime_memory.rs
+  s_00ef4c450f0d4c::t_28376bad5a90a1 1-134
+tests/integration/github_copilot_integration.rs
+  s_00ef4c450f0d4c::t_760ebb6cda9346 4,279-517,525-527
+tests/integration/lite_mode.rs
+  s_00ef4c450f0d4c::t_db89bbcdddfdaa 1-742
+tests/integration/main.rs
+  s_00ef4c450f0d4c::t_c2d270adc45db7 55,91
+tests/integration/performance.rs
+  s_00ef4c450f0d4c::t_6c4f481afa5719 18
+tests/integration/pull_rebase_ff.rs
+  s_00ef4c450f0d4c::t_3fc6175b49b791 6,104-110,547-597
+tests/integration/repos/test_file.rs
+  s_00ef4c450f0d4c::t_65bb1cc665529e 347-360
+tests/integration/repos/test_repo.rs
+  s_00ef4c450f0d4c::t_0124d01dd0ac44 1197-1203,1276-1281,1833-1839,1843,1861-1869
+tests/integration/stats.rs
+  s_00ef4c450f0d4c::t_be3d1e03587803 566,571
+Cargo.lock
+  s_00ef4c450f0d4c::t_197c2ddcf4a1f0 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22-ep",
+  "base_commit_sha": "d620021879a76c769750b6bffa5dfbf7326ed2a3",
+  "prompts": {},
+  "sessions": {
+    "s_00ef4c450f0d4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fee64-992b-7981-8d6b-43ed5d910c31",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
