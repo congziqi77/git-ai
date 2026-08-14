@@ -47,7 +47,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
@@ -75,6 +75,16 @@ pub mod telemetry_worker;
 pub mod test_sync;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
+
+pub(crate) fn rewrite_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GIT_AI_REWRITE_DIAGNOSTICS")
+            .as_deref()
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
@@ -5353,6 +5363,21 @@ impl ActorDaemonCoordinator {
             None
         };
 
+        if rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.detection_input",
+                root_sid = %cmd.root_sid,
+                primary = ?cmd.primary_command,
+                worktree = %worktree.display(),
+                exit_code = cmd.exit_code,
+                ref_changes = ?cmd.ref_changes,
+                pending_original_head = ?pending_original_head
+                    .as_ref()
+                    .map(|pending| pending.original_head.as_str()),
+                "rewrite detection input"
+            );
+        }
+
         // Collect branch ref changes (skip notes, tags, etc.)
         let mut branch_changes: Vec<_> = cmd
             .ref_changes
@@ -5379,6 +5404,15 @@ impl ActorDaemonCoordinator {
         }
 
         if branch_changes.is_empty() && pending_original_head.is_none() {
+            if rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.decision",
+                    root_sid = %cmd.root_sid,
+                    primary = ?cmd.primary_command,
+                    decision = "skipped_no_valid_ref_changes",
+                    "rewrite detection skipped"
+                );
+            }
             return Ok(());
         }
 

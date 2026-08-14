@@ -459,13 +459,74 @@ pub(crate) fn handle_non_fast_forward_rewrite_with_operation(
     onto: Option<&str>,
     operation: RewriteMetricOperation,
 ) -> Result<RewriteOutcome, GitAiError> {
-    let mappings = derive_mappings_from_range_diff(repo, old_tip, new_tip, onto)?;
+    let mappings = match derive_mappings_from_range_diff(repo, old_tip, new_tip, onto) {
+        Ok(mappings) => mappings,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.mapping_result",
+                    ?operation,
+                    old_tip,
+                    new_tip,
+                    onto,
+                    decision = "failed",
+                    error = %error,
+                    "rewrite range-diff mappings failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        let mapping_sample = mappings.iter().take(16).collect::<Vec<_>>();
+        tracing::info!(
+            event = "rewrite.mapping_result",
+            ?operation,
+            old_tip,
+            new_tip,
+            onto,
+            mapping_count = mappings.len(),
+            mapping_sample = ?mapping_sample,
+            decision = if mappings.is_empty() { "empty_mapping" } else { "mapped" },
+            "rewrite range-diff mappings"
+        );
+    }
     if mappings.is_empty() {
         return Ok(RewriteOutcome::empty());
     }
     let source_shas: Vec<String> = mappings.iter().map(|(source, _)| source.clone()).collect();
     crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, &source_shas);
-    let shifted_notes = shift_authorship_notes_merging_existing_with_notes(repo, &mappings)?;
+    let shifted_notes = match shift_authorship_notes_merging_existing_with_notes(repo, &mappings) {
+        Ok(notes) => notes,
+        Err(error) => {
+            if crate::daemon::rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.notes_result",
+                    ?operation,
+                    mapping_count = mappings.len(),
+                    decision = "failed",
+                    error = %error,
+                    "rewrite notes migration failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+    if crate::daemon::rewrite_diagnostics_enabled() {
+        let written_target_sample = shifted_notes
+            .iter()
+            .map(|(sha, _)| sha)
+            .take(16)
+            .collect::<Vec<_>>();
+        tracing::info!(
+            event = "rewrite.notes_result",
+            ?operation,
+            mapping_count = mappings.len(),
+            written_note_count = shifted_notes.len(),
+            written_target_sample = ?written_target_sample,
+            "rewrite notes migration complete"
+        );
+    }
     if !rewrite_metrics_enabled() {
         return Ok(RewriteOutcome::empty());
     }
