@@ -295,7 +295,11 @@ fn determine_action(force: bool, release: &ChannelRelease, current_version: &str
         return UpgradeAction::ForceReinstall;
     }
 
-    if release.semver == current_version {
+    if release.semver == current_version
+        || current_version
+            .strip_suffix("-ep")
+            .is_some_and(|version| version == release.semver)
+    {
         UpgradeAction::AlreadyLatest
     } else if is_newer_version(&release.semver, current_version) {
         UpgradeAction::UpgradeAvailable
@@ -1034,7 +1038,7 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
         |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse::<u32>().ok()).collect() };
 
     let latest_parts = parse_version(latest);
-    let current_parts = parse_version(current);
+    let current_parts = parse_version(current.strip_suffix("-ep").unwrap_or(current));
 
     for i in 0..latest_parts.len().max(current_parts.len()) {
         let latest_part = latest_parts.get(i).copied().unwrap_or(0);
@@ -1116,6 +1120,11 @@ mod tests {
         assert!(is_newer_version("1.10.0", "1.9.0"));
         assert!(is_newer_version("1.0.100", "1.0.99"));
         assert!(is_newer_version("100.200.300", "100.200.299"));
+
+        assert!(!is_newer_version("1.6.20", "1.6.20-ep"));
+        assert!(is_newer_version("1.6.21", "1.6.20-ep"));
+        assert!(!is_newer_version("1.6.19", "1.6.20-ep"));
+        assert!(is_newer_version("1.6.20", "1.6.20-rc.1"));
     }
 
     #[test]
@@ -1444,6 +1453,19 @@ mod tests {
         };
         let action = determine_action(false, &release, "1.0.0");
         assert_eq!(action, UpgradeAction::AlreadyLatest);
+    }
+
+    #[test]
+    fn test_determine_action_ep_build_is_current_for_same_release() {
+        let release = ChannelRelease {
+            tag: "v1.6.20-ep".to_string(),
+            semver: "1.6.20".to_string(),
+            checksum: "abc".to_string(),
+        };
+        assert_eq!(
+            determine_action(false, &release, "1.6.20-ep"),
+            UpgradeAction::AlreadyLatest
+        );
     }
 
     #[test]

@@ -16,8 +16,16 @@ use crate::git::repository::Repository;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, not(feature = "test-support")))]
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(any(test, not(feature = "test-support")))]
+use std::sync::Mutex;
+#[cfg(not(any(test, feature = "test-support")))]
+use std::sync::OnceLock;
+#[cfg(any(test, not(feature = "test-support")))]
+use std::time::Duration;
 use std::time::Instant;
 #[cfg(not(any(test, feature = "test-support")))]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,28 +51,105 @@ use crate::authorship::working_log::AgentId;
 
 #[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
 const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
+#[cfg(any(test, not(feature = "test-support")))]
+const AGENT_USAGE_LIMITER_CAPACITY: usize = 10_000;
 
 #[cfg(not(any(test, feature = "test-support")))]
 const KNOWN_HUMAN_MIN_SECS_AFTER_AI: u64 = 1;
 
+#[cfg(any(test, not(feature = "test-support")))]
+struct AgentUsageLimiter {
+    interval: Duration,
+    capacity: usize,
+    last_emitted: HashMap<String, Instant>,
+    expiry_order: VecDeque<(String, Instant)>,
+}
+
+#[cfg(any(test, not(feature = "test-support")))]
+impl AgentUsageLimiter {
+    fn new(interval: Duration, capacity: usize) -> Self {
+        Self {
+            interval,
+            capacity,
+            last_emitted: HashMap::with_capacity(capacity),
+            expiry_order: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn should_emit(&mut self, prompt_id: &str, now: Instant) -> bool {
+        self.expire_stale(now);
+
+        if self.last_emitted.contains_key(prompt_id) {
+            return false;
+        }
+        if self.capacity == 0 {
+            return true;
+        }
+
+        while self.last_emitted.len() >= self.capacity {
+            let Some((oldest_id, emitted_at)) = self.expiry_order.pop_front() else {
+                self.last_emitted.clear();
+                break;
+            };
+            if self.last_emitted.get(&oldest_id) == Some(&emitted_at) {
+                self.last_emitted.remove(&oldest_id);
+            }
+        }
+
+        let prompt_id = prompt_id.to_string();
+        self.last_emitted.insert(prompt_id.clone(), now);
+        self.expiry_order.push_back((prompt_id, now));
+        true
+    }
+
+    fn expire_stale(&mut self, now: Instant) {
+        while let Some((prompt_id, emitted_at)) = self.expiry_order.front() {
+            if now.saturating_duration_since(*emitted_at) < self.interval {
+                break;
+            }
+            if self.last_emitted.get(prompt_id) == Some(emitted_at) {
+                self.last_emitted.remove(prompt_id);
+            }
+            self.expiry_order.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.last_emitted.len()
+    }
+
+    #[cfg(test)]
+    fn expiry_count(&self) -> usize {
+        self.expiry_order.len()
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+static AGENT_USAGE_LIMITER: OnceLock<Mutex<AgentUsageLimiter>> = OnceLock::new();
+
+#[cfg(any(test, not(feature = "test-support")))]
+fn should_emit_with_limiter(
+    limiter: &Mutex<AgentUsageLimiter>,
+    prompt_id: &str,
+    now: Instant,
+) -> bool {
+    let Ok(mut limiter) = limiter.lock() else {
+        return true;
+    };
+    limiter.should_emit(prompt_id, now)
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 fn should_emit_real_agent_usage(agent_id: &AgentId) -> bool {
     let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
-    let now_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let Ok(db) = crate::metrics::db::MetricsDatabase::global() else {
-        return true;
-    };
-    let Ok(mut db_lock) = db.lock() else {
-        return true;
-    };
-
-    db_lock
-        .should_emit_agent_usage(&prompt_id, now_ts, AGENT_USAGE_MIN_INTERVAL_SECS)
-        .unwrap_or(true)
+    let limiter = AGENT_USAGE_LIMITER.get_or_init(|| {
+        Mutex::new(AgentUsageLimiter::new(
+            Duration::from_secs(AGENT_USAGE_MIN_INTERVAL_SECS),
+            AGENT_USAGE_LIMITER_CAPACITY,
+        ))
+    });
+    should_emit_with_limiter(limiter, &prompt_id, Instant::now())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -293,15 +378,12 @@ fn execute_resolved_checkpoint(
         entries.len(),
         entries_start.elapsed()
     );
+    let entry_count = entries.len();
 
     if !entries.is_empty() {
         let checkpoint_create_start = Instant::now();
-        let mut checkpoint = Checkpoint::new(
-            kind,
-            combined_hash.clone(),
-            author.to_string(),
-            entries.clone(),
-        );
+        let mut checkpoint =
+            Checkpoint::new(kind, combined_hash.clone(), author.to_string(), entries);
         checkpoint.timestamp = (resolved.ts / 1000) as u64;
         checkpoint.line_stats = compute_line_stats(&file_stats)?;
         checkpoint.trace_id = Some(trace_id.clone());
@@ -344,12 +426,14 @@ fn execute_resolved_checkpoint(
         );
 
         let append_start = Instant::now();
-        working_log.append_checkpoint(&checkpoint)?;
+        working_log.append_checkpoint_to(&mut checkpoints, checkpoint)?;
         tracing::debug!(
             "[BENCHMARK] Appending checkpoint to working log took {:?}",
             append_start.elapsed()
         );
-        checkpoints.push(checkpoint.clone());
+        let checkpoint = checkpoints
+            .last()
+            .expect("the appended checkpoint must remain in the working log");
 
         let mut attrs =
             build_checkpoint_attrs(repo, &resolved.base_commit, checkpoint.agent_id.as_ref());
@@ -372,7 +456,7 @@ fn execute_resolved_checkpoint(
             .get("edit_kind")
             .map(|s| s.as_str());
 
-        for (entry, file_stat) in entries.iter().zip(file_stats.iter()) {
+        for (entry, file_stat) in checkpoint.entries.iter().zip(file_stats.iter()) {
             let mut values = crate::metrics::CheckpointValues::new()
                 .checkpoint_ts(checkpoint.timestamp)
                 .kind(checkpoint.kind.to_str().to_string())
@@ -403,7 +487,7 @@ fn execute_resolved_checkpoint(
         None
     };
 
-    let label = if entries.len() > 1 {
+    let label = if entry_count > 1 {
         "checkpoint"
     } else {
         "commit"
@@ -411,7 +495,7 @@ fn execute_resolved_checkpoint(
 
     if !quiet {
         let log_author = agent_tool.unwrap_or(author);
-        let files_with_entries = entries.len();
+        let files_with_entries = entry_count;
         let total_uncommitted_files = resolved.files.len();
 
         if files_with_entries == total_uncommitted_files {
@@ -439,7 +523,7 @@ fn execute_resolved_checkpoint(
         "[BENCHMARK] Total checkpoint run took {:?}",
         checkpoint_start.elapsed()
     );
-    Ok((entries.len(), resolved.files.len(), checkpoints.len()))
+    Ok((entry_count, resolved.files.len(), checkpoints.len()))
 }
 
 fn save_current_file_states(
@@ -594,6 +678,14 @@ fn get_checkpoint_entry_for_file(
     parent_note_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     ts: u128,
 ) -> Result<Option<(WorkingLogEntry, FileLineStats)>, GitAiError> {
+    // Deterministic blocking work for the TestRepo throughput guard; release builds omit it.
+    #[cfg(feature = "test-support")]
+    if let Some(delay_millis) = std::env::var_os("GIT_AI_TEST_CHECKPOINT_FILE_DELAY_MS")
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_millis));
+    }
+
     let file_start = Instant::now();
     let initial_attrs_for_file = initial_attributions
         .get(&file_path)
@@ -860,16 +952,15 @@ async fn get_checkpoint_entries(
     };
 
     // Get HEAD commit info for git operations
-    let head_commit = head_commit_override
-        .map(str::trim)
-        .filter(|sha| !sha.is_empty() && *sha != "initial")
-        .and_then(|sha| repo.find_commit(sha.to_string()).ok())
-        .or_else(|| {
-            repo.head()
-                .ok()
-                .and_then(|h| h.target().ok())
-                .and_then(|oid| repo.find_commit(oid).ok())
-        });
+    let head_commit = match head_commit_override.map(str::trim) {
+        Some("" | "initial") => None,
+        Some(sha) => repo.find_commit(sha.to_string()).ok(),
+        None => repo
+            .head()
+            .ok()
+            .and_then(|h| h.target().ok())
+            .and_then(|oid| repo.find_commit(oid).ok()),
+    };
     let head_tree_id = head_commit
         .as_ref()
         .and_then(|c| c.tree().ok())
@@ -1143,5 +1234,75 @@ mod tests {
 
         agent_id.tool = "claude".to_string();
         assert!(should_emit_agent_usage_with_throttle(&agent_id, |_| true));
+    }
+}
+
+#[cfg(test)]
+mod agent_usage_limiter_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn suppresses_until_the_interval_expires() {
+        let mut limiter = AgentUsageLimiter::new(Duration::from_secs(150), 10_000);
+        let start = Instant::now();
+
+        assert!(limiter.should_emit("session", start));
+        assert!(!limiter.should_emit("session", start + Duration::from_secs(149)));
+        assert!(limiter.should_emit("session", start + Duration::from_secs(150)));
+    }
+
+    #[test]
+    fn capacity_is_bounded_and_evicts_the_oldest_valid_entry() {
+        assert_eq!(AGENT_USAGE_LIMITER_CAPACITY, 10_000);
+        let mut limiter = AgentUsageLimiter::new(Duration::from_secs(150), 3);
+        let start = Instant::now();
+
+        assert!(limiter.should_emit("first", start));
+        assert!(limiter.should_emit("second", start + Duration::from_secs(1)));
+        assert!(limiter.should_emit("third", start + Duration::from_secs(2)));
+        assert_eq!(limiter.entry_count(), 3);
+        assert_eq!(limiter.expiry_count(), 3);
+
+        assert!(limiter.should_emit("fourth", start + Duration::from_secs(3)));
+        assert_eq!(limiter.entry_count(), 3);
+        assert_eq!(limiter.expiry_count(), 3);
+        assert!(
+            limiter.should_emit("first", start + Duration::from_secs(4)),
+            "the oldest valid entry should have been evicted"
+        );
+        assert!(
+            !limiter.should_emit("third", start + Duration::from_secs(4)),
+            "newer entries should remain suppressed"
+        );
+    }
+
+    #[test]
+    fn stale_entries_are_expired_before_capacity_eviction() {
+        let mut limiter = AgentUsageLimiter::new(Duration::from_secs(10), 2);
+        let start = Instant::now();
+
+        assert!(limiter.should_emit("stale", start));
+        assert!(limiter.should_emit("live", start + Duration::from_secs(9)));
+        assert!(limiter.should_emit("new", start + Duration::from_secs(10)));
+
+        assert_eq!(limiter.entry_count(), 2);
+        assert_eq!(limiter.expiry_count(), 2);
+        assert!(!limiter.should_emit("live", start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn poisoned_lock_fails_open() {
+        let limiter = Mutex::new(AgentUsageLimiter::new(Duration::from_secs(150), 1));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = limiter.lock().unwrap();
+            panic!("poison limiter");
+        });
+
+        assert!(should_emit_with_limiter(
+            &limiter,
+            "session",
+            Instant::now()
+        ));
     }
 }

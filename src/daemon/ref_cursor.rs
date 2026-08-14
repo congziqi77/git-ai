@@ -196,7 +196,7 @@ impl RefCursor {
             "rebase" => self.consume_rebase_transition(cmd, state),
             "pull" => self.consume_pull_transition(cmd, state),
             "branch" => self.enrich_branch(cmd, state),
-            "stash" => self.enrich_stash(cmd, state),
+            "stash" => self.enrich_stash(cmd, state, &command_start_refs),
             "update-ref" => self.enrich_update_ref(cmd, state),
             _ => Ok(()),
         }?;
@@ -465,7 +465,48 @@ impl RefCursor {
             .head_expected_transition(cmd, state)
             .without_old_oid_constraint()
             .with_reflog_messages(commit_reflog_messages(&args, amend));
-        let Some(entry) = self.find_commit_head_entry(cmd, prefixes, expected)? else {
+        let entry = self.find_commit_head_entry(cmd, prefixes, expected.clone())?;
+        crate::wltrace::wltrace(
+            "ref_cursor.commit_entry",
+            cmd.worktree.as_deref().unwrap_or(Path::new("")),
+            || {
+                let cursor = cmd
+                    .worktree
+                    .as_deref()
+                    .and_then(git_dir_for_worktree)
+                    .map(|git_dir| head_key(&git_dir))
+                    .map(|key| {
+                        format!(
+                            "offset={:?} hint={:?} consumed={:?}",
+                            self.offsets.get(&key),
+                            self.command_start_hints.get(&key),
+                            self.consumed_offsets.get(&key),
+                        )
+                    })
+                    .unwrap_or_else(|| "no-key".to_string());
+                format!(
+                    "sid={} exit={} entry={} expected_new={:?} messages={:?} {cursor}",
+                    cmd.root_sid,
+                    cmd.exit_code,
+                    entry
+                        .as_ref()
+                        .map(|entry| format!(
+                            "{}->{}@{} msg={}",
+                            &entry.old[..8.min(entry.old.len())],
+                            &entry.new[..8.min(entry.new.len())],
+                            entry.start_offset,
+                            entry.message.chars().take(40).collect::<String>()
+                        ))
+                        .unwrap_or_else(|| "NONE".to_string()),
+                    expected
+                        .new_oid
+                        .as_ref()
+                        .map(|oid| &oid[..8.min(oid.len())]),
+                    expected.messages,
+                )
+            },
+        );
+        let Some(entry) = entry else {
             return Ok(());
         };
 
@@ -768,28 +809,21 @@ impl RefCursor {
         let spec = parse_update_ref_spec(&args)?;
         let Some(spec) = spec else {
             let mut changes = Vec::new();
-            if let Some(worktree) = cmd.worktree.as_deref() {
-                while let Some(entry) = self.find_head_entry_without_hint(
-                    Some(worktree),
-                    &[],
-                    ExpectedTransition::default(),
-                )? {
-                    self.consume_entry(&entry)?;
-                    changes.push(entry_to_ref_change(&entry));
-                }
+            if let Some(worktree) = cmd.worktree.as_deref()
+                && let Some(git_dir) = git_dir_for_worktree(worktree)
+            {
+                let key = head_key(&git_dir);
+                let path = git_dir.join("logs").join("HEAD");
+                changes.extend(self.consume_unstructured_update_ref_entries(&key, &path, "HEAD")?);
             }
             for reference in self.discover_common_refs()? {
                 if reference == "HEAD" || reference == "ORIG_HEAD" {
                     continue;
                 }
-                while let Some(entry) = self.find_common_ref_entry_without_hint(
-                    &reference,
-                    ExpectedTransition::default(),
-                    &[],
-                )? {
-                    self.consume_entry(&entry)?;
-                    changes.push(entry_to_ref_change(&entry));
-                }
+                let key = common_key(&reference);
+                let path = self.common_dir().join("logs").join(&reference);
+                changes
+                    .extend(self.consume_unstructured_update_ref_entries(&key, &path, &reference)?);
             }
             dedup_ref_changes(&mut changes);
             cmd.ref_changes = changes;
@@ -908,12 +942,18 @@ impl RefCursor {
         &mut self,
         cmd: &mut NormalizedCommand,
         state: &FamilyState,
+        command_start_refs: &HashMap<String, String>,
     ) -> Result<(), GitAiError> {
         let args = command_args(cmd);
         let stash_args = stash_command_args(&args);
         let kind = stash_args.first().map(String::as_str).unwrap_or("push");
 
         if matches!(kind, "apply" | "pop" | "drop" | "branch") {
+            if kind == "apply" {
+                // Only apply leaves the stash reflog intact, so its captured
+                // boundary still identifies the pre-command stack tip.
+                self.reconcile_stash_stack_top(command_start_refs.get("refs/stash"));
+            }
             let target = if kind == "branch" {
                 stash_args.get(2)
             } else {
@@ -1007,13 +1047,72 @@ impl RefCursor {
             return Ok(());
         }
 
+        // A failed control-mode rebase (--continue/--skip that stopped on a
+        // later conflict) may have produced no reflog entry of its own (e.g.
+        // an empty resolution git skipped). Because trace processing is
+        // asynchronous, the entry written by the EVENTUAL successful continue
+        // can already be in the reflog by the time this command is enriched;
+        // consuming it here starves that final continue of its evidence and
+        // loses the rebased-branch transition (and with it the migration of
+        // conflict-resolution working logs). Failed commands take no side
+        // effects, so their ref evidence is never used: consume nothing. Any
+        // entry this command did create is picked up by the successful
+        // continue's chain walk below.
+        if cmd.exit_code != 0 && summarize_rebase_args(&rebase_command_args(cmd)).is_control_mode {
+            return Ok(());
+        }
+
         let expected = self.head_expected_transition(cmd, state);
         let first = match self.find_rebase_start_entry(cmd, expected.clone())? {
             Some(entry) => Some(entry),
-            None => {
-                self.find_head_entry_without_hint(cmd.worktree.as_deref(), &["rebase"], expected)?
-            }
+            None => self.find_head_entry_without_hint(
+                cmd.worktree.as_deref(),
+                &["rebase"],
+                expected.clone(),
+            )?,
         };
+        crate::wltrace::wltrace(
+            "ref_cursor.rebase_first_entry",
+            cmd.worktree.as_deref().unwrap_or(std::path::Path::new("")),
+            || {
+                let cursor = cmd
+                    .worktree
+                    .as_deref()
+                    .and_then(git_dir_for_worktree)
+                    .map(|git_dir| head_key(&git_dir))
+                    .map(|key| {
+                        format!(
+                            "offset={:?} hint={:?}",
+                            self.offsets.get(&key),
+                            self.command_start_hints.get(&key)
+                        )
+                    })
+                    .unwrap_or_else(|| "no-key".to_string());
+                format!(
+                    "sid={} exit={} first={} expected_old={:?} expected_new={:?} {cursor}",
+                    cmd.root_sid,
+                    cmd.exit_code,
+                    first
+                        .as_ref()
+                        .map(|entry| format!(
+                            "{}->{} msg={}",
+                            &entry.old[..8.min(entry.old.len())],
+                            &entry.new[..8.min(entry.new.len())],
+                            entry.message.chars().take(40).collect::<String>()
+                        ))
+                        .unwrap_or_else(|| "NONE".to_string()),
+                    expected
+                        .old_oids
+                        .iter()
+                        .map(|oid| oid.chars().take(8).collect::<String>())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .new_oid
+                        .as_ref()
+                        .map(|oid| &oid[..8.min(oid.len())]),
+                )
+            },
+        );
         let Some(first) = first else {
             return Ok(());
         };
@@ -1062,15 +1161,10 @@ impl RefCursor {
         Ok(())
     }
 
-    // DEFERRED (code-review #14): this finder scans the reflog from
-    // reflog_start_offset and takes the first unconsumed entry matching the
-    // message/transition; it does not use the command's ingress hint (the
-    // reflog position at which THIS command began) to bound the search. In
-    // pathological histories with repeated identical rebase-start messages and
-    // transitions, it could match an earlier same-shaped entry than the one
-    // this command produced. Bounding by the per-command ingress offset would
-    // make the match exact; deferred as it needs the ingress offset threaded
-    // through to the finder.
+    // A prior untraced rebase can leave a complete matching span after the
+    // in-order cursor. Use the command-start hint to select this command's start
+    // marker while retaining the late-capture fallback shared by other cursor
+    // lookups.
     fn find_rebase_start_entry(
         &mut self,
         cmd: &NormalizedCommand,
@@ -1087,16 +1181,17 @@ impl RefCursor {
         let key = head_key(&git_dir);
         let path = git_dir.join("logs").join("HEAD");
         let start = self.reflog_start_offset(&key, &path)?;
-        let entries = read_reflog_entries(key, &path, "HEAD", start)?;
-
-        Ok(entries.into_iter().find(|entry| {
+        let entries = read_reflog_entries(key.clone(), &path, "HEAD", start)?;
+        let candidates = entries.into_iter().filter(|entry| {
             !self.entry_consumed(entry)
                 && rebase_reflog_action_is(&entry.message, "start")
                 && expected.matches_span_boundary(entry)
                 && target
                     .as_deref()
                     .is_none_or(|target| rebase_start_message_targets(&entry.message, target))
-        }))
+        });
+
+        Ok(self.select_candidate_with_hint(&key, candidates))
     }
 
     fn consume_failed_explicit_branch_rebase_start(
@@ -1164,6 +1259,21 @@ impl RefCursor {
         cmd: &mut NormalizedCommand,
         entry: CursorEntry,
     ) -> Result<(), GitAiError> {
+        crate::wltrace::wltrace(
+            "ref_cursor.consume_head_entry",
+            cmd.worktree.as_deref().unwrap_or(Path::new("")),
+            || {
+                format!(
+                    "sid={} cmd={} entry={}->{}@{} msg={}",
+                    cmd.root_sid,
+                    cmd.primary_command.as_deref().unwrap_or("unknown"),
+                    &entry.old[..8.min(entry.old.len())],
+                    &entry.new[..8.min(entry.new.len())],
+                    entry.start_offset,
+                    entry.message.chars().take(40).collect::<String>(),
+                )
+            },
+        );
         self.consume_entry(&entry)?;
         let old = entry.old.clone();
         let new = entry.new.clone();
@@ -1320,13 +1430,14 @@ impl RefCursor {
         let key = head_key(&git_dir);
         let path = git_dir.join("logs").join("HEAD");
         let start = self.reflog_start_offset(&key, &path)?;
-        let entries = read_reflog_entries(key, &path, "HEAD", start)?;
-
-        Ok(entries.into_iter().find(|entry| {
+        let entries = read_reflog_entries(key.clone(), &path, "HEAD", start)?;
+        let candidates = entries.into_iter().filter(|entry| {
             !self.entry_consumed(entry)
                 && pull_reflog_action_is(&entry.message, action, "start")
                 && expected.matches_span_boundary(entry)
-        }))
+        });
+
+        Ok(self.select_candidate_with_hint(&key, candidates))
     }
 
     // Span commands can append several contiguous HEAD rows. If command ingress
@@ -1493,6 +1604,36 @@ impl RefCursor {
             }))
     }
 
+    fn consume_unstructured_update_ref_entries(
+        &mut self,
+        key: &str,
+        path: &Path,
+        reference: &str,
+    ) -> Result<Vec<RefChange>, GitAiError> {
+        let start = self.reflog_start_offset(key, path)?;
+        let mut entries = read_reflog_entries(key.to_string(), path, reference, start)?
+            .into_iter()
+            .filter(|entry| !self.entry_consumed(entry))
+            .collect::<Vec<_>>();
+        if let Some(command_boundary) = self.command_start_hints.get(key).copied() {
+            if let Some(first_current) = entries
+                .iter()
+                .position(|entry| entry.start_offset >= command_boundary)
+            {
+                entries.drain(..first_current);
+            } else if let Some(latest_before_boundary) = entries.pop() {
+                entries.clear();
+                entries.push(latest_before_boundary);
+            }
+        }
+        let mut changes = Vec::new();
+        for entry in entries {
+            self.consume_entry(&entry)?;
+            changes.push(entry_to_ref_change(&entry));
+        }
+        Ok(changes)
+    }
+
     fn consume_unique_direct_common_ref_matching_timestamp(
         &mut self,
         cmd: &NormalizedCommand,
@@ -1594,23 +1735,6 @@ impl RefCursor {
             reference,
             expected,
             message_prefixes,
-        )
-    }
-
-    fn find_common_ref_entry_without_hint(
-        &mut self,
-        reference: &str,
-        expected: ExpectedTransition,
-        message_prefixes: &[&str],
-    ) -> Result<Option<CursorEntry>, GitAiError> {
-        let path = self.common_dir().join("logs").join(reference);
-        self.find_entry_in_log_with_hint(
-            common_key(reference),
-            &path,
-            reference,
-            expected,
-            message_prefixes,
-            false,
         )
     }
 
@@ -1853,14 +1977,31 @@ impl RefCursor {
         Ok(stack.get(index).cloned())
     }
 
+    fn reconcile_stash_stack_top(&mut self, observed_tip: Option<&String>) {
+        let Some(observed_tip) = observed_tip.filter(|oid| valid_non_zero_oid(oid)) else {
+            return;
+        };
+        if self.stash_stack.first() == Some(observed_tip) {
+            return;
+        }
+        if let Some(position) = self.stash_stack.iter().position(|oid| oid == observed_tip) {
+            self.stash_stack.drain(..position);
+        } else {
+            // A missed push can introduce an unknown top. Preserve only the exact
+            // tip captured at this command's reflog boundary; deeper symbolic
+            // indices will use the existing cursor-bounded reflog fallback.
+            self.stash_stack.clear();
+            self.stash_stack.push(observed_tip.clone());
+        }
+    }
+
     fn apply_stash_ref_entry(&mut self, kind: &str, entry: &CursorEntry) {
         match kind {
-            "push" | "save" => {
+            "push" | "save"
                 if valid_non_zero_oid(&entry.new)
-                    && !self.stash_stack.iter().any(|oid| oid == &entry.new)
-                {
-                    self.stash_stack.insert(0, entry.new.clone());
-                }
+                    && !self.stash_stack.iter().any(|oid| oid == &entry.new) =>
+            {
+                self.stash_stack.insert(0, entry.new.clone());
             }
             "pop" | "drop" | "branch" => {
                 if let Some(position) = self.stash_stack.iter().position(|oid| oid == &entry.old) {
@@ -3419,6 +3560,13 @@ fn parse_branch_command_spec(args: &[String]) -> BranchCommandSpec {
         .unwrap_or(BranchCommandSpec::None)
 }
 
+pub(super) fn branch_command_is_tip_update(cmd: &NormalizedCommand) -> bool {
+    matches!(
+        parse_branch_command_spec(&command_args(cmd)),
+        BranchCommandSpec::CreateOrReset { .. }
+    )
+}
+
 fn branch_command_args(args: &[String]) -> &[String] {
     if args.first().is_some_and(|arg| arg == "branch") {
         &args[1..]
@@ -4055,6 +4203,141 @@ mod tests {
     }
 
     #[test]
+    fn ingress_offset_hint_skips_untraced_rebase_span() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        let head_log = git_dir.join("logs/HEAD");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+
+        let base_line =
+            format!("{A} {B} Test User <test@example.com> 0 +0000\tcommit: traced base\n");
+        let missed_start = format!(
+            "{B} {C} Test User <test@example.com> 0 +0000\trebase (start): checkout main\n"
+        );
+        let missed_pick =
+            format!("{C} {D} Test User <test@example.com> 0 +0000\trebase (pick): missed\n");
+        let missed_finish = format!(
+            "{D} {D} Test User <test@example.com> 0 +0000\trebase (finish): returning to refs/heads/missed\n"
+        );
+        let checkout = format!(
+            "{D} {E} Test User <test@example.com> 0 +0000\tcheckout: moving from missed to traced\n"
+        );
+        let traced_start = format!(
+            "{E} {C} Test User <test@example.com> 0 +0000\trebase (start): checkout main\n"
+        );
+        let traced_pick =
+            format!("{C} {F} Test User <test@example.com> 0 +0000\trebase (pick): traced\n");
+        let traced_finish = format!(
+            "{F} {F} Test User <test@example.com> 0 +0000\trebase (finish): returning to refs/heads/traced\n"
+        );
+        let in_order_offset = base_line.len() as u64;
+        let command_start_offset = (base_line.len()
+            + missed_start.len()
+            + missed_pick.len()
+            + missed_finish.len()
+            + checkout.len()) as u64;
+        fs::write(
+            &head_log,
+            format!(
+                "{base_line}{missed_start}{missed_pick}{missed_finish}{checkout}{traced_start}{traced_pick}{traced_finish}"
+            ),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&head_key(&git_dir), in_order_offset)
+            .unwrap();
+        let mut cmd = command_with_worktree(&family, Some(worktree), &["rebase", "main"]);
+        cmd.reflog_start_offsets
+            .insert(head_key(&git_dir), command_start_offset);
+        cursor
+            .initialize_from_command_reflog_start_offsets(&cmd)
+            .unwrap();
+
+        let entry = cursor
+            .find_rebase_start_entry(&cmd, ExpectedTransition::default())
+            .unwrap()
+            .expect("current rebase start should be found");
+
+        assert_eq!(entry.start_offset, command_start_offset);
+        assert_eq!(entry.old, E);
+        assert_eq!(entry.new, C);
+    }
+
+    #[test]
+    fn ingress_offset_hint_skips_untraced_pull_rebase_span() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        let head_log = git_dir.join("logs/HEAD");
+        fs::create_dir_all(head_log.parent().unwrap()).unwrap();
+        let action = "pull --rebase origin main";
+
+        let base_line =
+            format!("{A} {B} Test User <test@example.com> 0 +0000\tcommit: traced base\n");
+        let missed_start = format!(
+            "{B} {C} Test User <test@example.com> 0 +0000\t{action} (start): checkout main\n"
+        );
+        let missed_pick =
+            format!("{C} {D} Test User <test@example.com> 0 +0000\t{action} (pick): missed\n");
+        let missed_finish = format!(
+            "{D} {D} Test User <test@example.com> 0 +0000\t{action} (finish): returning to refs/heads/missed\n"
+        );
+        let checkout = format!(
+            "{D} {E} Test User <test@example.com> 0 +0000\tcheckout: moving from missed to traced\n"
+        );
+        let traced_start = format!(
+            "{E} {C} Test User <test@example.com> 0 +0000\t{action} (start): checkout main\n"
+        );
+        let traced_pick =
+            format!("{C} {F} Test User <test@example.com> 0 +0000\t{action} (pick): traced\n");
+        let traced_finish = format!(
+            "{F} {F} Test User <test@example.com> 0 +0000\t{action} (finish): returning to refs/heads/traced\n"
+        );
+        let in_order_offset = base_line.len() as u64;
+        let command_start_offset = (base_line.len()
+            + missed_start.len()
+            + missed_pick.len()
+            + missed_finish.len()
+            + checkout.len()) as u64;
+        fs::write(
+            &head_log,
+            format!(
+                "{base_line}{missed_start}{missed_pick}{missed_finish}{checkout}{traced_start}{traced_pick}{traced_finish}"
+            ),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&head_key(&git_dir), in_order_offset)
+            .unwrap();
+        let mut cmd = command_with_worktree(
+            &family,
+            Some(worktree),
+            &["pull", "--rebase", "origin", "main"],
+        );
+        cmd.reflog_start_offsets
+            .insert(head_key(&git_dir), command_start_offset);
+        cursor
+            .initialize_from_command_reflog_start_offsets(&cmd)
+            .unwrap();
+
+        let entry = cursor
+            .find_pull_start_entry(&cmd, ExpectedTransition::default(), action)
+            .unwrap()
+            .expect("current pull-rebase start should be found");
+
+        assert_eq!(entry.start_offset, command_start_offset);
+        assert_eq!(entry.old, E);
+        assert_eq!(entry.new, C);
+    }
+
+    #[test]
     fn late_ingress_offset_skips_untraced_duplicate_message_commit() {
         // Same duplicate-message shape as above, but the async ingress capture
         // raced behind git and observed the reflog after this command's commit
@@ -4391,6 +4674,86 @@ mod tests {
                 reference: reference.to_string(),
                 old: C.to_string(),
                 new: D.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn initialized_common_boundary_skips_untraced_update_ref_transactions() {
+        let temp = tempfile::tempdir().unwrap();
+        let reference = "refs/heads/main";
+        let log_path = temp.path().join("logs").join(reference);
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+
+        let base_line = format!("{A} {B} Test User <test@example.com> 0 +0000\tbase\n");
+        let missed_forward =
+            format!("{B} {C} Test User <test@example.com> 0 +0000\tmissed forward\n");
+        let missed_back = format!("{C} {B} Test User <test@example.com> 0 +0000\tmissed back\n");
+        let current_line =
+            format!("{B} {D} Test User <test@example.com> 0 +0000\tcurrent stdin update\n");
+        let in_order_offset = base_line.len() as u64;
+        let command_start_offset =
+            (base_line.len() + missed_forward.len() + missed_back.len()) as u64;
+        fs::write(
+            &log_path,
+            format!("{base_line}{missed_forward}{missed_back}{current_line}"),
+        )
+        .unwrap();
+
+        let family = FamilyKey::new(temp.path().to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&common_key(reference), in_order_offset)
+            .unwrap();
+        let mut cmd = command(&family, &["update-ref", "--stdin"]);
+        cmd.reflog_start_offsets
+            .insert(common_key(reference), command_start_offset);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert_eq!(
+            cmd.ref_changes,
+            vec![RefChange {
+                reference: reference.to_string(),
+                old: B.to_string(),
+                new: D.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn late_common_boundary_falls_back_to_current_unstructured_update_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let reference = "refs/heads/main";
+        let log_path = temp.path().join("logs").join(reference);
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+
+        let base_line = format!("{A} {B} Test User <test@example.com> 0 +0000\tbase\n");
+        let current_line =
+            format!("{B} {C} Test User <test@example.com> 0 +0000\tcurrent stdin update\n");
+        let in_order_offset = base_line.len() as u64;
+        let late_command_start_offset = (base_line.len() + current_line.len()) as u64;
+        fs::write(&log_path, format!("{base_line}{current_line}")).unwrap();
+
+        let family = FamilyKey::new(temp.path().to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+        cursor
+            .initialize_reflog_cursor(&common_key(reference), in_order_offset)
+            .unwrap();
+        let mut cmd = command(&family, &["update-ref", "--stdin"]);
+        cmd.reflog_start_offsets
+            .insert(common_key(reference), late_command_start_offset);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert_eq!(
+            cmd.ref_changes,
+            vec![RefChange {
+                reference: reference.to_string(),
+                old: B.to_string(),
+                new: C.to_string(),
             }]
         );
     }
@@ -5220,6 +5583,86 @@ mod tests {
     }
 
     #[test]
+    fn failed_rebase_continue_does_not_steal_final_continue_entry() {
+        // Two-conflict rebase: the FIRST `rebase --continue` resolves conflict
+        // one with an empty/kept-side resolution and stops again on conflict
+        // two (exit != 0). Its only reflog evidence so far is the start entry
+        // (already consumed by the initial failed `rebase <branch>`); the
+        // continue entry that later appears belongs to the SECOND, successful
+        // `rebase --continue`. The failed continue must not consume it — doing
+        // so leaves the final continue with no entry, no ref_changes, and the
+        // conflict-resolution working log is never attributed (the
+        // two-conflicts attribution flake).
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = create_git_dir(&worktree);
+        fs::create_dir_all(git_dir.join("logs")).unwrap();
+        append_reflog(
+            &git_dir,
+            "HEAD",
+            &[
+                (A, B, "rebase (start): checkout main"),
+                (B, C, "rebase (continue): Add Rust joke"),
+                (C, C, "rebase (finish): returning to refs/heads/topic"),
+            ],
+        );
+        append_reflog(
+            &git_dir,
+            "refs/heads/topic",
+            &[(D, C, "rebase (finish): refs/heads/topic onto main")],
+        );
+
+        let family = FamilyKey::new(git_dir.to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+
+        // Initial rebase stops on the first conflict: consumes the start entry.
+        let mut initial =
+            command_with_worktree(&family, Some(worktree.clone()), &["rebase", "main"]);
+        initial.exit_code = 1;
+        cursor.enrich_command(&mut initial, &state).unwrap();
+        assert_eq!(
+            initial.ref_changes,
+            vec![RefChange {
+                reference: "HEAD".to_string(),
+                old: A.to_string(),
+                new: B.to_string(),
+            }],
+            "initial failed rebase should consume only the start entry"
+        );
+
+        // First --continue resolves conflict one and stops on conflict two.
+        // It produced no reflog entry of its own and must consume nothing.
+        let mut stopped_continue =
+            command_with_worktree(&family, Some(worktree.clone()), &["rebase", "--continue"]);
+        stopped_continue.exit_code = 1;
+        cursor
+            .enrich_command(&mut stopped_continue, &state)
+            .unwrap();
+        assert_eq!(
+            stopped_continue.ref_changes,
+            Vec::<RefChange>::new(),
+            "a --continue that stops on the next conflict must not steal the final continue's entry"
+        );
+
+        // Final --continue finishes the rebase: its continue + finish entries
+        // must still be available so the branch transition is established.
+        let mut final_continue =
+            command_with_worktree(&family, Some(worktree), &["rebase", "--continue"]);
+        cursor.enrich_command(&mut final_continue, &state).unwrap();
+        assert!(
+            final_continue
+                .ref_changes
+                .iter()
+                .any(|change| change.reference == "refs/heads/topic"
+                    && change.old == D
+                    && change.new == C),
+            "final --continue must recover the branch transition; got {:?}",
+            final_continue.ref_changes
+        );
+    }
+
+    #[test]
     fn cold_rebase_late_ingress_offset_still_recovers_start_and_branch_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("repo");
@@ -5876,6 +6319,76 @@ mod tests {
             }]
         );
         assert_eq!(cursor.stash_stack, vec![C.to_string()]);
+    }
+
+    #[test]
+    fn stash_target_reconciles_to_command_start_tip_after_untraced_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let reference = "refs/stash";
+        let log_path = temp.path().join("logs").join(reference);
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+
+        let surviving = format!(
+            "{} {B} Test User <test@example.com> 0 +0000\tOn main: surviving\n",
+            zero_oid()
+        );
+        let dropped = format!("{B} {C} Test User <test@example.com> 0 +0000\tOn main: dropped\n");
+        fs::write(&log_path, &surviving).unwrap();
+
+        let family = FamilyKey::new(temp.path().to_string_lossy().to_string());
+        let state = family_state(&family);
+        let mut cursor = RefCursor::new(family.clone());
+        cursor.offsets.insert(
+            common_key(reference),
+            (surviving.len() + dropped.len()) as u64,
+        );
+        cursor.stash_stack = vec![C.to_string(), B.to_string()];
+        let mut cmd = command(&family, &["stash", "apply", "stash@{0}"]);
+        cmd.reflog_start_offsets
+            .insert(common_key(reference), surviving.len() as u64);
+
+        cursor.enrich_command(&mut cmd, &state).unwrap();
+
+        assert_eq!(cmd.stash_target_oid.as_deref(), Some(B));
+        assert_eq!(cursor.stash_stack, vec![B.to_string()]);
+    }
+
+    #[test]
+    fn destructive_stash_targets_ignore_post_rewrite_boundary_tip() {
+        for args in [
+            vec!["stash", "pop", "stash@{0}"],
+            vec!["stash", "drop", "stash@{0}"],
+            vec!["stash", "branch", "restored", "stash@{0}"],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let reference = "refs/stash";
+            let log_path = temp.path().join("logs").join(reference);
+            fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+
+            let surviving = format!(
+                "{} {B} Test User <test@example.com> 0 +0000\tOn main: surviving\n",
+                zero_oid()
+            );
+            let removed =
+                format!("{B} {C} Test User <test@example.com> 0 +0000\tOn main: removed\n");
+            fs::write(&log_path, &surviving).unwrap();
+
+            let family = FamilyKey::new(temp.path().to_string_lossy().to_string());
+            let state = family_state(&family);
+            let mut cursor = RefCursor::new(family.clone());
+            cursor.offsets.insert(
+                common_key(reference),
+                (surviving.len() + removed.len()) as u64,
+            );
+            cursor.stash_stack = vec![C.to_string(), B.to_string()];
+            let mut cmd = command(&family, &args);
+            cmd.reflog_start_offsets
+                .insert(common_key(reference), surviving.len() as u64);
+
+            cursor.enrich_command(&mut cmd, &state).unwrap();
+
+            assert_eq!(cmd.stash_target_oid.as_deref(), Some(C), "args: {args:?}");
+        }
     }
 
     #[test]
