@@ -1,0 +1,20 @@
+tests/integration/cold_trace2_repo.rs
+  s_0785f5df64ce7b::t_53ad1a2bcebf0a 520-566,916
+  s_0785f5df64ce7b::t_5970db9985339f 519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23-ep",
+  "base_commit_sha": "08d14a3dc7086a51f06ceb32d908423cf5d21f71",
+  "prompts": {},
+  "sessions": {
+    "s_0785f5df64ce7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffdc9-9e54-7623-8486-8fe0f919d5cc",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
