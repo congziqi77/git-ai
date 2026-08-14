@@ -6092,22 +6092,19 @@ impl ActorDaemonCoordinator {
                     crate::daemon::domain::SemanticEvent::CherryPickNoCommit {
                         source_commits,
                         head,
-                    } => {
-                        if !lite_mode {
-                            let mut sources = source_commits.clone();
-                            if sources.is_empty() {
-                                let repo = find_repository_in_path(&worktree)?;
-                                sources = resolve_explicit_cherry_pick_sources_for_side_effect(
-                                    &repo, cmd,
-                                )?;
-                            }
-                            if !head.is_empty() && !sources.is_empty() {
-                                self.set_pending_cherry_pick_no_commit_for_worktree(
-                                    worktree.as_ref(),
-                                    sources,
-                                    head.clone(),
-                                )?;
-                            }
+                    } if !lite_mode => {
+                        let mut sources = source_commits.clone();
+                        if sources.is_empty() {
+                            let repo = find_repository_in_path(&worktree)?;
+                            sources =
+                                resolve_explicit_cherry_pick_sources_for_side_effect(&repo, cmd)?;
+                        }
+                        if !head.is_empty() && !sources.is_empty() {
+                            self.set_pending_cherry_pick_no_commit_for_worktree(
+                                worktree.as_ref(),
+                                sources,
+                                head.clone(),
+                            )?;
                         }
                     }
                     crate::daemon::domain::SemanticEvent::MergeSquash { source_head, onto } => {
@@ -6331,61 +6328,60 @@ impl ActorDaemonCoordinator {
                             }
                         }
                     }
-                    crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head } => {
+                    crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head }
                         if !old_head.is_empty()
                             && !new_head.is_empty()
                             && old_head != new_head
                             && is_valid_oid(old_head)
                             && !is_zero_oid(old_head)
                             && is_valid_oid(new_head)
-                            && !is_zero_oid(new_head)
-                        {
-                            let repo = find_repository_in_path(&worktree)?;
-                            if lite_mode {
-                                repo.storage.rename_working_log(old_head, new_head)?;
-                                continue;
-                            }
-                            let author = repo.effective_author_identity().formatted_or_unknown();
-                            let recovery_file_timestamps = Self::take_commit_file_timestamps(
-                                commit_file_timestamp_snapshots,
+                            && !is_zero_oid(new_head) =>
+                    {
+                        let repo = find_repository_in_path(&worktree)?;
+                        if lite_mode {
+                            repo.storage.rename_working_log(old_head, new_head)?;
+                            continue;
+                        }
+                        let author = repo.effective_author_identity().formatted_or_unknown();
+                        let recovery_file_timestamps = Self::take_commit_file_timestamps(
+                            commit_file_timestamp_snapshots,
+                            new_head,
+                        )
+                        .await;
+                        let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
+                            self.wait_for_session_event_recovery_candidate(
+                                &repo,
                                 new_head,
+                                recovery_file_timestamps.as_ref(),
+                                unknown_by_file,
+                            );
+                        };
+                        // Post-commit note generation does synchronous git/filesystem work
+                        // and may briefly wait for transcript recovery. Mark it as blocking
+                        // so the transcript worker can process the recovery sweep promptly.
+                        let amend_result = run_blocking_side_effect(|| {
+                            crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
+                                &repo,
+                                old_head,
+                                new_head,
+                                author,
+                                recovery_file_timestamps.as_ref(),
+                                Some(&recovery_preflight),
                             )
-                            .await;
-                            let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
-                                self.wait_for_session_event_recovery_candidate(
-                                    &repo,
-                                    new_head,
-                                    recovery_file_timestamps.as_ref(),
-                                    unknown_by_file,
-                                );
-                            };
-                            // Post-commit note generation does synchronous git/filesystem work
-                            // and may briefly wait for transcript recovery. Mark it as blocking
-                            // so the transcript worker can process the recovery sweep promptly.
-                            let amend_result = run_blocking_side_effect(|| {
-                                crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
-                                    &repo,
-                                    old_head,
-                                    new_head,
-                                    author,
-                                    recovery_file_timestamps.as_ref(),
-                                    Some(&recovery_preflight),
-                                )
-                            })?;
-                            if crate::authorship::rewrite::rewrite_metrics_enabled() {
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                                    &repo,
-                                    vec![
-                                        crate::authorship::rewrite::RewriteMetricCommit::new(
-                                            new_head.to_string(),
-                                            vec![old_head.to_string()],
-                                            crate::authorship::rewrite::RewriteMetricOperation::Amend,
-                                        )
-                                        .with_parent_sha(amend_result.parent_sha)
-                                        .with_authorship_note(amend_result.authorship_note),
-                                    ],
-                                );
-                            }
+                        })?;
+                        if crate::authorship::rewrite::rewrite_metrics_enabled() {
+                            crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                &repo,
+                                vec![
+                                    crate::authorship::rewrite::RewriteMetricCommit::new(
+                                        new_head.to_string(),
+                                        vec![old_head.to_string()],
+                                        crate::authorship::rewrite::RewriteMetricOperation::Amend,
+                                    )
+                                    .with_parent_sha(amend_result.parent_sha)
+                                    .with_authorship_note(amend_result.authorship_note),
+                                ],
+                            );
                         }
                     }
                     crate::daemon::domain::SemanticEvent::Reset {
