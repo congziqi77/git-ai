@@ -517,6 +517,54 @@ fn test_cold_repo_first_traced_rebase_is_processed() {
 }
 
 #[test]
+fn test_traced_rebase_after_untraced_rebase_preserves_source_ai_attribution() {
+    let repo = TestRepo::new_dedicated_daemon();
+
+    write_file(&repo, "base.txt", "base\n");
+    repo.git_ai(&["checkpoint", "mock_known_human", "base.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("base").unwrap();
+    let mut base_file = repo.filename("base.txt");
+    base_file.assert_committed_lines(crate::lines!["base".human()]);
+    let main = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "missed-rebase"]).unwrap();
+    write_file(&repo, "missed-rebase.txt", "missed rebase ai\n");
+    repo.git_ai(&["checkpoint", "mock_ai", "missed-rebase.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("missed rebase source").unwrap();
+    let mut missed_file = repo.filename("missed-rebase.txt");
+    missed_file.assert_committed_lines(crate::lines!["missed rebase ai".ai()]);
+
+    repo.git(&["checkout", &main]).unwrap();
+    repo.git(&["checkout", "-b", "traced-rebase"]).unwrap();
+    write_file(&repo, "traced-rebase.txt", "traced rebase ai\n");
+    repo.git_ai(&["checkpoint", "mock_ai", "traced-rebase.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("traced rebase source").unwrap();
+    let mut traced_file = repo.filename("traced-rebase.txt");
+    traced_file.assert_committed_lines(crate::lines!["traced rebase ai".ai()]);
+
+    repo.git(&["checkout", &main]).unwrap();
+    write_file(&repo, "main-advance.txt", "main advance\n");
+    repo.git_ai(&["checkpoint", "mock_known_human", "main-advance.txt"])
+        .unwrap();
+    repo.stage_all_and_commit("main advance").unwrap();
+    let mut main_advance = repo.filename("main-advance.txt");
+    main_advance.assert_committed_lines(crate::lines!["main advance".human()]);
+
+    repo.git(&["checkout", "missed-rebase"]).unwrap();
+    repo.sync_daemon_force();
+    raw_git(&repo, &["rebase", &main]);
+    let missed_rebase = raw_head(&repo);
+    assert_no_authorship_note(&repo, &missed_rebase);
+    raw_git(&repo, &["checkout", "traced-rebase"]);
+
+    run_traced_git(&repo, &["rebase", &main]);
+    traced_file.assert_committed_lines(crate::lines!["traced rebase ai".ai()]);
+}
+
+#[test]
 fn test_cold_repo_first_traced_conflict_rebase_ignores_stale_rebase_reflog_history() {
     let mut repo = TestRepo::new_dedicated_daemon();
     traced_ai_commit_file(&repo, "base.txt", "base\n", "ai base");
@@ -865,6 +913,7 @@ crate::reuse_tests_in_worktree!(
     test_cold_repo_first_traced_amend_is_processed,
     test_cold_repo_first_traced_soft_reset_is_processed,
     test_cold_repo_first_traced_rebase_is_processed,
+    test_traced_rebase_after_untraced_rebase_preserves_source_ai_attribution,
     test_cold_repo_mid_rebase_continue_preserves_ai_conflict_resolution,
     test_cold_repo_mid_cherry_pick_continue_preserves_ai_conflict_resolution,
     test_cold_repo_mid_merge_commit_preserves_ai_conflict_resolution,
