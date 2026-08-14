@@ -180,6 +180,7 @@ fn handle_run(args: &[String]) -> Result<(), String> {
     if has_flag(args, "--mode") {
         return Err("--mode is no longer supported; daemon always runs in write mode".to_string());
     }
+    crate::tokio_runtime::configure_daemon_allocator()?;
     ensure_daemon_start_allowed()?;
     let config = daemon_config_from_env_or_default_paths()?;
     let runtime_dir = daemon_runtime_dir(&config)?;
@@ -190,10 +191,8 @@ fn handle_run(args: &[String]) -> Result<(), String> {
             e
         )
     })?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let runtime = crate::tokio_runtime::build_daemon_runtime()?;
+    crate::tokio_runtime::initialize();
     let exit_action = runtime
         .block_on(async move { crate::daemon::run_daemon(config).await })
         .map_err(|e| e.to_string())?;
@@ -603,12 +602,7 @@ fn handle_restart(args: &[String]) -> Result<(), String> {
         if hard {
             hard_kill_daemon(&config)?;
         } else {
-            // Attempt soft shutdown; escalate to hard kill on timeout.
-            let _ = send_control_request(&config.control_socket_path, &ControlRequest::Shutdown);
-            if !wait_for_daemon_dead(&config, GRACEFUL_SHUTDOWN_TIMEOUT) {
-                eprintln!("graceful shutdown timed out, force-killing daemon");
-                hard_kill_daemon(&config)?;
-            }
+            stop_daemon(&config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
         }
 
         // Even after lock+sockets are gone, the process may still be alive
@@ -729,14 +723,26 @@ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<()
         return Ok(());
     }
 
-    // Attempt soft shutdown via control socket if reachable.
+    let deadline = Instant::now() + timeout;
+
+    // Attempt soft shutdown via control socket if reachable. Bound the request
+    // itself by the caller's deadline because shutdown may now wait for
+    // acknowledged checkpoints before responding.
     if local_socket_connects_with_timeout(&config.control_socket_path, Duration::from_millis(100))
         .is_ok()
     {
-        let _ = send_control_request(&config.control_socket_path, &ControlRequest::Shutdown);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = send_control_request_with_timeout(
+                &config.control_socket_path,
+                &ControlRequest::Shutdown,
+                remaining,
+            );
+        }
     }
 
-    if wait_for_daemon_dead(config, timeout) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if wait_for_daemon_dead(config, remaining) {
         return Ok(());
     }
 

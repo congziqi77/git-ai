@@ -7,7 +7,8 @@ use serde::Serialize;
 use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::authorship::stats::{
-    DetailedCommitStats, FileStats, stats_for_commit_detailed, stats_from_authorship_log,
+    DetailedCommitStats, FileStats, accepted_lines_from_attestations, stats_for_commit_detailed,
+    stats_from_authorship_log,
 };
 use crate::error::GitAiError;
 use crate::git::notes_api::{CommitAuthorship, filter_commits_with_notes};
@@ -424,13 +425,20 @@ fn calculate_range_stats_direct(
     let authorship_log =
         create_authorship_log_for_range(repo, &start_sha, &end_sha, commit_shas, ignore_patterns)?;
 
+    // Extract both ai_accepted and known_human_accepted from the authorship log
+    let (_ai_from_log, known_human_accepted, _ai_by_tool) = accepted_lines_from_attestations(
+        Some(&authorship_log),
+        &diff_ai_stats.added_lines_by_file,
+        false,
+    );
+
     // Step 3: Calculate stats from the authorship log
     let summary = stats_from_authorship_log(
         Some(&authorship_log),
         git_diff_added_lines,
         git_diff_deleted_lines,
         diff_ai_stats.total_ai_accepted,
-        diff_ai_stats.total_human_additions,
+        known_human_accepted,
         &diff_ai_stats.per_tool_model,
     );
     let file_stats = diff_ai_stats

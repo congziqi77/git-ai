@@ -20,6 +20,7 @@ use crate::{
     commands::checkpoint_agent::orchestrator::CheckpointRequest,
     daemon::checkpoint::PreparedPathRole,
 };
+use futures::{StreamExt, stream};
 #[cfg(not(windows))]
 use interprocess::local_socket::ConnectOptions;
 #[cfg(not(windows))]
@@ -46,9 +47,9 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 
 pub mod analyzers;
@@ -62,6 +63,7 @@ pub mod domain;
 pub mod family_actor;
 pub mod git_backend;
 pub mod global_actor;
+mod memory_watchdog;
 pub mod reducer;
 pub mod ref_cursor;
 pub mod rewrite_metrics;
@@ -73,6 +75,16 @@ pub mod telemetry_worker;
 pub mod test_sync;
 pub mod trace_normalizer;
 pub mod transcript_redaction;
+
+pub(crate) fn rewrite_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GIT_AI_REWRITE_DIAGNOSTICS")
+            .as_deref()
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
@@ -88,8 +100,13 @@ pub(crate) const TRACE_ROOT_REFLOG_START_OFFSETS_FIELD: &str = "git_ai_root_refl
 const TRACE_CONNECTION_CLOSED_EVENT: &str = "git_ai_connection_closed";
 const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_CONTROL_RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_CHECKPOINT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const DAEMON_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const CHECKPOINT_INGRESS_REQUEST_LIMIT: usize = 1_024;
+const CHECKPOINT_INGRESS_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+const CHECKPOINT_FAMILY_DRAIN_CONCURRENCY: usize = 2;
 // Trace2 frames are written synchronously by Git to the daemon's Unix socket.
 // With small kernel socket buffers (macOS defaults to ~8 KiB), a bursty trace2
 // stream can fill the buffer and block the raw `git` process in `write()` until
@@ -111,6 +128,123 @@ const WINDOWS_STDOUT_HANDLE: u32 = (-11i32) as u32;
 #[cfg(windows)]
 const WINDOWS_STDERR_HANDLE: u32 = (-12i32) as u32;
 static DAEMON_PROCESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Default)]
+struct CheckpointIngressQuotaState {
+    requests: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct CheckpointIngressQuota {
+    request_limit: usize,
+    byte_limit: usize,
+    state: Mutex<CheckpointIngressQuotaState>,
+}
+
+#[derive(Debug)]
+struct CheckpointIngressQuotaError {
+    reason: &'static str,
+    requested_bytes: usize,
+    outstanding_requests: usize,
+    outstanding_bytes: usize,
+    request_limit: usize,
+    byte_limit: usize,
+}
+
+#[derive(Debug)]
+struct CheckpointIngressReservation {
+    quota: Arc<CheckpointIngressQuota>,
+    body_bytes: usize,
+}
+
+#[derive(Debug)]
+struct AcceptedCheckpoint {
+    receipt_seq: u64,
+    received_at_ns: u128,
+    trace_ingest_target: u64,
+    body: Vec<u8>,
+    reservation: CheckpointIngressReservation,
+}
+
+#[derive(Debug)]
+struct PreparedCheckpointAdmission {
+    receipt_seq: u64,
+    received_at_ns: u128,
+    family: String,
+    request: CheckpointRequest,
+    reservation: CheckpointIngressReservation,
+}
+
+impl CheckpointIngressQuota {
+    fn new(request_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            request_limit,
+            byte_limit,
+            state: Mutex::new(CheckpointIngressQuotaState::default()),
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        body_bytes: usize,
+    ) -> Result<CheckpointIngressReservation, CheckpointIngressQuotaError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reason = if state.requests >= self.request_limit {
+            Some("request_limit")
+        } else if body_bytes > self.byte_limit.saturating_sub(state.bytes) {
+            Some("byte_limit")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(CheckpointIngressQuotaError {
+                reason,
+                requested_bytes: body_bytes,
+                outstanding_requests: state.requests,
+                outstanding_bytes: state.bytes,
+                request_limit: self.request_limit,
+                byte_limit: self.byte_limit,
+            });
+        }
+
+        state.requests += 1;
+        state.bytes += body_bytes;
+        Ok(CheckpointIngressReservation {
+            quota: Arc::clone(self),
+            body_bytes,
+        })
+    }
+
+    fn outstanding(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.requests, state.bytes)
+    }
+}
+
+impl CheckpointIngressReservation {
+    fn body_bytes(&self) -> usize {
+        self.body_bytes
+    }
+}
+
+impl Drop for CheckpointIngressReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .quota
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.requests = state.requests.saturating_sub(1);
+        state.bytes = state.bytes.saturating_sub(self.body_bytes);
+    }
+}
 
 #[cfg(windows)]
 unsafe extern "system" {
@@ -380,6 +514,11 @@ fn trace_payload_worktree_hint(payload: &Value) -> Option<PathBuf> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     if event == "def_repo" {
+        // Secondary repositories (repo index > 1, e.g. an embedded subrepo git
+        // peeked into during a commit) must not hint the command's worktree.
+        if crate::daemon::trace_normalizer::def_repo_is_secondary(payload) {
+            return None;
+        }
         if let Some(path) = payload
             .get("worktree")
             .or_else(|| payload.get("repo_working_dir"))
@@ -709,6 +848,11 @@ fn process_conflict_resolution_working_logs(
     new_tip: &str,
     onto: Option<&str>,
 ) -> Result<RewriteMetricContext, GitAiError> {
+    crate::wltrace::wltrace(
+        "rebase.conflict_logs",
+        &repo.workdir().unwrap_or_default(),
+        || format!("new_tip={new_tip} onto={}", onto.unwrap_or("NONE")),
+    );
     let onto_sha = match onto {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(RewriteMetricContext::default()),
@@ -857,9 +1001,71 @@ fn rfc3339_to_unix_nanos(value: &str) -> Option<u128> {
         .and_then(|timestamp| u128::try_from(timestamp.timestamp_nanos_opt()?).ok())
 }
 
+#[cfg(feature = "test-support")]
+fn checkpoint_test_delay(env_var: &str, trace_id: &str) -> Option<Duration> {
+    let spec = std::env::var(env_var).ok()?;
+    spec.split(',').find_map(|entry| {
+        let (entry_trace_id, delay_ms) = entry.split_once('=')?;
+        if entry_trace_id != trace_id {
+            return None;
+        }
+        delay_ms
+            .parse::<u64>()
+            .ok()
+            .filter(|delay_ms| *delay_ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+#[cfg(feature = "test-support")]
+fn wait_at_checkpoint_test_barrier(trace_id: &str) -> Result<(), GitAiError> {
+    let Ok(barrier_dir) = std::env::var("GIT_AI_TEST_CHECKPOINT_SIDE_EFFECT_BARRIER_DIR") else {
+        return Ok(());
+    };
+    let barrier_dir = PathBuf::from(barrier_dir);
+    fs::create_dir_all(&barrier_dir)?;
+    let marker = format!("{:x}", Sha256::digest(trace_id.as_bytes()));
+    fs::write(barrier_dir.join(marker), [])?;
+
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if fs::read_dir(&barrier_dir)?.count() >= 2 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(GitAiError::Generic(format!(
+        "checkpoint test barrier timed out for {trace_id}"
+    )))
+}
+
 fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
+    #[cfg(feature = "test-support")]
+    {
+        wait_at_checkpoint_test_barrier(&request.trace_id)?;
+        if let Some(delay) = checkpoint_test_delay(
+            "GIT_AI_TEST_DELAY_CHECKPOINT_SIDE_EFFECT",
+            &request.trace_id,
+        ) {
+            std::thread::sleep(delay);
+        }
+        if std::env::var("GIT_AI_TEST_FAIL_CHECKPOINT_SIDE_EFFECT")
+            .is_ok_and(|trace_id| trace_id == request.trace_id)
+        {
+            return Err(GitAiError::Generic(
+                "synthetic checkpoint processing failure".to_string(),
+            ));
+        }
+    }
+
     if request.files.is_empty() {
         return Ok(());
+    }
+
+    if request.checkpoint_kind.is_ai()
+        && let Some(agent_id) = request.agent_id.as_mut()
+    {
+        crate::streams::model_extraction::enrich_copilot_agent_model(agent_id, &request.metadata);
     }
 
     let repo_work_dir = &request.files[0].repo_work_dir;
@@ -2415,13 +2621,38 @@ fn read_json_line<R: BufRead>(reader: &mut R) -> Result<Option<String>, GitAiErr
     Ok(Some(line))
 }
 
+fn read_checkpoint_body<R: BufRead>(
+    reader: &mut R,
+    body_bytes: usize,
+) -> Result<Vec<u8>, GitAiError> {
+    let mut body = vec![0; body_bytes];
+    reader.read_exact(&mut body).map_err(|error| {
+        GitAiError::Generic(format!(
+            "failed receiving {body_bytes}-byte checkpoint body: {error}"
+        ))
+    })?;
+    let mut delimiter = [0u8; 1];
+    reader.read_exact(&mut delimiter).map_err(|error| {
+        GitAiError::Generic(format!(
+            "failed receiving checkpoint body delimiter: {error}"
+        ))
+    })?;
+    if delimiter != [b'\n'] {
+        return Err(GitAiError::Generic(
+            "checkpoint body was not followed by a newline delimiter".to_string(),
+        ));
+    }
+    Ok(body)
+}
+
 #[derive(Debug)]
 enum FamilySequencerEntry {
     PendingRoot,
     ReadyCommand(Box<crate::daemon::domain::NormalizedCommand>),
     Checkpoint {
         request: Box<CheckpointRequest>,
-        respond_to: Option<oneshot::Sender<Result<u64, GitAiError>>>,
+        receipt_seq: u64,
+        reservation: CheckpointIngressReservation,
     },
     Canceled,
 }
@@ -2475,6 +2706,12 @@ struct PendingCherryPickNoCommit {
 }
 
 #[derive(Debug, Clone)]
+struct PendingRebase {
+    original_head: String,
+    onto: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum RecentReplayPrerequisite {
     CheckoutSwitchRename {
@@ -2516,7 +2753,7 @@ pub struct ActorDaemonCoordinator {
             crate::daemon::git_backend::SystemGitBackend,
         >,
     >,
-    pending_rebase_original_head_by_worktree: Mutex<HashMap<String, (String, Option<String>)>>,
+    pending_rebase_original_head_by_worktree: Mutex<HashMap<String, PendingRebase>>,
     pending_cherry_pick_sources_by_worktree: Mutex<HashMap<String, Vec<String>>>,
     pending_cherry_pick_no_commit_by_worktree: Mutex<HashMap<String, PendingCherryPickNoCommit>>,
     pending_squash_merge_by_worktree: Mutex<HashMap<String, PendingSquashMerge>>,
@@ -2532,6 +2769,14 @@ pub struct ActorDaemonCoordinator {
         Mutex<HashMap<String, VecDeque<RecentReplayPrerequisite>>>,
     side_effect_errors_by_family: Mutex<HashMap<String, BTreeMap<u64, String>>>,
     side_effect_exec_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    checkpoint_side_effect_semaphore: Semaphore,
+    checkpoint_ingress_quota: Arc<CheckpointIngressQuota>,
+    checkpoint_ingress_tx: std::sync::OnceLock<mpsc::Sender<AcceptedCheckpoint>>,
+    next_checkpoint_receipt_seq: AtomicUsize,
+    processed_checkpoint_receipt_seq: AtomicUsize,
+    unadmitted_checkpoints: AtomicUsize,
+    accepting_checkpoints: AtomicBool,
+    checkpoint_progress_notify: Notify,
     bash_sessions: Mutex<crate::daemon::bash_sessions::BashSessionState>,
     test_completion_log_dir: Option<PathBuf>,
     test_completion_log_lock: Mutex<()>,
@@ -2616,6 +2861,17 @@ impl ActorDaemonCoordinator {
             recent_replay_prerequisites_by_family: Mutex::new(HashMap::new()),
             side_effect_errors_by_family: Mutex::new(HashMap::new()),
             side_effect_exec_locks: Mutex::new(HashMap::new()),
+            checkpoint_side_effect_semaphore: Semaphore::new(CHECKPOINT_FAMILY_DRAIN_CONCURRENCY),
+            checkpoint_ingress_quota: Arc::new(CheckpointIngressQuota::new(
+                CHECKPOINT_INGRESS_REQUEST_LIMIT,
+                CHECKPOINT_INGRESS_BYTE_LIMIT,
+            )),
+            checkpoint_ingress_tx: std::sync::OnceLock::new(),
+            next_checkpoint_receipt_seq: AtomicUsize::new(0),
+            processed_checkpoint_receipt_seq: AtomicUsize::new(0),
+            unadmitted_checkpoints: AtomicUsize::new(0),
+            accepting_checkpoints: AtomicBool::new(true),
+            checkpoint_progress_notify: Notify::new(),
             bash_sessions: Mutex::new(crate::daemon::bash_sessions::BashSessionState::new()),
             test_completion_log_dir: std::env::var("GIT_AI_TEST_DB_PATH")
                 .ok()
@@ -2925,7 +3181,13 @@ impl ActorDaemonCoordinator {
             map.retain(|_, state| !state.entries.is_empty());
         }
         if let Ok(mut map) = self.side_effect_exec_locks.lock() {
-            map.retain(|_, lock| Arc::strong_count(lock) <= 1);
+            // Evict only IDLE locks (strong_count == 1: the map holds the sole
+            // Arc). A lock with clones out is held or awaited by a drain;
+            // evicting it would hand the next drain a fresh unlocked mutex and
+            // run two drains concurrently on one family, tearing working-log
+            // read-modify-writes. The map mutex makes this check atomic with
+            // removal; idle locks are safely recreated on demand.
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
         }
         if let Ok(mut map) = self.pending_rebase_original_head_by_worktree.lock() {
             map.shrink_to_fit();
@@ -3161,10 +3423,20 @@ impl ActorDaemonCoordinator {
             let map = self.family_sequencers_by_family.lock().map_err(|_| {
                 GitAiError::Generic("family sequencer map lock poisoned".to_string())
             })?;
-            map.keys().cloned().collect::<Vec<_>>()
+            map.iter()
+                .filter(|(_, state)| !state.entries.is_empty())
+                .map(|(family, _)| family.clone())
+                .collect::<Vec<_>>()
         };
-        for family in families {
-            self.drain_ready_family_sequencer_entries(&family).await?;
+        let first_error = stream::iter(families)
+            .map(|family| async move { self.drain_ready_family_sequencer_entries(&family).await })
+            .buffer_unordered(CHECKPOINT_FAMILY_DRAIN_CONCURRENCY)
+            .fold(None, |first_error, result| async move {
+                first_error.or_else(|| result.err())
+            })
+            .await;
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -3547,6 +3819,25 @@ impl ActorDaemonCoordinator {
         })
     }
 
+    /// As [`Self::has_open_trace_roots_that_may_mutate_refs`], but scoped to
+    /// one family: roots already attributed to a DIFFERENT family (via their
+    /// `def_repo` worktree) cannot mutate this family's refs and are ignored.
+    /// Roots with no family attribution yet fail closed and block everyone.
+    fn has_open_trace_roots_that_may_mutate_family(&self, family: &str) -> bool {
+        let Ok(ingress) = self.trace_ingress_state.lock() else {
+            return false;
+        };
+        ingress.root_open_connections.iter().any(|(root, count)| {
+            *count > 0
+                && !ingress.root_definitely_read_only.contains(root)
+                && ingress.root_mutating.get(root).copied().unwrap_or(true)
+                && ingress
+                    .root_families
+                    .get(root)
+                    .is_none_or(|root_family| root_family == family)
+        })
+    }
+
     fn next_trace_ingest_seq(&self) -> u64 {
         // Relaxed: we only need fetch_add atomicity (unique monotone values),
         // not ordering w.r.t. any other atomic.
@@ -3740,6 +4031,275 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    fn start_checkpoint_ingress_worker(self: &Arc<Self>) -> Result<(), GitAiError> {
+        if self.checkpoint_ingress_tx.get().is_some() {
+            return Ok(());
+        }
+
+        let (tx, mut rx) = mpsc::channel::<AcceptedCheckpoint>(CHECKPOINT_INGRESS_REQUEST_LIMIT);
+        if self.checkpoint_ingress_tx.set(tx).is_err() {
+            return Ok(());
+        }
+
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    maybe = rx.recv() => match maybe {
+                        Some(accepted) => accepted,
+                        None => {
+                            if !coordinator.is_shutting_down() {
+                                tracing::error!(
+                                    component = "daemon",
+                                    phase = "checkpoint_ingress_worker",
+                                    reason = "ingress_channel_closed",
+                                    "checkpoint ingress channel closed unexpectedly"
+                                );
+                                coordinator.request_shutdown();
+                            }
+                            break;
+                        }
+                    },
+                    _ = coordinator.wait_for_shutdown() => break,
+                };
+                let receipt_seq = accepted.receipt_seq;
+                let prepare = coordinator.prepare_checkpoint_admission(accepted);
+                let caught = std::panic::AssertUnwindSafe(prepare);
+                match futures::FutureExt::catch_unwind(caught).await {
+                    Ok(Ok(prepared)) => {
+                        if let Err(error) = coordinator.complete_checkpoint_admission(prepared) {
+                            tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_admission",
+                                reason = "sequencer_admission_failed",
+                                receipt_seq,
+                                %error,
+                                "failed admitting checkpoint to family sequencer"
+                            );
+                            coordinator.request_shutdown();
+                            break;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_admission",
+                            reason = "checkpoint_prepare_failed",
+                            receipt_seq,
+                            %error,
+                            "failed preparing accepted checkpoint"
+                        );
+                        if let Err(accounting_error) =
+                            coordinator.complete_failed_checkpoint_admission(receipt_seq)
+                        {
+                            tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_admission",
+                                reason = "failed_admission_accounting_error",
+                                receipt_seq,
+                                error = %accounting_error,
+                                "failed releasing checkpoint admission gate"
+                            );
+                            coordinator.request_shutdown();
+                            break;
+                        }
+                    }
+                    Err(panic_payload) => {
+                        let panic_msg =
+                            if let Some(message) = panic_payload.downcast_ref::<String>() {
+                                message.clone()
+                            } else if let Some(message) = panic_payload.downcast_ref::<&str>() {
+                                message.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_ingress_worker",
+                            reason = "worker_panic",
+                            receipt_seq,
+                            panic_msg = %panic_msg,
+                            "checkpoint ingress worker panicked"
+                        );
+                        let _ = coordinator.complete_failed_checkpoint_admission(receipt_seq);
+                        coordinator.request_shutdown();
+                        break;
+                    }
+                }
+            }
+
+            let buffered_count = rx.len();
+            if buffered_count > 0 {
+                tracing::error!(
+                    component = "daemon",
+                    phase = "checkpoint_ingress_worker",
+                    reason = "buffered_receipts_on_exit",
+                    buffered_count,
+                    "checkpoint ingress worker exited with accepted receipts buffered"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    async fn prepare_checkpoint_admission(
+        &self,
+        accepted: AcceptedCheckpoint,
+    ) -> Result<PreparedCheckpointAdmission, GitAiError> {
+        let request: CheckpointRequest =
+            serde_json::from_slice(&accepted.body).map_err(|error| {
+                GitAiError::Generic(format!("invalid accepted checkpoint body: {error}"))
+            })?;
+        #[cfg(feature = "test-support")]
+        if let Some(delay) =
+            checkpoint_test_delay("GIT_AI_TEST_DELAY_CHECKPOINT_ADMISSION", &request.trace_id)
+        {
+            tokio::time::sleep(delay).await;
+        }
+        let trace_id = request.trace_id.clone();
+        let file_count = request.files.len();
+        let Some(repo_work_dir) = request.files.first().map(|file| file.repo_work_dir.clone())
+        else {
+            return Err(GitAiError::Generic(
+                "accepted checkpoint contains no files".to_string(),
+            ));
+        };
+        let family = self.backend.resolve_family(&repo_work_dir)?.0;
+        crate::wltrace::wltrace("checkpoint.admission", Path::new(&family), || {
+            format!(
+                "receipt_seq={} repo_work_dir={}",
+                accepted.receipt_seq,
+                repo_work_dir.display()
+            )
+        });
+
+        self.notify_checkpoint_stream(&request);
+        self.wait_for_trace_ingest_seq(accepted.trace_ingest_target)
+            .await;
+
+        tracing::info!(
+            component = "daemon",
+            phase = "checkpoint_admission",
+            receipt_seq = accepted.receipt_seq,
+            %trace_id,
+            %family,
+            file_count,
+            retained_bytes = accepted.reservation.body_bytes(),
+            receipt_to_admission_ms =
+                now_unix_nanos().saturating_sub(accepted.received_at_ns) / 1_000_000,
+            "checkpoint prepared for family admission"
+        );
+
+        Ok(PreparedCheckpointAdmission {
+            receipt_seq: accepted.receipt_seq,
+            received_at_ns: accepted.received_at_ns,
+            family,
+            request,
+            reservation: accepted.reservation,
+        })
+    }
+
+    fn notify_checkpoint_stream(&self, request: &CheckpointRequest) {
+        if let Some(worker) = &self.stream_worker
+            && let Some(stream_source) = &request.stream_source
+        {
+            let tool = request
+                .agent_id
+                .as_ref()
+                .map(|agent| agent.tool.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            worker.notify_checkpoint(
+                stream_source.session_id.clone(),
+                tool,
+                request.trace_id.clone(),
+                request.metadata.get("tool_use_id").cloned(),
+                stream_source.path.clone(),
+                request.files.first().map(|file| file.repo_work_dir.clone()),
+                stream_source.external_session_id.clone(),
+                stream_source.external_parent_session_id.clone(),
+            );
+        }
+    }
+
+    fn complete_checkpoint_admission(
+        self: &Arc<Self>,
+        prepared: PreparedCheckpointAdmission,
+    ) -> Result<(), GitAiError> {
+        let remaining = {
+            let mut sequencers = self.family_sequencers_by_family.lock().map_err(|_| {
+                GitAiError::Generic("family sequencer map lock poisoned".to_string())
+            })?;
+            let state = sequencers
+                .entry(prepared.family.clone())
+                .or_insert_with(|| FamilySequencerState {
+                    next_ordinal: 1,
+                    entries: BTreeMap::new(),
+                });
+            let order = FamilySequencerOrder {
+                started_at_ns: prepared.received_at_ns,
+                ordinal: state.next_ordinal,
+            };
+            state.next_ordinal = state.next_ordinal.saturating_add(1);
+            state.entries.insert(
+                order,
+                FamilySequencerEntry::Checkpoint {
+                    request: Box::new(prepared.request),
+                    receipt_seq: prepared.receipt_seq,
+                    reservation: prepared.reservation,
+                },
+            );
+            self.unadmitted_checkpoints
+                .fetch_sub(1, Ordering::AcqRel)
+                .saturating_sub(1)
+        };
+        self.record_checkpoint_admission_processed(prepared.receipt_seq);
+        if remaining == 0 {
+            self.schedule_all_ready_family_drains();
+        }
+        Ok(())
+    }
+
+    fn complete_failed_checkpoint_admission(
+        self: &Arc<Self>,
+        receipt_seq: u64,
+    ) -> Result<(), GitAiError> {
+        let remaining = {
+            let _sequencers = self.family_sequencers_by_family.lock().map_err(|_| {
+                GitAiError::Generic("family sequencer map lock poisoned".to_string())
+            })?;
+            self.unadmitted_checkpoints
+                .fetch_sub(1, Ordering::AcqRel)
+                .saturating_sub(1)
+        };
+        self.record_checkpoint_admission_processed(receipt_seq);
+        if remaining == 0 {
+            self.schedule_all_ready_family_drains();
+        }
+        Ok(())
+    }
+
+    fn record_checkpoint_admission_processed(&self, receipt_seq: u64) {
+        self.processed_checkpoint_receipt_seq
+            .store(receipt_seq as usize, Ordering::Release);
+        self.checkpoint_progress_notify.notify_waiters();
+    }
+
+    fn schedule_all_ready_family_drains(self: &Arc<Self>) {
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = coordinator.drain_all_ready_family_sequencers().await {
+                tracing::error!(
+                    component = "daemon",
+                    phase = "checkpoint_processing",
+                    reason = "family_drain_failed",
+                    %error,
+                    "failed draining family sequencers after checkpoint admission"
+                );
+            }
+        });
+    }
+
     fn enqueue_trace_payload(&self, payload: Value) -> Result<(), GitAiError> {
         let tx =
             self.trace_ingest_tx.get().cloned().ok_or_else(|| {
@@ -3789,6 +4349,26 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    async fn wait_for_trace_ingest_seq(&self, target: u64) {
+        loop {
+            // Enroll in the notification BEFORE checking the condition.
+            // `Notify::notify_waiters` only wakes already-enrolled waiters, so
+            // checking first would leave a window where the final progress
+            // notification is lost and the waiter stalls until shutdown.
+            let progress = self.trace_ingest_progress_notify.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            let processed = self.processed_trace_ingest_seq.load(Ordering::Acquire) as u64;
+            if processed >= target {
+                return;
+            }
+            tokio::select! {
+                _ = &mut progress => {}
+                _ = self.wait_for_shutdown() => return,
+            }
+        }
+    }
+
     /// Waits until all trace payloads enqueued up to now have been processed
     /// by the ingest worker, and any identified trace root that may mutate refs
     /// has closed. This is a causal drain fence: it guarantees that trace2 data
@@ -3808,17 +4388,7 @@ impl ActorDaemonCoordinator {
             // point has a seq <= this value. We need to wait until the ingest
             // worker has processed through at least this seq.
             let target = self.next_trace_ingest_seq.load(Ordering::Acquire) as u64;
-            loop {
-                let processed = self.processed_trace_ingest_seq.load(Ordering::Acquire) as u64;
-                if processed >= target {
-                    break;
-                }
-                let progress = self.trace_ingest_progress_notify.notified();
-                tokio::select! {
-                    _ = progress => {}
-                    _ = self.wait_for_shutdown() => return,
-                }
-            }
+            self.wait_for_trace_ingest_seq(target).await;
 
             if !self.has_open_trace_roots_that_may_mutate_refs() {
                 return;
@@ -3830,6 +4400,32 @@ impl ActorDaemonCoordinator {
             }
             tokio::select! {
                 _ = progress => {}
+                _ = self.wait_for_shutdown() => return,
+            }
+        }
+    }
+
+    /// As [`Self::wait_for_trace_ingest_processed_through`], but scoped to one
+    /// family: open mutating roots already attributed to a different family do
+    /// not hold this fence, so a long-running git command in one repository no
+    /// longer delays `sync.family` for every other repository. Unattributed
+    /// roots still fail closed and block until their `def_repo` arrives.
+    async fn wait_for_trace_ingest_processed_through_family(&self, family: &str) {
+        loop {
+            let target = self.next_trace_ingest_seq.load(Ordering::Acquire) as u64;
+            self.wait_for_trace_ingest_seq(target).await;
+
+            // Enroll before checking (see wait_for_trace_ingest_seq): the
+            // notify_waiters fired by the root's close/def_repo must not race
+            // the condition load.
+            let progress = self.trace_ingest_progress_notify.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            if !self.has_open_trace_roots_that_may_mutate_family(family) {
+                return;
+            }
+            tokio::select! {
+                _ = &mut progress => {}
                 _ = self.wait_for_shutdown() => return,
             }
         }
@@ -4023,48 +4619,6 @@ impl ActorDaemonCoordinator {
             .clone())
     }
 
-    async fn append_checkpoint_to_family_sequencer(
-        &self,
-        family: &str,
-        request: CheckpointRequest,
-        respond_to: Option<oneshot::Sender<Result<u64, GitAiError>>>,
-    ) -> Result<(), GitAiError> {
-        // Causal drain fence: ensure already-visible trace2 work has reached
-        // the family sequencer before inserting this checkpoint.
-        self.wait_for_trace_ingest_processed_through().await;
-
-        let exec_lock = self.side_effect_exec_lock(family)?;
-        let _guard = exec_lock.lock().await;
-
-        {
-            let mut sequencers = self.family_sequencers_by_family.lock().map_err(|_| {
-                GitAiError::Generic("family sequencer map lock poisoned".to_string())
-            })?;
-            let state =
-                sequencers
-                    .entry(family.to_string())
-                    .or_insert_with(|| FamilySequencerState {
-                        next_ordinal: 1,
-                        entries: BTreeMap::new(),
-                    });
-            let order = FamilySequencerOrder {
-                started_at_ns: now_unix_nanos(),
-                ordinal: state.next_ordinal,
-            };
-            state.next_ordinal = state.next_ordinal.saturating_add(1);
-            state.entries.insert(
-                order,
-                FamilySequencerEntry::Checkpoint {
-                    request: Box::new(request),
-                    respond_to,
-                },
-            );
-        }
-
-        self.drain_ready_family_sequencer_entries_locked(family)
-            .await
-    }
-
     async fn drain_ready_family_sequencer_entries_locked(
         &self,
         family: &str,
@@ -4075,12 +4629,12 @@ impl ActorDaemonCoordinator {
             let mut map = self.family_sequencers_by_family.lock().map_err(|_| {
                 GitAiError::Generic("family sequencer map lock poisoned".to_string())
             })?;
-            let state = map
-                .entry(family.to_string())
-                .or_insert_with(|| FamilySequencerState {
-                    next_ordinal: 1,
-                    entries: BTreeMap::new(),
-                });
+            if self.unadmitted_checkpoints.load(Ordering::Acquire) > 0 {
+                return Ok(());
+            }
+            let Some(state) = map.get_mut(family) else {
+                return Ok(());
+            };
             while let Some(first_entry) = state.entries.first_entry() {
                 if matches!(first_entry.get(), FamilySequencerEntry::PendingRoot) {
                     break;
@@ -4115,6 +4669,22 @@ impl ActorDaemonCoordinator {
 
         let _ = self.begin_family_effect(family);
         for (order, ready_entry) in ready {
+            // Per-family drains must be strictly serialized; overlapping or
+            // order-regressing exec windows in a wltrace capture indicate a
+            // broken exec-lock (see the GC held-lock eviction regression).
+            crate::wltrace::wltrace("drain.exec", Path::new(family), || {
+                let entry = match &ready_entry {
+                    FamilySequencerEntry::ReadyCommand(command) => format!(
+                        "command:{}",
+                        command.primary_command.as_deref().unwrap_or("unknown")
+                    ),
+                    FamilySequencerEntry::Checkpoint { receipt_seq, .. } => {
+                        format!("checkpoint:seq={receipt_seq}")
+                    }
+                    _ => "other".to_string(),
+                };
+                format!("order={order} entry={entry}")
+            });
             match ready_entry {
                 FamilySequencerEntry::ReadyCommand(command) => {
                     // Wrap the entire command + side-effect pipeline in catch_unwind
@@ -4201,7 +4771,8 @@ impl ActorDaemonCoordinator {
                 }
                 FamilySequencerEntry::Checkpoint {
                     mut request,
-                    respond_to,
+                    receipt_seq,
+                    reservation: _reservation,
                 } => {
                     let repo_wd = request
                         .files
@@ -4214,6 +4785,7 @@ impl ActorDaemonCoordinator {
                         .map(|f| f.path.to_string_lossy().to_string())
                         .collect();
                     let checkpoint_kind = request.checkpoint_kind;
+                    let checkpoint_trace_id = request.trace_id.clone();
                     let checkpoint_path_role = request.path_role;
                     let checkpoint_has_agent = request.agent_id.is_some();
                     let checkpoint_kind_str = format!("{:?}", checkpoint_kind);
@@ -4257,9 +4829,15 @@ impl ActorDaemonCoordinator {
                                     error: None,
                                 };
                                 let _ = self.maybe_append_test_completion_log(family, &log_entry);
-                                if let Some(respond_to) = respond_to {
-                                    let _ = respond_to.send(Ok(0));
-                                }
+                                tracing::info!(
+                                    component = "daemon",
+                                    phase = "checkpoint_processing",
+                                    receipt_seq,
+                                    trace_id = %checkpoint_trace_id,
+                                    %family,
+                                    status = "suppressed",
+                                    "checkpoint processing completed"
+                                );
                                 continue;
                             }
                         }
@@ -4276,6 +4854,15 @@ impl ActorDaemonCoordinator {
 
                     let should_log_completion = true; // Always log for test sync
                     tracing::info!(kind = %checkpoint_kind_str, repo = %repo_wd, "checkpoint start");
+                    let checkpoint_side_effect_permit = self
+                        .checkpoint_side_effect_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|_| {
+                            GitAiError::Generic(
+                                "checkpoint side-effect semaphore closed".to_string(),
+                            )
+                        })?;
                     let checkpoint_start = std::time::Instant::now();
                     let checkpoint_request = {
                         let future = async {
@@ -4284,12 +4871,20 @@ impl ActorDaemonCoordinator {
                                     self.coordinator.apply_checkpoint(Path::new(&repo_wd)).await;
                                 match ack {
                                     Ok(ack) => {
-                                        apply_checkpoint_side_effect(*request).map(|_| ack.seq)
+                                        crate::tokio_runtime::spawn_blocking_result(move || {
+                                            apply_checkpoint_side_effect(*request)
+                                        })
+                                        .await
+                                        .map(|_| ack.seq)
                                     }
                                     Err(error) => Err(error),
                                 }
                             } else {
-                                apply_checkpoint_side_effect(*request).map(|_| 0)
+                                crate::tokio_runtime::spawn_blocking_result(move || {
+                                    apply_checkpoint_side_effect(*request)
+                                })
+                                .await
+                                .map(|_| 0)
                             }
                         };
                         let caught = std::panic::AssertUnwindSafe(future);
@@ -4321,6 +4916,7 @@ impl ActorDaemonCoordinator {
                             )))
                         }
                     };
+                    drop(checkpoint_side_effect_permit);
                     let checkpoint_duration_ms = checkpoint_start.elapsed().as_millis();
                     if result.is_ok() {
                         tracing::info!(
@@ -4361,8 +4957,8 @@ impl ActorDaemonCoordinator {
                         } else {
                             std::collections::HashMap::new()
                         };
-                        if !per_file.is_empty() || !per_worktree.is_empty() {
-                            let _ = self
+                        if (!per_file.is_empty() || !per_worktree.is_empty())
+                            && let Err(error) = self
                                 .coordinator
                                 .update_watermarks_family(
                                     Path::new(&repo_wd),
@@ -4371,13 +4967,30 @@ impl ActorDaemonCoordinator {
                                         per_worktree,
                                     },
                                 )
-                                .await;
+                                .await
+                        {
+                            let _ = self.record_side_effect_error(family, order, &error);
+                            tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_processing",
+                                reason = "watermark_update_failed",
+                                receipt_seq,
+                                %family,
+                                order,
+                                %error,
+                                "checkpoint watermark update failed"
+                            );
                         }
                     }
                     // Removed captured_checkpoint_id cleanup - no more captured checkpoints
                     if let Err(error) = &result {
                         let _ = self.record_side_effect_error(family, order, error);
                         tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_processing",
+                            reason = "side_effect_failed",
+                            receipt_seq,
+                            trace_id = %checkpoint_trace_id,
                             %error,
                             %family,
                             order,
@@ -4405,6 +5018,11 @@ impl ActorDaemonCoordinator {
                         {
                             let _ = self.record_side_effect_error(family, order, &error);
                             tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_processing",
+                                reason = "completion_log_failed",
+                                receipt_seq,
+                                trace_id = %checkpoint_trace_id,
                                 %error,
                                 %family,
                                 order,
@@ -4412,9 +5030,16 @@ impl ActorDaemonCoordinator {
                             );
                         }
                     }
-                    if let Some(respond_to) = respond_to {
-                        let _ = respond_to.send(result);
-                    }
+                    tracing::info!(
+                        component = "daemon",
+                        phase = "checkpoint_processing",
+                        receipt_seq,
+                        trace_id = %checkpoint_trace_id,
+                        %family,
+                        status = if result.is_ok() { "ok" } else { "error" },
+                        duration_ms = checkpoint_duration_ms as u64,
+                        "checkpoint processing completed"
+                    );
                 }
                 FamilySequencerEntry::Canceled => {}
                 FamilySequencerEntry::PendingRoot => {}
@@ -4447,7 +5072,13 @@ impl ActorDaemonCoordinator {
             .map_err(|_| {
                 GitAiError::Generic("pending rebase original-head map lock poisoned".to_string())
             })?;
-        map.insert(Self::worktree_state_key(worktree), (original_head, onto));
+        map.insert(
+            Self::worktree_state_key(worktree),
+            PendingRebase {
+                original_head,
+                onto,
+            },
+        );
         Ok(())
     }
 
@@ -4468,7 +5099,7 @@ impl ActorDaemonCoordinator {
     fn take_pending_rebase_original_head_for_worktree(
         &self,
         worktree: &Path,
-    ) -> Result<Option<(String, Option<String>)>, GitAiError> {
+    ) -> Result<Option<PendingRebase>, GitAiError> {
         let mut map = self
             .pending_rebase_original_head_by_worktree
             .lock()
@@ -4732,6 +5363,21 @@ impl ActorDaemonCoordinator {
             None
         };
 
+        if rewrite_diagnostics_enabled() {
+            tracing::info!(
+                event = "rewrite.detection_input",
+                root_sid = %cmd.root_sid,
+                primary = ?cmd.primary_command,
+                worktree = %worktree.display(),
+                exit_code = cmd.exit_code,
+                ref_changes = ?cmd.ref_changes,
+                pending_original_head = ?pending_original_head
+                    .as_ref()
+                    .map(|pending| pending.original_head.as_str()),
+                "rewrite detection input"
+            );
+        }
+
         // Collect branch ref changes (skip notes, tags, etc.)
         let mut branch_changes: Vec<_> = cmd
             .ref_changes
@@ -4758,6 +5404,15 @@ impl ActorDaemonCoordinator {
         }
 
         if branch_changes.is_empty() && pending_original_head.is_none() {
+            if rewrite_diagnostics_enabled() {
+                tracing::info!(
+                    event = "rewrite.decision",
+                    root_sid = %cmd.root_sid,
+                    primary = ?cmd.primary_command,
+                    decision = "skipped_no_valid_ref_changes",
+                    "rewrite detection skipped"
+                );
+            }
             return Ok(());
         }
 
@@ -4769,6 +5424,53 @@ impl ActorDaemonCoordinator {
                 .entry(rc.reference.as_str())
                 .and_modify(|(_old, new)| *new = &rc.new)
                 .or_insert((&rc.old, &rc.new));
+        }
+
+        // Lite mode keeps working logs aligned with the final ref tips, but does not
+        // inspect the commit graph or migrate authorship notes. Everything needed for
+        // this bookkeeping comes from the already-normalized trace2/ref transition.
+        if config::Config::get().get_feature_flags().lite_mode {
+            if let Some(pending) = pending_original_head.as_ref()
+                && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
+            {
+                if pending.original_head != new_tip {
+                    repo.storage
+                        .rename_working_log(&pending.original_head, &new_tip)?;
+                }
+                return Ok(());
+            }
+            if !matches!(
+                cmd.primary_command.as_deref(),
+                Some("rebase" | "pull" | "update-ref")
+            ) {
+                return Ok(());
+            }
+            let command_moves_checked_out_history =
+                matches!(cmd.primary_command.as_deref(), Some("rebase" | "pull"));
+            let mut collapsed_head: Option<(&str, &str)> = None;
+            for change in cmd.ref_changes.iter().filter(|change| {
+                change.reference == "HEAD"
+                    && is_valid_oid(&change.old)
+                    && !is_zero_oid(&change.old)
+                    && is_valid_oid(&change.new)
+                    && !is_zero_oid(&change.new)
+            }) {
+                if let Some((_old, new)) = &mut collapsed_head {
+                    *new = &change.new;
+                } else {
+                    collapsed_head = Some((&change.old, &change.new));
+                }
+            }
+            for (old_tip, new_tip) in collapsed.values() {
+                let moves_head = command_moves_checked_out_history
+                    || collapsed_head.is_some_and(|(head_old, head_new)| {
+                        head_old == *old_tip && head_new == *new_tip
+                    });
+                if old_tip != new_tip && moves_head {
+                    repo.storage.rename_working_log(old_tip, new_tip)?;
+                }
+            }
+            return Ok(());
         }
 
         // Extract "onto" hint from HEAD ref changes for rebases.
@@ -4785,15 +5487,35 @@ impl ActorDaemonCoordinator {
         // with the branch ref update as new_tip. This handles rebase --skip/--continue
         // where HEAD can contain extra checkout/detach movement that is not the
         // rebased branch tip.
-        if let Some((original_head, stored_onto)) = pending_original_head
-            && let Some(new_tip) = rebase_new_tip_from_command(cmd, &original_head)
+        crate::wltrace::wltrace(
+            "rewrite.branch_transition",
+            Path::new(cmd.worktree.as_deref().unwrap_or(Path::new(""))),
+            || {
+                format!(
+                    "cmd={} branch_changes={} pending_original_head={} ref_changes={}",
+                    cmd.primary_command.as_deref().unwrap_or("unknown"),
+                    branch_changes.len(),
+                    pending_original_head
+                        .as_ref()
+                        .map(|pending| pending.original_head.as_str())
+                        .unwrap_or("NONE"),
+                    cmd.ref_changes.len(),
+                )
+            },
+        );
+
+        if let Some(pending) = pending_original_head
+            && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
         {
-            if original_head != new_tip && !is_ancestor_commit(&repo, &original_head, &new_tip) {
+            if pending.original_head != new_tip
+                && !is_ancestor_commit(&repo, &pending.original_head, &new_tip)
+            {
                 let command_rebase_onto =
-                    rebase_onto_from_command(cmd, &repo, &original_head, &new_tip);
-                let rebase_onto = stored_onto
+                    rebase_onto_from_command(cmd, &repo, &pending.original_head, &new_tip);
+                let rebase_onto = pending
+                    .onto
                     .filter(|onto| {
-                        onto != &original_head
+                        onto != &pending.original_head
                             && onto != &new_tip
                             && is_ancestor_commit(&repo, onto, &new_tip)
                     })
@@ -4801,12 +5523,13 @@ impl ActorDaemonCoordinator {
                 let outcome =
                     crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
                         &repo,
-                        &original_head,
+                        &pending.original_head,
                         &new_tip,
                         rebase_onto.as_deref(),
                         crate::authorship::rewrite::RewriteMetricOperation::Rebase,
                     )?;
-                repo.storage.rename_working_log(&original_head, &new_tip)?;
+                repo.storage
+                    .rename_working_log(&pending.original_head, &new_tip)?;
                 let conflict_base = rebase_onto.clone();
                 let metric_context = process_conflict_resolution_working_logs(
                     &repo,
@@ -4816,8 +5539,12 @@ impl ActorDaemonCoordinator {
                 let metric_commits =
                     rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
                 if !metric_commits.is_empty() {
-                    let branch =
-                        rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
+                    let branch = rewrite_metric_branch_for_transition(
+                        cmd,
+                        &pending.original_head,
+                        &new_tip,
+                        None,
+                    );
                     crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
                         &repo,
                         rewrite_metric_commits_with_branch(metric_commits, branch),
@@ -4892,6 +5619,12 @@ impl ActorDaemonCoordinator {
     fn start_commit_file_timestamp_snapshots_for_command(
         command: &crate::daemon::domain::NormalizedCommand,
     ) -> CommitFileTimestampSnapshotHandles {
+        if config::Config::get().get_feature_flags().lite_mode
+            && command.primary_command.as_deref() == Some("commit")
+            && command.invoked_args.iter().any(|arg| arg == "--amend")
+        {
+            return HashMap::new();
+        }
         let Some(worktree) = command.worktree.clone() else {
             return HashMap::new();
         };
@@ -5005,6 +5738,7 @@ impl ActorDaemonCoordinator {
         let events = &applied.analysis.events;
 
         let primary = cmd.primary_command.as_deref().unwrap_or("unknown");
+        let lite_mode = config::Config::get().get_feature_flags().lite_mode;
 
         #[cfg(feature = "test-support")]
         if let Ok(spec) = std::env::var("GIT_AI_TEST_DELAY_SIDE_EFFECT_MS_FOR_COMMAND") {
@@ -5157,6 +5891,21 @@ impl ActorDaemonCoordinator {
                         .unwrap_or("");
                     let pending_old_head =
                         strict_rebase_original_head_from_command(cmd, semantic_old_head);
+                    crate::wltrace::wltrace(
+                        "rebase.pending_head",
+                        cmd.worktree.as_deref().unwrap_or(Path::new("")),
+                        || {
+                            format!(
+                                "old_head={} rebase_start={} ref_changes={}",
+                                pending_old_head.as_deref().unwrap_or("NONE"),
+                                rebase_start
+                                    .as_ref()
+                                    .map(|(old, new)| format!("{old}->{new}"))
+                                    .unwrap_or_else(|| "NONE".to_string()),
+                                cmd.ref_changes.len(),
+                            )
+                        },
+                    );
                     if let Some(old_head) = pending_old_head {
                         let rebase_onto = rebase_start.as_ref().map(|(_, new)| new.clone());
                         if std::env::var("GIT_AI_DEBUG_DAEMON_TRACE")
@@ -5189,7 +5938,7 @@ impl ActorDaemonCoordinator {
                 if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
                     self.clear_pending_cherry_pick_no_commit_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 {
+                } else if !lite_mode && cmd.exit_code != 0 {
                     let new_commits = cherry_pick_destination_commits(cmd);
                     let is_continue = cherry_pick_command_has_flag(cmd, "--continue");
                     let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
@@ -5316,7 +6065,16 @@ impl ActorDaemonCoordinator {
                         source_commits,
                         new_commits,
                     } => {
-                        if !new_head.is_empty() {
+                        if lite_mode {
+                            if !original_head.is_empty()
+                                && !new_head.is_empty()
+                                && original_head != new_head
+                            {
+                                let repo = find_repository_in_path(&worktree)?;
+                                repo.storage.rename_working_log(original_head, new_head)?;
+                            }
+                            self.clear_pending_cherry_pick_sources_for_worktree(worktree.as_ref())?;
+                        } else if !new_head.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
                             let mut sources = source_commits.clone();
                             let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
@@ -5368,7 +6126,7 @@ impl ActorDaemonCoordinator {
                     crate::daemon::domain::SemanticEvent::CherryPickNoCommit {
                         source_commits,
                         head,
-                    } => {
+                    } if !lite_mode => {
                         let mut sources = source_commits.clone();
                         if sources.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
@@ -5513,6 +6271,18 @@ impl ActorDaemonCoordinator {
                             && cmd.primary_command.as_deref() == Some("revert")
                         {
                             if !handled_revert_commits {
+                                handled_revert_commits = true;
+                                if lite_mode {
+                                    if let Some(base) = base.as_deref()
+                                        && let Some(destination) =
+                                            revert_destination_changes(cmd).last()
+                                        && base != destination.new
+                                    {
+                                        let repo = find_repository_in_path(&worktree)?;
+                                        repo.storage.rename_working_log(base, &destination.new)?;
+                                    }
+                                    continue;
+                                }
                                 // A single `git revert A B` creates one commit per source.
                                 // Reconstruct each destination from the matching HEAD transition
                                 // instead of treating the command as one final CommitCreated event.
@@ -5524,12 +6294,21 @@ impl ActorDaemonCoordinator {
                                     )?;
                                 }
                                 apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
-                                handled_revert_commits = true;
                             }
                         } else if !new_head.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
                             let author = repo.effective_author_identity().formatted_or_unknown();
                             let base_opt = base.clone().filter(|b| !b.is_empty() && b != "initial");
+                            crate::wltrace::wltrace(
+                                "commit.post_commit",
+                                Path::new(cmd.worktree.as_deref().unwrap_or(Path::new(""))),
+                                || {
+                                    format!(
+                                        "sid={} base={:?} new_head={}",
+                                        cmd.root_sid, base_opt, new_head
+                                    )
+                                },
+                            );
                             let recovery_file_timestamps = Self::take_commit_file_timestamps(
                                 commit_file_timestamp_snapshots,
                                 new_head,
@@ -5559,7 +6338,8 @@ impl ActorDaemonCoordinator {
                                 )
                             })?;
 
-                            if cmd.primary_command.as_deref() == Some("commit")
+                            if !lite_mode
+                                && cmd.primary_command.as_deref() == Some("commit")
                                 && let Some(pending) = self
                                     .take_pending_cherry_pick_no_commit_for_worktree(
                                         worktree.as_ref(),
@@ -5582,57 +6362,60 @@ impl ActorDaemonCoordinator {
                             }
                         }
                     }
-                    crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head } => {
+                    crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head }
                         if !old_head.is_empty()
                             && !new_head.is_empty()
                             && old_head != new_head
                             && is_valid_oid(old_head)
                             && !is_zero_oid(old_head)
                             && is_valid_oid(new_head)
-                            && !is_zero_oid(new_head)
-                        {
-                            let repo = find_repository_in_path(&worktree)?;
-                            let author = repo.effective_author_identity().formatted_or_unknown();
-                            let recovery_file_timestamps = Self::take_commit_file_timestamps(
-                                commit_file_timestamp_snapshots,
+                            && !is_zero_oid(new_head) =>
+                    {
+                        let repo = find_repository_in_path(&worktree)?;
+                        if lite_mode {
+                            repo.storage.rename_working_log(old_head, new_head)?;
+                            continue;
+                        }
+                        let author = repo.effective_author_identity().formatted_or_unknown();
+                        let recovery_file_timestamps = Self::take_commit_file_timestamps(
+                            commit_file_timestamp_snapshots,
+                            new_head,
+                        )
+                        .await;
+                        let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
+                            self.wait_for_session_event_recovery_candidate(
+                                &repo,
                                 new_head,
+                                recovery_file_timestamps.as_ref(),
+                                unknown_by_file,
+                            );
+                        };
+                        // Post-commit note generation does synchronous git/filesystem work
+                        // and may briefly wait for transcript recovery. Mark it as blocking
+                        // so the transcript worker can process the recovery sweep promptly.
+                        let amend_result = run_blocking_side_effect(|| {
+                            crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
+                                &repo,
+                                old_head,
+                                new_head,
+                                author,
+                                recovery_file_timestamps.as_ref(),
+                                Some(&recovery_preflight),
                             )
-                            .await;
-                            let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
-                                self.wait_for_session_event_recovery_candidate(
-                                    &repo,
-                                    new_head,
-                                    recovery_file_timestamps.as_ref(),
-                                    unknown_by_file,
-                                );
-                            };
-                            // Post-commit note generation does synchronous git/filesystem work
-                            // and may briefly wait for transcript recovery. Mark it as blocking
-                            // so the transcript worker can process the recovery sweep promptly.
-                            let amend_result = run_blocking_side_effect(|| {
-                                crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
-                                    &repo,
-                                    old_head,
-                                    new_head,
-                                    author,
-                                    recovery_file_timestamps.as_ref(),
-                                    Some(&recovery_preflight),
-                                )
-                            })?;
-                            if crate::authorship::rewrite::rewrite_metrics_enabled() {
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                                    &repo,
-                                    vec![
-                                        crate::authorship::rewrite::RewriteMetricCommit::new(
-                                            new_head.to_string(),
-                                            vec![old_head.to_string()],
-                                            crate::authorship::rewrite::RewriteMetricOperation::Amend,
-                                        )
-                                        .with_parent_sha(amend_result.parent_sha)
-                                        .with_authorship_note(amend_result.authorship_note),
-                                    ],
-                                );
-                            }
+                        })?;
+                        if crate::authorship::rewrite::rewrite_metrics_enabled() {
+                            crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
+                                &repo,
+                                vec![
+                                    crate::authorship::rewrite::RewriteMetricCommit::new(
+                                        new_head.to_string(),
+                                        vec![old_head.to_string()],
+                                        crate::authorship::rewrite::RewriteMetricOperation::Amend,
+                                    )
+                                    .with_parent_sha(amend_result.parent_sha)
+                                    .with_authorship_note(amend_result.authorship_note),
+                                ],
+                            );
                         }
                     }
                     crate::daemon::domain::SemanticEvent::Reset {
@@ -5655,7 +6438,7 @@ impl ActorDaemonCoordinator {
                                     // commit): carry the working log to the new base,
                                     // matching the pull fast-forward side effect.
                                     repo.storage.rename_working_log(old_head, new_head)?;
-                                } else {
+                                } else if !lite_mode {
                                     let outcome =
                                         crate::authorship::rewrite::handle_rewrite_event_with_metrics(
                                         &repo,
@@ -5708,9 +6491,11 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Handle update-ref: migrate working logs and authorship notes when the ref
-        // update affects the currently checked-out branch.
-        if primary == "update-ref"
+        // Handle direct tip movers: migrate working logs and authorship notes when
+        // the update affects the currently checked-out branch. A branch create/reset
+        // (`branch -f`) uses the same rewrite, while rename/copy lifecycle events do not.
+        if (primary == "update-ref"
+            || primary == "branch" && crate::daemon::ref_cursor::branch_command_is_tip_update(cmd))
             && let Some(worktree) = cmd.worktree.as_ref()
         {
             for event in events {
@@ -5727,6 +6512,11 @@ impl ActorDaemonCoordinator {
                         || is_zero_oid(new)
                         || old == new
                     {
+                        continue;
+                    }
+                    if lite_mode {
+                        // The trace-derived pass above already moved the working log when this
+                        // transition also moved HEAD. Avoid the commit-graph lookup and note write.
                         continue;
                     }
                     let repo = find_repository_in_path(&worktree.to_string_lossy())?;
@@ -5920,26 +6710,6 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
-    async fn ingest_checkpoint_payload(
-        &self,
-        request: CheckpointRequest,
-    ) -> Result<ControlResponse, GitAiError> {
-        if request.files.is_empty() {
-            return Ok(ControlResponse::ok(None, None));
-        }
-
-        let repo_work_dir = request.files[0].repo_work_dir.clone();
-        let family = self.backend.resolve_family(&repo_work_dir)?;
-
-        let (respond_to, response) = oneshot::channel();
-        self.append_checkpoint_to_family_sequencer(&family.0, request, Some(respond_to))
-            .await?;
-        response
-            .await
-            .map_err(|_| GitAiError::Generic("checkpoint response channel closed".to_string()))??;
-        Ok(ControlResponse::ok(None, None))
-    }
-
     async fn watermarks_for_family(
         &self,
         repo_working_dir: String,
@@ -5969,16 +6739,81 @@ impl ActorDaemonCoordinator {
         })
     }
 
+    async fn wait_for_checkpoint_admission_through(&self, target: u64) {
+        loop {
+            // Enroll before checking (see wait_for_trace_ingest_seq): the
+            // final admission's notify_waiters must not race the load.
+            let progress = self.checkpoint_progress_notify.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            let processed = self
+                .processed_checkpoint_receipt_seq
+                .load(Ordering::Acquire) as u64;
+            if processed >= target {
+                return;
+            }
+            tokio::select! {
+                _ = &mut progress => {}
+                _ = self.wait_for_shutdown() => return,
+            }
+        }
+    }
+
+    async fn wait_for_no_unadmitted_checkpoints(&self) {
+        loop {
+            // Enroll before checking (see wait_for_trace_ingest_seq).
+            let progress = self.checkpoint_progress_notify.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            if self.unadmitted_checkpoints.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::select! {
+                _ = &mut progress => {}
+                _ = self.wait_for_shutdown() => return,
+            }
+        }
+    }
+
     async fn sync_family(&self, repo_working_dir: String) -> Result<FamilyStatus, GitAiError> {
+        let checkpoint_target = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
+        self.wait_for_checkpoint_admission_through(checkpoint_target)
+            .await;
+        self.wait_for_no_unadmitted_checkpoints().await;
         let family = self.backend.resolve_family(Path::new(&repo_working_dir))?;
-        self.wait_for_trace_ingest_processed_through().await;
+        self.wait_for_trace_ingest_processed_through_family(&family.0)
+            .await;
 
         let exec_lock = self.side_effect_exec_lock(&family.0)?;
-        let _guard = exec_lock.lock().await;
-        self.drain_ready_family_sequencer_entries_locked(&family.0)
-            .await?;
+        loop {
+            self.wait_for_no_unadmitted_checkpoints().await;
+            let guard = exec_lock.lock().await;
+            self.drain_ready_family_sequencer_entries_locked(&family.0)
+                .await?;
+            if self.unadmitted_checkpoints.load(Ordering::Acquire) == 0 {
+                drop(guard);
+                break;
+            }
+            drop(guard);
+        }
 
         self.status_for_family(repo_working_dir).await
+    }
+
+    async fn drain_accepted_checkpoints(&self) -> Result<(), GitAiError> {
+        loop {
+            let checkpoint_target = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
+            self.wait_for_checkpoint_admission_through(checkpoint_target)
+                .await;
+            self.wait_for_no_unadmitted_checkpoints().await;
+            self.wait_for_trace_ingest_processed_through().await;
+            self.drain_all_ready_family_sequencers().await?;
+
+            if self.outstanding_checkpoint_state().0 == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Wait for the daemon to finish all in-flight work and telemetry flushing.
@@ -6113,6 +6948,9 @@ impl ActorDaemonCoordinator {
     }
 
     fn has_pending_daemon_work(&self) -> bool {
+        if self.checkpoint_ingress_quota.outstanding().0 > 0 {
+            return true;
+        }
         if self.queued_trace_payloads.load(Ordering::Acquire) > 0 {
             return true;
         }
@@ -6139,38 +6977,26 @@ impl ActorDaemonCoordinator {
         false
     }
 
+    fn outstanding_checkpoint_state(&self) -> (usize, usize) {
+        self.checkpoint_ingress_quota.outstanding()
+    }
+
+    fn set_checkpoint_acceptance(&self, accepting: bool) -> Result<(), GitAiError> {
+        let _sequencers = self
+            .family_sequencers_by_family
+            .lock()
+            .map_err(|_| GitAiError::Generic("family sequencer map lock poisoned".to_string()))?;
+        self.accepting_checkpoints
+            .store(accepting, Ordering::Release);
+        Ok(())
+    }
+
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
-            ControlRequest::CheckpointRun { request } => {
-                if let Some(worker) = &self.stream_worker
-                    && let Some(stream_source) = &request.stream_source
-                {
-                    let session_id = stream_source.session_id.clone();
-                    let tool = request
-                        .agent_id
-                        .as_ref()
-                        .map(|aid| aid.tool.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let trace_id = request.trace_id.clone();
-                    let tool_use_id = request.metadata.get("tool_use_id").cloned();
-
-                    let repo_work_dir = request.files.first().map(|f| f.repo_work_dir.clone());
-
-                    worker.notify_checkpoint(
-                        session_id,
-                        tool,
-                        trace_id,
-                        tool_use_id,
-                        stream_source.path.clone(),
-                        repo_work_dir,
-                        stream_source.external_session_id.clone(),
-                        stream_source.external_parent_session_id.clone(),
-                    );
-                }
-
-                self.ingest_checkpoint_payload(*request).await
-            }
+            ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
+                "checkpoint.run requires the framed checkpoint transport".to_string(),
+            )),
             ControlRequest::SyncFamily { repo_working_dir } => {
                 self.sync_family(repo_working_dir).await.and_then(|status| {
                     serde_json::to_value(status)
@@ -6459,7 +7285,28 @@ impl ActorDaemonCoordinator {
                 };
                 Ok(response)
             }
-            ControlRequest::Shutdown => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::Shutdown => match self.set_checkpoint_acceptance(false) {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    tracing::info!(
+                        component = "daemon",
+                        phase = "shutdown",
+                        "checkpoint acceptance closed for graceful shutdown"
+                    );
+                    match self.drain_accepted_checkpoints().await {
+                        Ok(()) => Ok(ControlResponse::ok(None, None)),
+                        Err(error) => {
+                            if let Err(reopen_error) = self.set_checkpoint_acceptance(true) {
+                                tracing::error!(
+                                    %reopen_error,
+                                    "failed reopening checkpoint acceptance after shutdown error"
+                                );
+                            }
+                            Err(error)
+                        }
+                    }
+                }
+            },
         };
 
         match result {
@@ -6494,7 +7341,13 @@ fn control_listener_loop_actor(
             if std::thread::Builder::new()
                 .spawn(move || {
                     if let Err(e) = handle_control_connection_actor(stream, coord, handle) {
-                        tracing::debug!(%e, "control connection error");
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "control_receive",
+                            reason = "connection_error",
+                            error = %e,
+                            "daemon control connection failed"
+                        );
                     }
                 })
                 .is_err()
@@ -6652,15 +7505,55 @@ fn windows_control_pipe_worker_loop(
 
 #[cfg(windows)]
 fn handle_windows_control_pipe_connection(
-    mut server: WindowsPipeServer,
+    server: WindowsPipeServer,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
-    let mut reader = BufReader::new(&mut server);
+    let mut reader = BufReader::new(server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
-        tracing::debug!(%e, "control connection error");
+        tracing::error!(
+            component = "daemon",
+            phase = "control_receive",
+            reason = "connection_error",
+            error = %e,
+            "daemon control connection failed"
+        );
     }
+}
+
+trait ControlConnection: Read + Write {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError>;
+}
+
+#[cfg(windows)]
+impl ControlConnection for WindowsPipeServer {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError> {
+        self.set_read_timeout(timeout);
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+impl ControlConnection for LocalSocketStream {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError> {
+        self.set_recv_timeout(timeout).map_err(|error| {
+            GitAiError::Generic(format!(
+                "failed setting daemon control receive timeout: {error}"
+            ))
+        })
+    }
+}
+
+fn control_receive_timed_out(error: &GitAiError) -> bool {
+    matches!(
+        error,
+        GitAiError::IoError(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
 }
 
 #[cfg(not(windows))]
@@ -6673,33 +7566,287 @@ fn handle_control_connection_actor(
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
 
-fn handle_control_connection_actor_reader<R: Read + Write>(
+fn handle_control_connection_actor_reader<R: ControlConnection>(
     reader: &mut BufReader<R>,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), GitAiError> {
-    while let Some(line) = read_json_line(reader)? {
+    reader
+        .get_mut()
+        .set_receive_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))?;
+    let mut uses_idle_timeout = false;
+    loop {
+        let line = match read_json_line(reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) if control_receive_timed_out(&error) => break,
+            Err(error) => return Err(error),
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let parsed = serde_json::from_str::<ControlRequest>(trimmed);
+        if !uses_idle_timeout
+            && matches!(
+                &parsed,
+                Ok(request) if !matches!(request, ControlRequest::CheckpointRun { .. })
+            )
+        {
+            reader
+                .get_mut()
+                .set_receive_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT))?;
+            uses_idle_timeout = true;
+        }
         let mut shutdown_after_response = false;
         let response = match parsed {
-            Ok(req) => {
-                shutdown_after_response = matches!(req, ControlRequest::Shutdown);
-                runtime_handle.block_on(async { coordinator.handle_control_request(req).await })
+            Ok(ControlRequest::CheckpointRun { body_bytes }) => {
+                if !coordinator.accepting_checkpoints.load(Ordering::Acquire) {
+                    let acceptance_closed = {
+                        let _sequencers =
+                            coordinator
+                                .family_sequencers_by_family
+                                .lock()
+                                .map_err(|_| {
+                                    GitAiError::Generic(
+                                        "family sequencer map lock poisoned".to_string(),
+                                    )
+                                })?;
+                        !coordinator.accepting_checkpoints.load(Ordering::Acquire)
+                    };
+                    if acceptance_closed {
+                        write_control_response(
+                            reader.get_mut(),
+                            &ControlResponse::err("daemon is shutting down"),
+                        )?;
+                        continue;
+                    }
+                }
+                let body_bytes = match usize::try_from(body_bytes) {
+                    Ok(body_bytes) => body_bytes,
+                    Err(error) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            reason = "body_length_overflow",
+                            declared_body_bytes = body_bytes,
+                            %error,
+                            "checkpoint body length does not fit this platform"
+                        );
+                        write_control_response(
+                            reader.get_mut(),
+                            &ControlResponse::err("checkpoint body length is too large"),
+                        )?;
+                        continue;
+                    }
+                };
+                let reservation = match coordinator.checkpoint_ingress_quota.reserve(body_bytes) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            reason = error.reason,
+                            requested_bytes = error.requested_bytes,
+                            outstanding_requests = error.outstanding_requests,
+                            outstanding_bytes = error.outstanding_bytes,
+                            request_limit = error.request_limit,
+                            byte_limit = error.byte_limit,
+                            "checkpoint ingress quota exhausted"
+                        );
+                        write_control_response(
+                            reader.get_mut(),
+                            &ControlResponse::err(format!(
+                                "checkpoint ingress busy: {}",
+                                error.reason
+                            )),
+                        )?;
+                        continue;
+                    }
+                };
+
+                if let Err(error) = write_control_response(
+                    reader.get_mut(),
+                    &ControlResponse::ok(None, Some(json!({ "ready": true }))),
+                ) {
+                    tracing::error!(
+                        component = "daemon",
+                        phase = "checkpoint_receive",
+                        reason = "ready_response_write_failed",
+                        body_bytes,
+                        %error,
+                        "failed writing checkpoint ready response"
+                    );
+                    return Err(error);
+                }
+
+                if uses_idle_timeout {
+                    reader
+                        .get_mut()
+                        .set_receive_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))?;
+                }
+                let body = match read_checkpoint_body(reader, reservation.body_bytes()) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            reason = "body_receive_failed",
+                            body_bytes,
+                            %error,
+                            "failed receiving checkpoint body"
+                        );
+                        return Err(error);
+                    }
+                };
+                if uses_idle_timeout {
+                    reader
+                        .get_mut()
+                        .set_receive_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT))?;
+                }
+                let Some(checkpoint_tx) = coordinator.checkpoint_ingress_tx.get().cloned() else {
+                    tracing::error!(
+                        component = "daemon",
+                        phase = "checkpoint_receive",
+                        reason = "ingress_worker_not_started",
+                        body_bytes,
+                        "checkpoint ingress worker is unavailable"
+                    );
+                    coordinator.request_shutdown();
+                    write_control_response(
+                        reader.get_mut(),
+                        &ControlResponse::err("checkpoint ingress worker is unavailable"),
+                    )?;
+                    continue;
+                };
+                let permit = match checkpoint_tx.try_reserve_owned() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            reason = "ingress_queue_full",
+                            body_bytes,
+                            queue_limit = CHECKPOINT_INGRESS_REQUEST_LIMIT,
+                            "checkpoint ingress queue is full despite quota reservation"
+                        );
+                        write_control_response(
+                            reader.get_mut(),
+                            &ControlResponse::err("checkpoint ingress busy: queue_full"),
+                        )?;
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::error!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            reason = "ingress_channel_closed",
+                            body_bytes,
+                            "checkpoint ingress channel is closed"
+                        );
+                        coordinator.request_shutdown();
+                        write_control_response(
+                            reader.get_mut(),
+                            &ControlResponse::err("checkpoint ingress worker is unavailable"),
+                        )?;
+                        continue;
+                    }
+                };
+                let receipt_seq = {
+                    let _sequencers =
+                        coordinator
+                            .family_sequencers_by_family
+                            .lock()
+                            .map_err(|_| {
+                                GitAiError::Generic(
+                                    "family sequencer map lock poisoned".to_string(),
+                                )
+                            })?;
+                    if coordinator.accepting_checkpoints.load(Ordering::Acquire) {
+                        let receipt_seq = coordinator
+                            .next_checkpoint_receipt_seq
+                            .fetch_add(1, Ordering::Relaxed)
+                            as u64
+                            + 1;
+                        let received_at_ns = now_unix_nanos();
+                        let trace_ingest_target =
+                            coordinator.next_trace_ingest_seq.load(Ordering::Acquire) as u64;
+                        coordinator
+                            .unadmitted_checkpoints
+                            .fetch_add(1, Ordering::Release);
+                        permit.send(AcceptedCheckpoint {
+                            receipt_seq,
+                            received_at_ns,
+                            trace_ingest_target,
+                            body,
+                            reservation,
+                        });
+                        Some(receipt_seq)
+                    } else {
+                        None
+                    }
+                };
+                match receipt_seq {
+                    Some(receipt_seq) => {
+                        tracing::info!(
+                            component = "daemon",
+                            phase = "checkpoint_receive",
+                            receipt_seq,
+                            retained_bytes = body_bytes,
+                            "checkpoint received into bounded ingress"
+                        );
+                        ControlResponse::ok(Some(receipt_seq), None)
+                    }
+                    None => ControlResponse::err("daemon is shutting down"),
+                }
             }
-            Err(e) => ControlResponse::err(format!("invalid control request: {}", e)),
+            Ok(req) => {
+                let is_shutdown = matches!(req, ControlRequest::Shutdown);
+                let response = runtime_handle
+                    .block_on(async { coordinator.handle_control_request(req).await });
+                shutdown_after_response = is_shutdown && response.ok;
+                response
+            }
+            Err(error) => {
+                tracing::error!(
+                    component = "daemon",
+                    phase = "control_receive",
+                    reason = "request_decode_failed",
+                    %error,
+                    "failed decoding daemon control request"
+                );
+                ControlResponse::err(format!("invalid control request: {error}"))
+            }
         };
-        let raw = serde_json::to_string(&response)?;
-        reader.get_mut().write_all(raw.as_bytes())?;
-        reader.get_mut().write_all(b"\n")?;
-        reader.get_mut().flush()?;
+        let write_result = write_control_response(reader.get_mut(), &response);
+        if let Err(error) = &write_result
+            && let Some(receipt_seq) = response.seq
+        {
+            tracing::error!(
+                component = "daemon",
+                phase = "checkpoint_receive",
+                reason = "receipt_ack_write_failed",
+                receipt_seq,
+                %error,
+                "failed writing checkpoint receipt acknowledgement"
+            );
+        }
         if shutdown_after_response {
             coordinator.request_stop();
         }
+        write_result?;
     }
+    Ok(())
+}
+
+fn write_control_response<W: Write>(
+    writer: &mut W,
+    response: &ControlResponse,
+) -> Result<(), GitAiError> {
+    let raw = serde_json::to_string(response)?;
+    writer.write_all(raw.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -7199,10 +8346,10 @@ fn daemon_min_uptime_for_self_restart() -> u64 {
         .unwrap_or(DAEMON_MIN_UPTIME_FOR_SELF_RESTART_SECS)
 }
 
-/// Background loop that verifies the daemon's sockets are reachable by
-/// actually connecting to them.  A successful connect proves the socket file
-/// exists, points to this daemon's listener, and that the listener thread is
-/// alive and calling accept().  If either probe fails (deleted file, stale
+/// Background loop that verifies the daemon's sockets are reachable. The
+/// control probe performs a bounded Ping request so it also proves a handler
+/// can receive and respond, while the write-only trace2 socket is verified by
+/// connecting to its listener. If either probe fails (deleted file, stale
 /// socket, hung listener), the daemon spawns a detached restart process and
 /// shuts down.
 ///
@@ -7243,12 +8390,40 @@ fn daemon_socket_health_check_loop(
             return;
         }
 
-        let control_ok =
-            local_socket_connects_with_timeout(&control_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
+        let control_ok = send_control_request_with_timeouts(
+            &control_socket_path,
+            &ControlRequest::Ping,
+            DAEMON_SOCKET_PROBE_TIMEOUT,
+            DAEMON_CONTROL_RESPONSE_TIMEOUT,
+        )
+        .and_then(|response| {
+            if response.ok {
+                Ok(())
+            } else {
+                Err(GitAiError::Generic(response.error.unwrap_or_else(|| {
+                    "daemon Ping returned an error".to_string()
+                })))
+            }
+        });
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
         if control_ok.is_err() || trace_ok.is_err() {
+            let (outstanding_checkpoints, retained_checkpoint_bytes) =
+                coordinator.outstanding_checkpoint_state();
+            if outstanding_checkpoints > 0 {
+                tracing::error!(
+                    component = "daemon",
+                    phase = "socket_health",
+                    reason = "restart_deferred_for_checkpoints",
+                    outstanding_checkpoints,
+                    retained_checkpoint_bytes,
+                    control = %control_ok.err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
+                    trace = %trace_ok.err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
+                    "socket health restart deferred while accepted checkpoints remain"
+                );
+                continue;
+            }
             let uptime = started.elapsed();
             let min_uptime = std::time::Duration::from_secs(daemon_min_uptime_for_self_restart());
 
@@ -7307,9 +8482,19 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 
         match check_for_update_available() {
             Ok(DaemonUpdateCheckResult::UpdateReady) => {
-                tracing::info!("update check: newer version available, requesting shutdown");
-                coordinator.request_restart_after_update();
-                return;
+                let (outstanding_checkpoints, retained_checkpoint_bytes) =
+                    coordinator.outstanding_checkpoint_state();
+                if outstanding_checkpoints > 0 {
+                    tracing::info!(
+                        outstanding_checkpoints,
+                        retained_checkpoint_bytes,
+                        "update restart deferred while accepted checkpoints remain"
+                    );
+                } else {
+                    tracing::info!("update check: newer version available, requesting shutdown");
+                    coordinator.request_restart_after_update();
+                    return;
+                }
             }
             Ok(DaemonUpdateCheckResult::NoUpdate) => {
                 tracing::info!("update check: no update needed");
@@ -7321,9 +8506,19 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
 
         let uptime_ns = now_unix_nanos().saturating_sub(started_at_ns);
         if uptime_ns >= daemon_max_uptime_ns() {
-            tracing::info!("uptime exceeded max, requesting restart");
-            coordinator.request_restart();
-            return;
+            let (outstanding_checkpoints, retained_checkpoint_bytes) =
+                coordinator.outstanding_checkpoint_state();
+            if outstanding_checkpoints > 0 {
+                tracing::info!(
+                    outstanding_checkpoints,
+                    retained_checkpoint_bytes,
+                    "uptime restart deferred while accepted checkpoints remain"
+                );
+            } else {
+                tracing::info!("uptime exceeded max, requesting restart");
+                coordinator.request_restart();
+                return;
+            }
         }
     }
 }
@@ -7441,6 +8636,12 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
 
     let coordinator = Arc::new(coordinator_inner);
     coordinator.start_trace_ingest_worker()?;
+    coordinator.start_checkpoint_ingress_worker()?;
+    if let Some(limit_mb) = config::Config::get().daemon_memory_limit_mb()
+        && let Some(limit_bytes) = limit_mb.checked_mul(config::MEBIBYTE_BYTES)
+    {
+        memory_watchdog::start(Arc::clone(&coordinator), limit_bytes)?;
+    }
     let rt_handle = tokio::runtime::Handle::current();
     let control_socket_path = config.control_socket_path.clone();
     let trace_socket_path = config.trace_socket_path.clone();
@@ -7582,6 +8783,7 @@ fn checkpoint_control_response_timeout(
         ControlRequest::Await { timeout_secs } => {
             Duration::from_secs(timeout_secs.saturating_add(5))
         }
+        ControlRequest::Shutdown => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     }
 }
@@ -7913,6 +9115,78 @@ pub fn send_control_request(
     )
 }
 
+pub fn send_checkpoint_request_with_timeout(
+    socket_path: &Path,
+    request: &CheckpointRequest,
+    timeout: Duration,
+) -> Result<ControlResponse, GitAiError> {
+    send_checkpoint_request_with_timeouts(socket_path, request, timeout, timeout)
+}
+
+pub fn send_checkpoint_request(
+    socket_path: &Path,
+    request: &CheckpointRequest,
+) -> Result<ControlResponse, GitAiError> {
+    send_checkpoint_request_with_timeouts(
+        socket_path,
+        request,
+        DAEMON_CONTROL_CONNECT_TIMEOUT,
+        checkpoint_control_response_timeout(
+            &ControlRequest::CheckpointRun { body_bytes: 0 },
+            checkpoint_control_timeout_uses_ci_or_test_budget(),
+        ),
+    )
+}
+
+fn send_checkpoint_request_with_timeouts(
+    socket_path: &Path,
+    request: &CheckpointRequest,
+    connect_timeout: Duration,
+    response_timeout: Duration,
+) -> Result<ControlResponse, GitAiError> {
+    let body = serde_json::to_vec(request)?;
+    let body_bytes = u64::try_from(body.len())
+        .map_err(|_| GitAiError::Generic("checkpoint body length exceeds u64".to_string()))?;
+    let header = ControlRequest::CheckpointRun { body_bytes };
+
+    let mut stream = open_local_socket_stream_with_timeout(socket_path, connect_timeout)?;
+    set_daemon_client_stream_timeouts(&mut stream, socket_path, response_timeout)?;
+    let mut header_bytes = serde_json::to_vec(&header)?;
+    header_bytes.push(b'\n');
+    write_all_daemon_client_stream(&mut stream, socket_path, &header_bytes)?;
+
+    let mut response_reader = BufReader::new(stream);
+    let ready_line = read_daemon_client_line(&mut response_reader, socket_path, response_timeout)?;
+    let ready: ControlResponse =
+        serde_json::from_str(ready_line.trim()).map_err(GitAiError::from)?;
+    if !ready.ok {
+        return Ok(ready);
+    }
+    if ready
+        .data
+        .as_ref()
+        .and_then(|data| data.get("ready"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(GitAiError::Generic(
+            "daemon checkpoint handshake omitted ready confirmation".to_string(),
+        ));
+    }
+
+    let mut framed_body = body;
+    framed_body.push(b'\n');
+    write_all_daemon_client_stream(response_reader.get_mut(), socket_path, &framed_body)?;
+    let response_line =
+        read_daemon_client_line(&mut response_reader, socket_path, response_timeout)?;
+    if response_line.trim().is_empty() {
+        return Err(GitAiError::Generic(
+            "empty daemon checkpoint response".to_string(),
+        ));
+    }
+    serde_json::from_str(response_line.trim()).map_err(GitAiError::from)
+}
+
 pub fn send_control_request_fire_and_forget(
     socket_path: &Path,
     request: &ControlRequest,
@@ -7936,6 +9210,30 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::io::Write;
+
+    #[test]
+    fn secondary_def_repo_does_not_hint_worktree() {
+        let primary = serde_json::json!({
+            "event": "def_repo",
+            "sid": "s1",
+            "repo": 1,
+            "worktree": "/repo",
+        });
+        assert_eq!(
+            trace_payload_worktree_hint(&primary),
+            Some(PathBuf::from("/repo"))
+        );
+
+        // A nested/embedded repo git peeked into (repo index > 1) must not
+        // retarget the command's worktree at that repo.
+        let secondary = serde_json::json!({
+            "event": "def_repo",
+            "sid": "s1",
+            "repo": 2,
+            "worktree": "/repo/nested",
+        });
+        assert_eq!(trace_payload_worktree_hint(&secondary), None);
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -7986,23 +9284,7 @@ mod tests {
     }
 
     fn sample_checkpoint_request() -> ControlRequest {
-        use crate::commands::checkpoint_agent::orchestrator::{BaseCommit, CheckpointFile};
-        ControlRequest::CheckpointRun {
-            request: Box::new(CheckpointRequest {
-                trace_id: "test-trace".to_string(),
-                checkpoint_kind: CheckpointKind::Human,
-                agent_id: None,
-                files: vec![CheckpointFile {
-                    path: std::path::PathBuf::from("test.txt"),
-                    content: None,
-                    repo_work_dir: std::path::PathBuf::from("/tmp/repo"),
-                    base_commit: BaseCommit::Initial,
-                }],
-                path_role: PreparedPathRole::WillEdit,
-                stream_source: None,
-                metadata: std::collections::HashMap::new(),
-            }),
-        }
+        ControlRequest::CheckpointRun { body_bytes: 128 }
     }
 
     fn run_git_for_test(repo: &Path, args: &[&str]) -> String {
@@ -8152,6 +9434,93 @@ mod tests {
             checkpoint_control_response_timeout(&sample_checkpoint_request(), false),
             DAEMON_CONTROL_RESPONSE_TIMEOUT
         );
+    }
+
+    #[test]
+    fn shutdown_requests_allow_checkpoint_drain_timeout() {
+        assert_eq!(
+            checkpoint_control_response_timeout(&ControlRequest::Shutdown, false),
+            DAEMON_CHECKPOINT_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_held_family_exec_locks_and_evicts_only_idle_ones() {
+        let coord = ActorDaemonCoordinator::new();
+
+        let held_lock = coord
+            .side_effect_exec_lock("family-held")
+            .expect("held family lock");
+        let _held_guard = held_lock.lock().await;
+        coord
+            .side_effect_exec_lock("family-idle")
+            .expect("idle family lock");
+
+        coord.gc_stale_family_state();
+
+        let map = coord.side_effect_exec_locks.lock().unwrap();
+        let surviving = map.get("family-held").expect(
+            "GC must never evict a held exec lock: a re-created lock would let a \
+             second drain run concurrently on the same family",
+        );
+        assert!(
+            Arc::ptr_eq(surviving, &held_lock),
+            "GC must keep the SAME lock instance while it is held"
+        );
+        assert!(
+            !map.contains_key("family-idle"),
+            "GC should evict idle exec locks to bound the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_an_unknown_family_does_not_retain_empty_sequencer_state() {
+        let coord = ActorDaemonCoordinator::new();
+
+        coord
+            .drain_ready_family_sequencer_entries_locked("family-with-no-work")
+            .await
+            .expect("empty family drain");
+
+        let map = coord.family_sequencers_by_family.lock().unwrap();
+        assert!(
+            !map.contains_key("family-with-no-work"),
+            "global drains must not grow the sequencer map with empty families"
+        );
+    }
+
+    #[test]
+    fn checkpoint_ingress_quota_bounds_count_and_bytes_and_releases_on_drop() {
+        let quota = Arc::new(CheckpointIngressQuota::new(2, 10));
+        let first = quota.reserve(4).expect("first reservation");
+        let second = quota.reserve(6).expect("second reservation");
+
+        let count_error = quota.reserve(0).expect_err("count limit must reject");
+        assert_eq!(count_error.reason, "request_limit");
+
+        drop(second);
+        let byte_error = quota.reserve(7).expect_err("byte limit must reject");
+        assert_eq!(byte_error.reason, "byte_limit");
+
+        drop(first);
+        let replacement = quota.reserve(10).expect("released quota must be reusable");
+        assert_eq!(replacement.body_bytes(), 10);
+    }
+
+    #[test]
+    fn checkpoint_body_reader_requires_exact_length_and_delimiter() {
+        let mut valid = std::io::BufReader::new(std::io::Cursor::new(b"body\n".to_vec()));
+        assert_eq!(
+            read_checkpoint_body(&mut valid, 4).expect("valid framed body"),
+            b"body"
+        );
+
+        let mut truncated = std::io::BufReader::new(std::io::Cursor::new(b"bod".to_vec()));
+        assert!(read_checkpoint_body(&mut truncated, 4).is_err());
+
+        let mut missing_delimiter =
+            std::io::BufReader::new(std::io::Cursor::new(b"body!".to_vec()));
+        assert!(read_checkpoint_body(&mut missing_delimiter, 4).is_err());
     }
 
     #[test]
@@ -8753,73 +10122,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_control_request_waits_while_blocked_behind_pending_root() {
-        use crate::commands::checkpoint_agent::orchestrator::{BaseCommit, CheckpointFile};
-
+    async fn family_fence_ignores_open_mutating_roots_of_other_families() {
         let coord = Arc::new(ActorDaemonCoordinator::new());
         let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let init = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .arg("init")
-            .output()
-            .expect("git init should run");
+        let other_repo = temp.path().join("other-repo");
+        std::fs::create_dir_all(other_repo.join(".git")).unwrap();
+        std::fs::write(
+            other_repo.join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+
+        let sid = "20260411T120000.000000-Psid1";
+        coord.trace_root_connection_opened(sid).unwrap();
+        let mut start = make_start_payload(&["git", "commit", "-m", "other repo commit"]);
+        assert!(coord.prepare_trace_payload_for_ingest(&mut start));
+
+        // Before the root is attributed to a repository, it must block every
+        // family (fail closed: it could belong to any of them).
         assert!(
-            init.status.success(),
-            "git init failed: {}",
-            String::from_utf8_lossy(&init.stderr)
-        );
-        std::fs::write(repo.join("test.txt"), "checkpoint content\n").unwrap();
-
-        let family = coord.backend.resolve_family(&repo).unwrap().0;
-        let root_sid = "20260411T120000.000000-Psid-blocking-root";
-        coord
-            .append_pending_root_entry(&family, root_sid, 1)
-            .unwrap();
-
-        let request = CheckpointRequest {
-            trace_id: "blocked-checkpoint".to_string(),
-            checkpoint_kind: CheckpointKind::Human,
-            agent_id: None,
-            files: vec![CheckpointFile {
-                path: PathBuf::from("test.txt"),
-                content: Some("checkpoint content\n".to_string()),
-                repo_work_dir: repo.clone(),
-                base_commit: BaseCommit::Initial,
-            }],
-            path_role: PreparedPathRole::Edited,
-            stream_source: None,
-            metadata: HashMap::new(),
-        };
-
-        let mut checkpoint = {
-            let coord = coord.clone();
-            tokio::spawn(async move { coord.ingest_checkpoint_payload(request).await })
-        };
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut checkpoint)
-                .await
-                .is_err(),
-            "checkpoint control request must not complete before its sequenced side effect runs"
-        );
-
-        coord
-            .replace_pending_root_entry(root_sid, FamilySequencerEntry::Canceled)
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                coord.wait_for_trace_ingest_processed_through_family("/some/unrelated/family")
+            )
             .await
-            .unwrap();
-
-        let response = tokio::time::timeout(Duration::from_secs(1), checkpoint)
-            .await
-            .expect("checkpoint should finish once the prior root is released")
-            .expect("checkpoint task should not panic")
-            .expect("checkpoint request should succeed");
-        assert!(
-            response.ok,
-            "checkpoint response should be ok: {response:?}"
+            .is_err(),
+            "an unattributed mutating root must block all family fences"
         );
+
+        // def_repo attributes the root to other-repo's family; unrelated
+        // families must no longer wait on it.
+        let mut def_repo = serde_json::json!({
+            "event": "def_repo",
+            "sid": sid,
+            "worktree": other_repo.to_string_lossy(),
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut def_repo));
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            coord.wait_for_trace_ingest_processed_through_family("/some/unrelated/family"),
+        )
+        .await
+        .expect("a mutating root attributed to another family must not block this fence");
+
+        // The root's own family still waits until the connection closes.
+        let own_family = coord.backend.resolve_family(&other_repo).unwrap().0;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                coord.wait_for_trace_ingest_processed_through_family(&own_family)
+            )
+            .await
+            .is_err(),
+            "the root's own family fence must still wait for the open root"
+        );
+
+        coord
+            .record_trace_connection_close(&[sid.to_string()])
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            coord.wait_for_trace_ingest_processed_through_family(&own_family),
+        )
+        .await
+        .expect("own family fence should pass once the root closes");
     }
 
     #[tokio::test]

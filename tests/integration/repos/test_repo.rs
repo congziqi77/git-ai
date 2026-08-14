@@ -1194,6 +1194,13 @@ impl TestRepo {
 
         let mut config = serde_json::Map::new();
 
+        if let Some(git_path) = &patch.git_path {
+            config.insert(
+                "git_path".to_string(),
+                serde_json::Value::String(git_path.clone()),
+            );
+        }
+
         if let Some(exclude) = &patch.exclude_prompts_in_repositories {
             let values = exclude
                 .iter()
@@ -1264,6 +1271,12 @@ impl TestRepo {
             config.insert(
                 "max_checkpoint_total_lines".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(max_lines as u64)),
+            );
+        }
+        if let Some(limit_mb) = patch.daemon_memory_limit_mb {
+            config.insert(
+                "daemon_memory_limit_mb".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(limit_mb)),
             );
         }
 
@@ -1817,10 +1830,17 @@ impl TestRepo {
     }
 
     pub(crate) fn restart_dedicated_daemon_for_test(&mut self) {
+        self.restart_dedicated_daemon_with_env_for_test(&[]);
+    }
+
+    pub(crate) fn restart_dedicated_daemon_with_env_for_test(
+        &mut self,
+        daemon_env: &[(&str, &str)],
+    ) {
         assert_eq!(
             self.daemon_scope,
             DaemonTestScope::Dedicated,
-            "restart_dedicated_daemon_for_test requires a dedicated daemon repo"
+            "daemon restart requires a dedicated daemon repo"
         );
         let family_key = self.daemon_family_key();
         let pending_summary = {
@@ -1838,7 +1858,15 @@ impl TestRepo {
         if let Some(daemon) = self.daemon_process.take() {
             daemon.shutdown();
         }
-        self.setup_daemon_mode();
+        let daemon = Arc::new(DaemonProcess::start_with_env(
+            &self.path,
+            &self.test_home,
+            &self.test_db_path,
+            daemon_env,
+        ));
+        self.test_db_path = daemon.test_db_path.clone();
+        self.daemon_process = Some(daemon);
+        self.sync_test_home_config();
     }
 
     fn daemon_completion_log_path_for_family(&self, family_key: &str) -> PathBuf {
@@ -1854,6 +1882,13 @@ impl TestRepo {
     pub(crate) fn daemon_completion_entries(&self) -> Vec<DaemonTestCompletionLogEntry> {
         let family_key = self.daemon_family_key();
         self.daemon_completion_entries_for_family(&family_key)
+    }
+
+    pub(crate) fn daemon_stderr_contents(&self) -> String {
+        let Some(daemon) = self.daemon_process.as_ref() else {
+            return String::new();
+        };
+        fs::read_to_string(&daemon.stderr_log_path).unwrap_or_default()
     }
 
     fn daemon_completion_entries_for_family(
@@ -2310,7 +2345,20 @@ impl TestRepo {
                     repo_working_dir: repo_working_dir.clone(),
                 },
             ) {
-                Ok(response) if response.ok => return,
+                Ok(response) if response.ok => {
+                    if let Some(error) = response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("last_error"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        panic!(
+                            "daemon completion log reported an error: {error}\ndaemon logs:\n{}",
+                            self.daemon_stderr_contents()
+                        );
+                    }
+                    return;
+                }
                 Ok(response) => {
                     panic!(
                         "daemon sync.family failed: {}",
@@ -3043,21 +3091,40 @@ impl TestRepo {
     }
 
     pub fn current_working_logs(&self) -> PersistedWorkingLog {
+        let commit_sha = {
+            let repo = GitAiRepository::find_repository_in_path(self.path.to_str().unwrap())
+                .expect("Failed to find repository");
+            // Get the current HEAD commit SHA, or use "initial" for empty repos
+            repo.head()
+                .ok()
+                .and_then(|head| head.target().ok())
+                .unwrap_or_else(|| "initial".to_string())
+        };
+        self.working_logs_for_base_commit(&commit_sha)
+    }
+
+    /// Opens the working log for `base_commit` after synchronizing the daemon,
+    /// so accepted-but-unprocessed checkpoints are visible to the read. Tests
+    /// must use this (or `current_working_logs`) instead of reading working
+    /// logs through raw storage APIs whenever checkpoints were issued through
+    /// the daemon.
+    pub fn working_logs_for_base_commit(&self, base_commit: &str) -> PersistedWorkingLog {
+        self.working_logs_for_repo_path_and_base_commit(&self.path, base_commit)
+    }
+
+    /// As [`Self::working_logs_for_base_commit`], but for a specific repo or
+    /// worktree path (e.g. a linked worktree that shares this repo's family).
+    pub fn working_logs_for_repo_path_and_base_commit(
+        &self,
+        repo_path: &Path,
+        base_commit: &str,
+    ) -> PersistedWorkingLog {
         self.sync_daemon_force();
 
-        let repo = GitAiRepository::find_repository_in_path(self.path.to_str().unwrap())
+        let repo = GitAiRepository::find_repository_in_path(repo_path.to_str().unwrap())
             .expect("Failed to find repository");
-
-        // Get the current HEAD commit SHA, or use "initial" for empty repos
-        let commit_sha = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target().ok())
-            .unwrap_or_else(|| "initial".to_string());
-
-        // Get the working log for the current HEAD commit
         repo.storage
-            .working_log_for_base_commit(&commit_sha)
+            .working_log_for_base_commit(base_commit)
             .unwrap()
     }
 
@@ -3198,6 +3265,44 @@ impl Drop for TestRepo {
             .unwrap_or(false)
         {
             return;
+        }
+
+        // Drain any still-queued checkpoints for this repo before deleting it.
+        // With asynchronous checkpoint acknowledgement, a test whose final
+        // checkpoint is never followed by a synced read can otherwise remove
+        // the repo while the shared daemon still holds the checkpoint,
+        // producing spurious "Failed to resolve git common dir" / ENOENT
+        // daemon errors that pollute forensics. Only sync when the registry
+        // shows un-synced checkpoints, and best-effort: Drop must never panic
+        // (a panic here during unwinding would abort the process and mask the
+        // test's real failure), so skip the drain when the family key can't
+        // be resolved instead of using the panicking accessor.
+        if self.daemon_scope == DaemonTestScope::Shared
+            && self.has_active_daemon()
+            && let Some(family_key) = self
+                .daemon_family_key
+                .get()
+                .cloned()
+                .or_else(|| self.maybe_daemon_family_key_for_repo_path(&self.path))
+        {
+            let has_pending = {
+                let registry = daemon_sync_registry()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                registry.pending_work_summary(&family_key).is_some()
+            };
+            if has_pending {
+                let repo_working_dir = self
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.path.clone())
+                    .to_string_lossy()
+                    .to_string();
+                let _ = send_control_request(
+                    &self.daemon_control_socket_path(),
+                    &ControlRequest::SyncFamily { repo_working_dir },
+                );
+            }
         }
 
         if self.daemon_scope == DaemonTestScope::Dedicated
