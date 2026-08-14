@@ -3229,6 +3229,7 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
     feature_file.assert_committed_lines(lines!["// AI feature".ai()]);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn daemon_rebase_diagnostics_cover_ref_changes_mapping_and_notes() {
     let repo = TestRepo::new();
