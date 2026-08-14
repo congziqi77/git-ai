@@ -1,0 +1,21 @@
+src/authorship/rewrite.rs
+  s_0785f5df64ce7b::t_91653b9f7940c3 462-493,499-529
+src/daemon.rs
+  s_0785f5df64ce7b::t_91653b9f7940c3 50,79-88,5366-5380,5407-5415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23-ep",
+  "base_commit_sha": "ae947afa67ff296eba752f19a8b7b21b9c0c571b",
+  "prompts": {},
+  "sessions": {
+    "s_0785f5df64ce7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffdc9-9e54-7623-8486-8fe0f919d5cc",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}

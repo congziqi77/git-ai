@@ -1,0 +1,70 @@
+tests/commit_tree_update_ref.rs
+  s_7e05ba92eeba4c::t_b8fff78ed8b55f 138-139,141-146,189
+  s_7e05ba92eeba4c::t_11f7cc62774030 193-228
+  s_7e05ba92eeba4c::t_fee2b83f199cb5 1899-1966,2034
+  s_7e05ba92eeba4c::t_369b5a692e8314 191,2035-2112
+  s_7e05ba92eeba4c::t_91e9f2cb420f0b 190,192
+src/daemon/ref_cursor.rs
+  s_7e05ba92eeba4c::t_ce4aebd22a7b2f 1635,1996,6325-6334,6336-6355
+  s_7e05ba92eeba4c::t_47009599ec8e3c 199,945,1433-1434,1438-1440,1980-1995
+  s_7e05ba92eeba4c::t_508655dace0d0c 4682-4690,4692-4724
+  s_7e05ba92eeba4c::t_8b5ef29a9991c2 812-816,823-824,1607-1613,1631-1634
+  s_7e05ba92eeba4c::t_5a537ff7c7dd8c 817,825-826,1622,1627,4284-4285,4295-4296,4691,6335
+  s_7e05ba92eeba4c::t_84aa11a8fa4315 4271-4283,4286-4294,4297-4339
+  s_308399384e171e::t_d14810c146f693 1636,1997,4270,4681,6324
+  s_7e05ba92eeba4c::t_98a6f886b0df6e 1614-1621,1623-1626,1628-1630,3563-3569,4725-4760
+  s_7e05ba92eeba4c::t_764ad71c21e5f1 952-956,6356-6393
+  s_0785f5df64ce7b::t_6ba8c1ec06709e 2000,2002-2004
+tests/integration/cold_trace2_repo.rs
+  s_7e05ba92eeba4c::t_16a8a12e50f639 417-434,436-446,448-454,620-622,634-638,643,654-672
+  s_7e05ba92eeba4c::t_594c824c73bb31 435,447
+  s_7e05ba92eeba4c::t_5b78c46ad444bb 416,506,673,848,1250-1306,1354-1386
+  s_7e05ba92eeba4c::t_fdb502d68c5226 1391,1397,1406,1415,1418
+  s_7e05ba92eeba4c::t_c1c6b68caa9940 1395,1399
+  s_7e05ba92eeba4c::t_32252179d40c1e 507-518,520-521,523-529,531-532,534-538,540-541,543-554
+  s_7e05ba92eeba4c::t_fd12310ac1fdc0 1392
+  s_7e05ba92eeba4c::t_8f9c8db9fc6d59 849-916
+  s_7e05ba92eeba4c::t_732c7753825230 243,249-250,257,291-297,310-331,519,522,530,533,539,542
+  s_7e05ba92eeba4c::t_6bd6c69f97ce41 244-248,251-256,258-290,298-309,332-334
+  s_7e05ba92eeba4c::t_11cbce9fa2cbc4 623-633,639-642,644-653
+  s_7e05ba92eeba4c::t_8072e4249876c4 674
+  s_7e05ba92eeba4c::t_1fcd1270e83ae9 1387
+src/daemon.rs
+  s_7e05ba92eeba4c::t_614557115fd4e8 6460-6464
+  s_0785f5df64ce7b::t_6ba8c1ec06709e 6095-6107,6331,6338-6365,6367-6369,6371-6384
+tests/daemon_mode.rs
+  s_0785f5df64ce7b::t_bf756affcf47d0 3233-3288
+  s_0785f5df64ce7b::t_0310ad46141ee8 3232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.6.20",
+  "base_commit_sha": "fd3deffc9fc8858a324943f3628ea34b7d28d536",
+  "prompts": {},
+  "sessions": {
+    "s_0785f5df64ce7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffdc9-9e54-7623-8486-8fe0f919d5cc",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    },
+    "s_308399384e171e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc5c9-5bf9-7c53-9e95-a36b3e6eca3c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sasha Varlamov <sasha@sashavarlamov.com>"
+    },
+    "s_7e05ba92eeba4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc5da-6f02-7801-8355-ae16942c7ace",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sasha Varlamov <sasha@sashavarlamov.com>"
+    }
+  }
+}
