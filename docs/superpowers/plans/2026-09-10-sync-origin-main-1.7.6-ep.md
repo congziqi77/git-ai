@@ -19,7 +19,7 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - [x] Resolve textual conflicts without dropping EP or upstream behavior.
 - [x] Review critical-path auto-merges in rewrite and trace2 code.
 - [x] Run focused post-merge regression tests.
-- [ ] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
+- [x] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
 - [ ] Run format, lint, build, version, and full test verification.
 - [ ] Push the integration branch and fast-forward `fork/main` after verification.
 - [ ] Create and push annotated tag `v1.7.6-ep` at the verified release commit.
@@ -42,3 +42,4 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - 2026-09-10: Resolved six textual conflicts by combining behavior; kept upstream `1.7.6` for the merge commit.
 - 2026-09-10: Reviewed fork-only deltas against `origin/main`; no new git work was introduced on ingestion paths.
 - 2026-09-10: Post-merge diagnostics, recovery, file-statistics, and update-ref stdin regression tests passed.
+- 2026-09-10: Created the separate EP version change for `1.7.6-ep` in all three version sources.
