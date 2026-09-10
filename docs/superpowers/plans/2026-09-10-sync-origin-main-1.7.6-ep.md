@@ -15,10 +15,10 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 ## Execution checklist
 
 - [x] Run focused pre-merge regression tests on `fork/main`.
-- [ ] Merge `origin/main` with a merge commit.
-- [ ] Resolve textual conflicts without dropping EP or upstream behavior.
-- [ ] Review critical-path auto-merges in rewrite and trace2 code.
-- [ ] Run focused post-merge regression tests.
+- [x] Merge `origin/main` with a merge commit.
+- [x] Resolve textual conflicts without dropping EP or upstream behavior.
+- [x] Review critical-path auto-merges in rewrite and trace2 code.
+- [x] Run focused post-merge regression tests.
 - [ ] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
 - [ ] Run format, lint, build, version, and full test verification.
 - [ ] Push the integration branch and fast-forward `fork/main` after verification.
@@ -39,3 +39,6 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - 2026-09-10: Created a clean clone because the original checkout has `core.bare=true` and a divergent index/worktree.
 - 2026-09-10: Refreshed both remotes and created the integration branch from `fork/main`.
 - 2026-09-10: Pre-merge rebase diagnostics, cold trace2 rebase recovery, and file-level statistics tests passed.
+- 2026-09-10: Resolved six textual conflicts by combining behavior; kept upstream `1.7.6` for the merge commit.
+- 2026-09-10: Reviewed fork-only deltas against `origin/main`; no new git work was introduced on ingestion paths.
+- 2026-09-10: Post-merge diagnostics, recovery, file-statistics, and update-ref stdin regression tests passed.
