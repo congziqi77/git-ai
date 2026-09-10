@@ -1,0 +1,41 @@
+# Sync `origin/main` and release `v1.7.6-ep`
+
+## Goal
+
+Make `fork/main` the maintained EP mainline, merge the current `origin/main`, preserve the fork-only attribution recovery and file-level statistics work, and publish a traceable `v1.7.6-ep` release to the `rebasefix` S3 channel.
+
+## Starting point
+
+- Fork main: `8726112af97d3d87ddab7b6f7de4b310d883079e` (`1.6.24-ep`)
+- Upstream main: `0670e7ef27590af0e8ff5409267f3f4b09b8fcb4` (`1.7.6`)
+- Merge base: `c57c6c24be03ba89ce7d47783841d2f49ba8ee45` (`1.6.22`)
+- Divergence: 33 fork-only commits and 227 upstream-only commits
+- Integration branch: `codex/sync-origin-main-1.7.6-ep`
+
+## Execution checklist
+
+- [x] Run focused pre-merge regression tests on `fork/main`.
+- [ ] Merge `origin/main` with a merge commit.
+- [ ] Resolve textual conflicts without dropping EP or upstream behavior.
+- [ ] Review critical-path auto-merges in rewrite and trace2 code.
+- [ ] Run focused post-merge regression tests.
+- [ ] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
+- [ ] Run format, lint, build, version, and full test verification.
+- [ ] Push the integration branch and fast-forward `fork/main` after verification.
+- [ ] Create and push annotated tag `v1.7.6-ep` at the verified release commit.
+- [ ] Build and verify four GitHub Actions release artifacts.
+- [ ] Dry-run packaging, upload to S3, update `rebasefix`, and reinstall to verify.
+
+## Conflict policy
+
+- Preserve upstream architecture and new functionality by default.
+- Reapply fork-only behavior narrowly where upstream has not superseded it.
+- Never resolve `src/daemon.rs` or trace2/rewrite code by choosing an entire side.
+- Do not introduce git work on trace2 ingestion paths or unbounded/per-item git spawns.
+- Keep the merge commit at upstream version `1.7.6`; make the EP suffix a separate release commit.
+
+## Progress log
+
+- 2026-09-10: Created a clean clone because the original checkout has `core.bare=true` and a divergent index/worktree.
+- 2026-09-10: Refreshed both remotes and created the integration branch from `fork/main`.
+- 2026-09-10: Pre-merge rebase diagnostics, cold trace2 rebase recovery, and file-level statistics tests passed.
