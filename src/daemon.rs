@@ -92,7 +92,7 @@ pub(crate) fn rewrite_diagnostics_enabled() -> bool {
         std::env::var("GIT_AI_REWRITE_DIAGNOSTICS")
             .as_deref()
             .map(|value| value != "0")
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
 }
 

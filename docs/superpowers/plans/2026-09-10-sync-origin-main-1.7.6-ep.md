@@ -45,3 +45,4 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - 2026-09-10: Created the separate EP version change for `1.7.6-ep` in all three version sources.
 - 2026-09-10: `task fmt`, `task lint`, `task build`, the debug version check, the remaining standalone test binaries, and doc tests passed.
 - 2026-09-10: The complete integration target finished with 3,377 passed, 89 ignored, and two checked-out `update-ref` timing failures. Both failures reproduce unchanged on a clean `origin/main` baseline under the local Homebrew Git 2.48.0 environment, so they are not merge regressions; hosted CI remains the release gate.
+- 2026-09-10: The first hosted macOS core run exposed a fork-only interaction: rewrite diagnostics were enabled by default and interfered with metrics reingestion. Changed diagnostics to explicit opt-in, kept the diagnostics test enabled through a scoped daemon environment, and verified both regression tests plus lint locally.

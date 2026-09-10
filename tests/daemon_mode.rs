@@ -4195,7 +4195,7 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
 #[cfg(not(windows))]
 #[test]
 fn daemon_rebase_diagnostics_cover_ref_changes_mapping_and_notes() {
-    let repo = TestRepo::new();
+    let repo = TestRepo::new_with_daemon_env(&[("GIT_AI_REWRITE_DIAGNOSTICS", "1")]);
 
     let mut base_file = repo.filename("base.txt");
     base_file.set_contents(lines!["base".human()]);
