@@ -1,0 +1,347 @@
+src/lib.rs
+  s_00f92a342223ec::t_a29645adec297b 8-9,18,20
+tests/integration/codex.rs
+  s_00f92a342223ec::t_a29645adec297b 5-7,70,160
+src/authorship/post_commit.rs
+  s_00f92a342223ec::t_a29645adec297b 371-380
+agent-support/visualstudio/src/GitAiVS/LICENSE
+  s_00f92a342223ec::t_a29645adec297b 1-21
+agent-support/visualstudio/src/GitAiVS/Services/CheckpointService.cs
+  s_00f92a342223ec::t_a29645adec297b 1-162
+src/daemon/stream_worker_tests.rs
+  s_00f92a342223ec::t_a29645adec297b 1-182
+tests/integration/continue_cli.rs
+  s_00f92a342223ec::t_a29645adec297b 5-7,180,258
+src/process_timeout.rs
+  s_00f92a342223ec::t_a29645adec297b 1-253
+tests/integration/streams_e2e.rs
+  s_00f92a342223ec::t_a29645adec297b 1-788
+src/streams/agent.rs
+  s_00f92a342223ec::t_a29645adec297b 1-223
+.github/workflows/codeql.yml
+  s_00f92a342223ec::t_a29645adec297b 66,76,109
+src/daemon/stream_worker.rs
+  s_00f92a342223ec::t_a29645adec297b 1-1626
+src/git/command_classification.rs
+  s_00f92a342223ec::t_a29645adec297b 47-48,58,154-177
+src/streams/agents/codex.rs
+  s_00f92a342223ec::t_a29645adec297b 1-595
+src/streams/agents/pi.rs
+  s_00f92a342223ec::t_a29645adec297b 1-375
+tests/integration/cursor.rs
+  s_00f92a342223ec::t_a29645adec297b 6-8
+agent-support/visualstudio/src/GitAiVS/source.extension.vsixmanifest
+  s_00f92a342223ec::t_a29645adec297b 1-49
+agent-support/visualstudio/src/GitAiVS.Tests/CheckpointInputTests.cs
+  s_00f92a342223ec::t_a29645adec297b 1-125
+src/mdm/agents/opencode.rs
+  s_00f92a342223ec::t_a29645adec297b 218-219,241-244
+tests/integration/gemini.rs
+  s_00f92a342223ec::t_a29645adec297b 6-8,133
+agent-support/visualstudio/src/GitAiVS/Listeners/DocumentSaveListener.cs
+  s_00f92a342223ec::t_a29645adec297b 1-133
+.github/workflows/intellij-ui-tests.yml
+  s_00f92a342223ec::t_a29645adec297b 50
+src/commands/checkpoint_agent/presets/ai_tab.rs
+  s_00f92a342223ec::t_a29645adec297b 82,154
+.github/workflows/test-visualstudio-extension.yml
+  s_00f92a342223ec::t_a29645adec297b 1-92
+tests/integration/opencode.rs
+  s_00f92a342223ec::t_a29645adec297b 19-21,210,447-449,476-478,503-505,623
+tests/integration/ci_fork_notes.rs
+  s_00f92a342223ec::t_a29645adec297b 1-914
+src/streams/agents/amp.rs
+  s_00f92a342223ec::t_a29645adec297b 1-450
+src/commands/checkpoint_agent/presets/github_copilot/ide.rs
+  s_00f92a342223ec::t_a29645adec297b 4,10,110,123,125,135,213,215,227-228,230,249,304,326,535-537,616-618,880-882,954
+src/streams/agents/gemini.rs
+  s_00f92a342223ec::t_a29645adec297b 1-427
+.github/workflows/intellij-build.yml
+  s_00f92a342223ec::t_a29645adec297b 46,99,156,193
+agent-support/visualstudio/src/GitAiVS/GitAiPackage.cs
+  s_00f92a342223ec::t_a29645adec297b 1-184
+src/commands/checkpoint_agent/presets/mod.rs
+  s_00f92a342223ec::t_a29645adec297b 61,92,96,98,109,124-126
+src/commands/daemon.rs
+  s_00f92a342223ec::t_a29645adec297b 586-588,599-604,680-706
+src/feature_flags.rs
+  s_00f92a342223ec::t_a29645adec297b 84,147
+src/ci/gitlab.rs
+  s_00f92a342223ec::t_a29645adec297b 11,22-135,195,290-343,426-440,442-451,454-465,473-474,501-503,514-515,528-530,536-537,546-548,556-557,602-798
+agent-support/visualstudio/src/GitAiVS/Listeners/TextBufferListener.cs
+  s_00f92a342223ec::t_a29645adec297b 1-196
+agent-support/intellij/gradle.properties
+  s_00f92a342223ec::t_a29645adec297b 7
+src/commands/config.rs
+  s_00f92a342223ec::t_a29645adec297b 5,111-112,118,139-140,147,332-337,344-348,451-452,455-457,525-548,550,685-704,713-718,837-861,863,980-990,998-1004,1126-1149,1151,1334-1345,1367-1377,1420-1440,1537-1549
+src/commands/install_hooks.rs
+  s_00f92a342223ec::t_a29645adec297b 17-25,306,310,313,317,323,327,331,338-357,462,482-485,503,505,511,520,550,558,562,577-579,598,637-639,644,652,659,699,1007-1036
+src/mdm/agents/cursor.rs
+  s_00f92a342223ec::t_a29645adec297b 380-385,409-428
+src/ci/workflow_templates/github.yaml
+  s_00f92a342223ec::t_a29645adec297b 5,9
+src/commands/upgrade.rs
+  s_00f92a342223ec::t_a29645adec297b 55,572,631
+tests/integration/test_utils_unit.rs
+  s_00f92a342223ec::t_a29645adec297b 39,151
+src/main.rs
+  s_00f92a342223ec::t_a29645adec297b 3,15-36,71-85
+tests/integration/ci_partial_clone.rs
+  s_00f92a342223ec::t_a29645adec297b 72,79-80,142,149-150,223,230-231,314,321-322
+tests/integration/claude_code.rs
+  s_00f92a342223ec::t_a29645adec297b 3-5,329,370
+src/git/notes_api.rs
+  s_00f92a342223ec::t_a29645adec297b 98-136,595-633
+tests/integration/ci_context_unit.rs
+  s_00f92a342223ec::t_a29645adec297b 17,35,59,119,151,172
+agent-support/visualstudio/src/GitAiVS/Services/GitRepoResolver.cs
+  s_00f92a342223ec::t_a29645adec297b 1-90
+src/diagnostics.rs
+  s_00f92a342223ec::t_a29645adec297b 1-1475
+install.sh
+  s_00f92a342223ec::t_a29645adec297b 176-210
+src/streams/mod.rs
+  s_00f92a342223ec::t_a29645adec297b 1-57
+tests/integration/ci_squash_rebase.rs
+  s_00f92a342223ec::t_a29645adec297b 4,597,604-605,1018-1380,1702-2086,2102-2104
+agent-support/visualstudio/src/GitAiVS.Tests/BinaryResolverTests.cs
+  s_00f92a342223ec::t_a29645adec297b 1-74
+.github/workflows/update-changelog.yml
+  s_00f92a342223ec::t_a29645adec297b 56
+tests/integration/agent_presets_comprehensive.rs
+  s_00f92a342223ec::t_a29645adec297b 3-5,114,134,175,350,551,811
+tests/integration/github_copilot.rs
+  s_00f92a342223ec::t_a29645adec297b 4-6
+.github/workflows/performance-benchmarks.yml
+  s_00f92a342223ec::t_a29645adec297b 31,87
+src/commands/blame.rs
+  s_00f92a342223ec::t_a29645adec297b 1404
+src/daemon/checkpoint.rs
+  s_00f92a342223ec::t_a29645adec297b 194-199
+tests/integration/refs_unit.rs
+  s_00f92a342223ec::t_a29645adec297b 5-6,8-9,125-216
+src/mdm/agents/codex.rs
+  s_00f92a342223ec::t_a29645adec297b 1,211,231-242,569-624,698-723,727,758-812,819,994-1006,1795-1962
+src/ci/github.rs
+  s_00f92a342223ec::t_a29645adec297b 14-18,63-66,69-80,85,90-161,178-207,212-223,229-236,256-316
+src/streams/agents/copilot_cli.rs
+  s_00f92a342223ec::t_a29645adec297b 1-313
+src/commands/checkpoint_agent/presets/pi.rs
+  s_00f92a342223ec::t_a29645adec297b 3,148,150,152,186,197,281-283,335-337
+tests/integration/event_timestamp_extraction.rs
+  s_00f92a342223ec::t_a29645adec297b 2-5
+tests/integration/repos/test_repo.rs
+  s_00f92a342223ec::t_a29645adec297b 374,383,387,1040-1043
+tests/integration/simple_additions.rs
+  s_00f92a342223ec::t_a29645adec297b 4,1924-2071
+src/ci/ci_context.rs
+  s_00f92a342223ec::t_a29645adec297b 9-15,20-24,33-43,55-59,64-67,73-74,83-84,117-118,151-196,205-231,265-266,269,271,274-275,281,284-311,378-543,556-742,753-762,787-959,963,973,996-1059
+.github/workflows/coverage.yml
+  s_00f92a342223ec::t_a29645adec297b 24
+install.ps1
+  s_00f92a342223ec::t_a29645adec297b 353-416
+.github/workflows/test-vscode-extension.yml
+  s_00f92a342223ec::t_a29645adec297b 24
+agent-support/visualstudio/src/GitAiVS.Tests/GitAiVS.Tests.csproj
+  s_00f92a342223ec::t_a29645adec297b 1-27
+src/commands/checkpoint_agent/presets/cursor.rs
+  s_00f92a342223ec::t_a29645adec297b 4,114,116,135,147,268-270,400
+src/config.rs
+  s_00f92a342223ec::t_a29645adec297b 1,4,6-7,57-113,177-178,181,183,252-255,260-261,263-264,269-293,313-314,319-320,322-323,347-384,409-416,422-425,437-439,448-459,465-472,490,573,626-629,635-643,659-662,721-868,886-915,1070-1080,1108-1122,1142-1153,1173-1174,1177,1179,1203-1204,1207,1209,1624-1626,1637-1646,1653-1655,1690-1691,1694,1696-1704,1706-1735,1819-1908,1932-1933,1936,1938,1990-2000,2035-2045,2077-2078,2081,2083,2196-2210,2326-2335,2359-2369,2575-2607
+tests/integration/checkpoint_unit.rs
+  s_00f92a342223ec::t_a29645adec297b 241,270-323,437,1357
+tests/integration/sweep_e2e.rs
+  s_00f92a342223ec::t_a29645adec297b 10-14,80,82,252,264-270,275,277,279-280,293,296-302,306,314,324,326,328-329,342,354-361,375,386,404,411,413,415-416,429,443-450,453-460
+src/streams/agents/droid.rs
+  s_00f92a342223ec::t_a29645adec297b 1-433
+src/mdm/agents/visual_studio.rs
+  s_00f92a342223ec::t_a29645adec297b 1-506
+src/git/refs.rs
+  s_00f92a342223ec::t_a29645adec297b 10-11,37,42-52,148-194,208,210,235-269
+src/commands/debug.rs
+  s_00f92a342223ec::t_f2522d5897b979 3,5-9,13-29,40-47,49,57,59-64,67-87,90-102,104-105,107,112,114-115,140-156,159,163-181,283-288,385-390,392-393,399-689,692-700,702-732,735-736,738-739,742-743,745-746,749-750,753-842,846-852,865-874,876-899,901-914,925-1005,1173,1194,1200,1212,1354-1364,1374-1377,1405-1424,1466-1629
+src/git/repository.rs
+  s_00f92a342223ec::t_a29645adec297b 20,917,930-937,954-966,1008-1075,1360,1369-1370,1376-1388,1405-1406,1408-1414,2720-2773,3080-3130
+agent-support/visualstudio/src/GitAiVS/Models/CheckpointInput.cs
+  s_00f92a342223ec::t_a29645adec297b 1-152
+src/commands/ci_handlers.rs
+  s_00f92a342223ec::t_a29645adec297b 12-14,21-23,27-32,102-106,221,266-267,276,286-287,301-374,398-404,407,419-428
+tests/integration/streams_claude_reader.rs
+  s_00f92a342223ec::t_a29645adec297b 1-251
+tests/integration/amp.rs
+  s_00f92a342223ec::t_a29645adec297b 3-5,144,146
+src/metrics/events.rs
+  s_00f92a342223ec::t_a29645adec297b 1392-1524,1630-1736
+src/streams/agents/copilot_otel.rs
+  s_00f92a342223ec::t_a29645adec297b 1-1019
+src/streams/agents/mod.rs
+  s_00f92a342223ec::t_a29645adec297b 1-26
+.github/workflows/e2e-tests.yml
+  s_00f92a342223ec::t_a29645adec297b 27
+src/commands/checkpoint_agent/presets/github_copilot/cli.rs
+  s_00f92a342223ec::t_a29645adec297b 4,10,66,80,82,96,142,227,291
+.github/workflows/release.yml
+  s_00f92a342223ec::t_a29645adec297b 54,189,314,440
+README.md
+  s_00f92a342223ec::t_a29645adec297b 6,8,17,21,23-32,34-40,43-47,49,51,77,79-83,85,87,89,91-97,146,149-150,153,162,164,166,168,170-175,177,179,181,183,185-187,189,191-192,194-195,197-198,200-207,209-210,212-213,215-216,218,220-234,236,238-254,257,259-262
+tests/integration/agent_v1.rs
+  s_00f92a342223ec::t_a29645adec297b 86
+src/streams/types.rs
+  s_00f92a342223ec::t_a29645adec297b 1-198
+.github/workflows/git-core-compat.yml
+  s_00f92a342223ec::t_a29645adec297b 38
+tests/async_mode.rs
+  s_00f92a342223ec::t_a29645adec297b 89
+tests/daemon_mode.rs
+  s_00f92a342223ec::t_a29645adec297b 1015-1080
+agent-support/intellij/src/main/kotlin/org/jetbrains/plugins/template/services/TelemetryService.kt
+  s_00f92a342223ec::t_a29645adec297b 10,95-98,101,115-146,177,243-250,260
+assets/docs/buttons/get-early-access.svg
+  s_00f92a342223ec::t_a29645adec297b 1-9
+src/commands/checkpoint_agent/presets/agent_v1.rs
+  s_00f92a342223ec::t_a29645adec297b 106,173
+agent-support/visualstudio/src/GitAiVS/Detection/CopilotEditDetector.cs
+  s_00f92a342223ec::t_a29645adec297b 1-145
+tests/integration/log.rs
+  s_00f92a342223ec::t_a29645adec297b 1-198
+src/streams/agents/opencode.rs
+  s_00f92a342223ec::t_a29645adec297b 1-693
+tests/integration/windsurf.rs
+  s_00f92a342223ec::t_a29645adec297b 5-7,73,151
+.github/workflows/release-intellij-plugin.yml
+  s_00f92a342223ec::t_a29645adec297b 38
+src/streams/agents/cursor.rs
+  s_00f92a342223ec::t_a29645adec297b 1-382
+src/authorship/stats.rs
+  s_00f92a342223ec::t_a29645adec297b 382-389,391-396,406,410-411,413,416,419,421,425-436
+src/daemon/test_sync.rs
+  s_00f92a342223ec::t_a29645adec297b 241-242,253-254
+src/metrics/mod.rs
+  s_00f92a342223ec::t_a29645adec297b 17-18,52-54,60-72,110-114
+.github/workflows/lint-format.yml
+  s_00f92a342223ec::t_a29645adec297b 40,59,86
+agent-support/visualstudio/src/GitAiVS.Tests/DocumentSaveListenerTests.cs
+  s_00f92a342223ec::t_a29645adec297b 1-39
+.github/workflows/github-integration-tests.yml
+  s_00f92a342223ec::t_a29645adec297b 22
+.github/workflows/release-vscode-extension.yml
+  s_00f92a342223ec::t_a29645adec297b 30,73,104,149
+src/streams/agents/continue_cli.rs
+  s_00f92a342223ec::t_a29645adec297b 1-387
+tests/integration/superuser_guard.rs
+  s_00f92a342223ec::t_a29645adec297b 1-122
+src/commands/checkpoint_agent/orchestrator.rs
+  s_00f92a342223ec::t_a29645adec297b 5,41,331,347,406,532
+src/commands/checkpoint_agent/presets/firebender.rs
+  s_00f92a342223ec::t_a29645adec297b 228,234,291,334
+src/commands/git_ai_handlers.rs
+  s_00f92a342223ec::t_a29645adec297b 321-322,354-355
+src/streams/model_extraction.rs
+  s_00f92a342223ec::t_a29645adec297b 1-460
+tests/integration/droid.rs
+  s_00f92a342223ec::t_a29645adec297b 4-6
+src/commands/checkpoint_agent/presets/gemini.rs
+  s_00f92a342223ec::t_a29645adec297b 4,35,37,50,52,75,81,142-144
+src/api/client.rs
+  s_00f92a342223ec::t_a29645adec297b 4,64,66-68,71-76,78-82
+src/commands/log.rs
+  s_00f92a342223ec::t_a29645adec297b 1-27,30,156,164-187,189-206,208-213,215-304,306-307,309-315,319-389,392-395,397-1007,1009-1039,1043-1116,1311-1395
+src/mdm/agents/vscode.rs
+  s_00f92a342223ec::t_a29645adec297b 177-183,282-301
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_00f92a342223ec::t_a29645adec297b 3,147,159,161,174,292,295,297,316,332,338
+src/commands/checkpoint_agent/presets/windsurf.rs
+  s_00f92a342223ec::t_a29645adec297b 4,113,115,145,172,240-242
+src/metrics/types.rs
+  s_00f92a342223ec::t_a29645adec297b 24
+src/commands/checkpoint_agent/presets/amp.rs
+  s_00f92a342223ec::t_a29645adec297b 4,268,308,310,324,326,346,352,418-419
+src/commands/checkpoint_agent/presets/codex.rs
+  s_00f92a342223ec::t_a29645adec297b 5,40,133,135,167,182,252-254,277
+src/streams/watermark.rs
+  s_00f92a342223ec::t_a29645adec297b 1-688
+agent-support/visualstudio/src/GitAiVS/Services/BinaryResolver.cs
+  s_00f92a342223ec::t_a29645adec297b 1-256
+src/commands/status.rs
+  s_00f92a342223ec::t_a29645adec297b 53
+src/streams/agents/claude.rs
+  s_00f92a342223ec::t_a29645adec297b 1-628
+agent-support/visualstudio/src/GitAiVS/GitAiVS.csproj
+  s_00f92a342223ec::t_a29645adec297b 1-63
+.github/workflows/test.yml
+  s_00f92a342223ec::t_a29645adec297b 59,115
+src/streams/db.rs
+  s_00f92a342223ec::t_a29645adec297b 1-1239
+src/commands/checkpoint_agent/presets/mock_ai.rs
+  s_00f92a342223ec::t_a29645adec297b 64
+tests/integration/main.rs
+  s_00f92a342223ec::t_a29645adec297b 36,81,128-129,131
+agent-support/visualstudio/DESIGN.md
+  s_00f92a342223ec::t_a29645adec297b 1-335
+.github/workflows/install-scripts-local.yml
+  s_00f92a342223ec::t_a29645adec297b 59,205
+agent-support/vscode/package.json
+  s_00f92a342223ec::t_a29645adec297b 86,90,101
+agent-support/visualstudio/src/GitAiVS.Tests/GitRepoResolverTests.cs
+  s_00f92a342223ec::t_a29645adec297b 1-63
+src/diagnostic_sentinels.rs
+  s_00f92a342223ec::t_a29645adec297b 1-45
+tests/integration/ci_handlers_comprehensive.rs
+  s_00f92a342223ec::t_a29645adec297b 1-26,58-59,86-244,261,271,278-281,283,390-395,397,400,533
+src/commands/checkpoint_agent/presets/droid.rs
+  s_00f92a342223ec::t_a29645adec297b 4,128-133,157,159,186,194,266-268,298-300
+assets/docs/buttons/meet-the-maintainers.svg
+  s_00f92a342223ec::t_a29645adec297b 1-9
+.github/workflows/nightly-upgrade.yml
+  s_00f92a342223ec::t_a29645adec297b 22
+agent-support/opencode/package.json
+  s_00f92a342223ec::t_a29645adec297b 11
+scripts/ai
+  s_00f92a342223ec::t_a29645adec297b 13-16,34-35,37,39-60,100,175,187,215-216,240,272-273,277,298-307,315,318,321,326,331,334,336
+agent-support/visualstudio/README.md
+  s_00f92a342223ec::t_a29645adec297b 1-52
+.github/workflows/opencode-type-check.yml
+  s_00f92a342223ec::t_a29645adec297b 24
+.github/workflows/nightly-agent-integration.yml
+  s_00f92a342223ec::t_a29645adec297b 141,249
+agent-support/opencode/README.md
+  s_00f92a342223ec::t_a29645adec297b 20,33
+src/commands/checkpoint_agent/presets/continue_cli.rs
+  s_00f92a342223ec::t_a29645adec297b 4,45,47,69,75,131-133
+src/daemon/sweep_coordinator.rs
+  s_00f92a342223ec::t_a29645adec297b 1-6,8-28,31-33,35,37,41-42,44,46-55,60-61,80-115,121,124-125,127-136,139-158,160-183,186-188,190-196,198-206
+src/streams/agents/windsurf.rs
+  s_00f92a342223ec::t_a29645adec297b 1-368
+tests/integration/session_event_repo_url.rs
+  s_00f92a342223ec::t_a29645adec297b 4-7,57,59,62,65,67-68,70,72-73,240-245,260-265,279-280,282-291,313,319,321-328,369,375,377-384,403-413,438-448,455,483-484,488-494,496-503,529,535,539-546,573,579,582-589,615-616,619-626,630,648,663,690,696,699-706,711,787-788,790-797,802,809,855,882
+src/streams/agents/copilot.rs
+  s_00f92a342223ec::t_a29645adec297b 1-969
+src/streams/sweep.rs
+  s_00f92a342223ec::t_a29645adec297b 1-86
+src/utils.rs
+  s_00f92a342223ec::t_a29645adec297b 154-320,1229-1270
+src/mdm/agents/mod.rs
+  s_00f92a342223ec::t_a29645adec297b 12-13,28-29,37,50-56
+src/commands/checkpoint_agent/presets/claude.rs
+  s_00f92a342223ec::t_a29645adec297b 4,73,75,90,93,95,115,121,181-183
+agent-support/opencode/git-ai.ts
+  s_00f92a342223ec::t_a29645adec297b 21-23,27-28,146-177,180-185,187,189-211,213-265,268-272,277-337,339-343,345-347,349,355-362,364-367,370-371,375,381-395,399-402,404-407,409-413,415-419,422,424-452,456-490,493,497-499,503-506,509-511,514-515
+src/mdm/agents/windsurf.rs
+  s_00f92a342223ec::t_a29645adec297b 382-387,406-430
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.71-ep",
+  "base_commit_sha": "bd4d8a663da05dd2fe3dd250ea39de9f7282a1a5",
+  "prompts": {},
+  "sessions": {
+    "s_00f92a342223ec": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ece3a-656c-7472-8d55-6d88a75cbec9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+src/daemon/ref_cursor.rs
+  s_0785f5df64ce7b::t_6ba8c1ec06709e 2000,2002-2004
+src/daemon.rs
+  s_0785f5df64ce7b::t_6ba8c1ec06709e 6095-6107,6331,6338-6365,6367-6369,6371-6384
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23-ep",
+  "base_commit_sha": "432f3b4020f4e5648b1aa01bacab25bfda18a518",
+  "prompts": {},
+  "sessions": {
+    "s_0785f5df64ce7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffdc9-9e54-7623-8486-8fe0f919d5cc",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}

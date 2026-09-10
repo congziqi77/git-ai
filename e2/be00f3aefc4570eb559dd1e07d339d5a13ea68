@@ -1,0 +1,137 @@
+.github/workflows/release-s3.yml
+  s_0f2bd4fcde2198::t_0c3e6289e8c2fe 49,54,62,78,86,88,93,146,149,151,155,200
+flake.nix
+  s_0f2bd4fcde2198::t_e1fa605c5c9b93 39
+tests/integration/stats.rs
+  s_0f2bd4fcde2198::t_0358aea1cc9e32 72-73,84-105,134-135
+src/commands/upgrade.rs
+  s_0f2bd4fcde2198::t_b887a415fadbdd 298-302,1123-1126,1458-1468
+  s_0f2bd4fcde2198::t_943cd2bbb817c1 1041,1127
+  s_0f2bd4fcde2198::t_04b03a4d6af6bb 1469-1470
+Cargo.toml
+  s_0f2bd4fcde2198::t_e1fa605c5c9b93 3
+.github/workflows/install-scripts-local.yml
+  s_0f2bd4fcde2198::t_7f58b6ecde9c8f 10-17,34-35,145,147-153,171,174-176,311,321-337,512,525
+.github/workflows/release.yml
+  s_0f2bd4fcde2198::t_315c556c84419e 474-478,481,552-572,600,602-609,810
+README.md
+  s_0f2bd4fcde2198::t_cdde98ef5bb101 177
+packaging/README.md
+  s_0f2bd4fcde2198::t_3d3d6182c380b3 12-13
+packaging/macos/build-pkg.sh
+  s_0f2bd4fcde2198::t_33c401892ffa10 6,29,35,41-42,49
+src/authorship/attribution_recovery.rs
+  s_0f2bd4fcde2198::t_672bf6b3d729cc 1,3,255-260,266,268-272,532,534,536,542,548,556,583,586,614,630-673,1717-1733,2168-2211
+src/authorship/rewrite.rs
+  s_0f2bd4fcde2198::t_eb69a105c3318b 419-420,466
+src/bin/git-ai-test-git-shim.rs
+  s_0f2bd4fcde2198::t_29262f2b827ad0 15,79-88,129,154
+src/commands/checkpoint_agent/bash_tool.rs
+  s_0f2bd4fcde2198::t_c91b4daaca029f 317,322-323,333,337-340,1491-1494,1496-1499,1521,1525-1534,1536
+src/commands/checkpoint_agent/presets/amp.rs
+  s_0f2bd4fcde2198::t_81a37d3957e9e9 252,255-264,473-534
+src/commands/checkpoint_agent/presets/claude.rs
+  s_0f2bd4fcde2198::t_cd83770aea3aac 51-58,71,227-279
+src/commands/checkpoint_agent/presets/droid.rs
+  s_0f2bd4fcde2198::t_72178fda2ca5a0 20-28,119,309-363
+src/commands/checkpoint_agent/presets/gemini.rs
+  s_0f2bd4fcde2198::t_04eea84b7b071b 21-28,35,200-254
+src/commands/daemon.rs
+  s_0f2bd4fcde2198::t_77cffdbe7c43ec 606,727-731,735-742,745-746
+src/commands/git_ai_handlers.rs
+  s_0f2bd4fcde2198::t_c9ef09cb33bd92 558,565-587
+src/daemon.rs
+  s_0f2bd4fcde2198::t_333202ca36eae0 23,52,92-93,96-98,121-237,506-510,840-844,993-1030,1032-1049,2607-2630,2637-2638,2749-2756,2841-2851,3161-3167,3403-3406,3408-3416,3992-4260,4310-4329,4349,4564-4569,4604-4619,4706-4707,4720,4764-4772,4789-4797,4806-4810,4815-4819,4851,4892-4893,4902-4914,4921-4925,4953-4957,4965-4974,5345-5361,5734-5748,6122-6131,6551-6586,6588-6591,6596-6606,6611-6626,6759-6761,6788-6801,6805-6807,7096-7117,7152-7158,7316,7320,7323-7352,7356-7366,7377,7382-7392,7398-7408,7411-7610,7612-7626,7629-7641,7645,7650-7660,8157-8160,8201-8215,8220-8234,8293-8305,8317-8329,8447,8589,8921-8992,9017-9040,9090,9242-9328
+src/daemon/checkpoint.rs
+  s_0f2bd4fcde2198::t_c43adcb70fbb6e 863-871
+src/daemon/control_api.rs
+  s_0f2bd4fcde2198::t_07f5a36c9b9c77 14
+src/daemon/ref_cursor.rs
+  s_0f2bd4fcde2198::t_99eb2c508d6bd5 468-509,1051-1065,1069-1073,1075-1116,1267-1281,5337-5416
+src/daemon/stream_worker.rs
+  s_0f2bd4fcde2198::t_91810d98c2ef78 1105-1110
+src/daemon/telemetry_handle.rs
+  s_0f2bd4fcde2198::t_06e3faf6f15643 33,48-56,60-65,69-73,86-90,93,98,109,120-122,132,143-148,159,170-175
+src/daemon/trace_normalizer.rs
+  s_0f2bd4fcde2198::t_d07d24604a1668 354-366,806-817,1299-1357
+src/diagnostics.rs
+  s_0f2bd4fcde2198::t_b227547d9765a8 346,352,358,364,373-374,378-379,383-384,386,392,399,602,610-618,778,780
+src/git/repo_storage.rs
+  s_0f2bd4fcde2198::t_bbcb719176ca9e 114,199-201,205-207,339,464,524-529,679-681,691-695,804
+src/lib.rs
+  s_0f2bd4fcde2198::t_2a3ff75c03083d 27
+src/streams/agent.rs
+  s_0f2bd4fcde2198::t_c8d1b5695b324f 107
+src/wltrace.rs
+  s_0f2bd4fcde2198::t_1d20e39103906e 1-64
+tests/async_mode.rs
+  s_0f2bd4fcde2198::t_85d7dd629627ed 11-12,506-521,565-569,618-676
+tests/daemon_mode.rs
+  s_0f2bd4fcde2198::t_109b7e2cce1086 5,12,14,20-21,33-34,65-76,1648-1650,1696-1698,1720-2377,2442-2444
+tests/integration/bash_tool_conformance.rs
+  s_0f2bd4fcde2198::t_d32aa61e6dce18 567-570,573-576,612,621-630,632
+tests/integration/checkpoint_size.rs
+  s_0f2bd4fcde2198::t_5158d7ad935048 104,128
+tests/integration/checkpoint_unit.rs
+  s_0f2bd4fcde2198::t_41cccec0574777 57,99,141,176,351-353,362-365,453,492,551-553,561-564,609,652,719,775,833,884-885,920-921,1071,1117,1176,1253,1360
+tests/integration/cherry_pick.rs
+  s_0f2bd4fcde2198::t_f9ae5c385b2b2e 3,832-1010,1487,1494-1498
+tests/integration/claude_code.rs
+  s_0f2bd4fcde2198::t_3ccadcff218dad 79,138,166,379
+tests/integration/cold_trace2_repo.rs
+  s_0f2bd4fcde2198::t_558a83dfb7536d 135-137
+tests/integration/continue_cli.rs
+  s_0f2bd4fcde2198::t_71e71f1c0f1676 389-395
+tests/integration/cursor.rs
+  s_0f2bd4fcde2198::t_bb71fffe3f40cf 529,546-547
+tests/integration/debug_diagnostics.rs
+  s_0f2bd4fcde2198::t_448dd6097365ac 1,3,8-25,35-42,47-50
+tests/integration/droid.rs
+  s_0f2bd4fcde2198::t_8b48a6f6337590 151,192
+tests/integration/fuzzer/model.rs
+  s_0f2bd4fcde2198::t_2d9f3a3fbcd642 269-297
+tests/integration/fuzzer/operations.rs
+  s_0f2bd4fcde2198::t_df779dc3b00622 188,214
+tests/integration/gemini.rs
+  s_0f2bd4fcde2198::t_bd761b0f1fb55b 356-363
+tests/integration/opencode.rs
+  s_0f2bd4fcde2198::t_7a603977bfee8a 2,5-7,10-11,368-373,429-456
+tests/integration/post_commit_unit.rs
+  s_0f2bd4fcde2198::t_4dad42a7c5cbdd 59,63,66-70,72
+tests/integration/pull_rebase_ff.rs
+  s_0f2bd4fcde2198::t_00adf95434e3a6 541-695,2138,2157-2161
+tests/integration/repos/test_repo.rs
+  s_0f2bd4fcde2198::t_c63bf6e03e9a85 1859-1865,2320-2333,3066-3076,3078-3085,3087-3094,3096-3097,3099,3242-3279
+tests/integration/rewrite_ops_attribution.rs
+  s_0f2bd4fcde2198::t_8d4a611627711a 322
+tests/integration/session_event_attribution.rs
+  s_0f2bd4fcde2198::t_c65a004bf32e7c 142-168,421-522,543,547-551,582,586-590,613,655,685,724,953,966-973,991-995,1010-1017,1032-1039,1074-1078
+tests/integration/simple_additions.rs
+  s_0f2bd4fcde2198::t_f44d8137ec6418 230-238,1002-1009,1988-1992,2041-2042,2076
+tests/integration/squash_merge.rs
+  s_0f2bd4fcde2198::t_9aa5c23c3b52cf 562-563,565
+tests/integration/status_unit.rs
+  s_0f2bd4fcde2198::t_dc502fe1d4e8d3 1,50-65
+tests/integration/windsurf.rs
+  s_0f2bd4fcde2198::t_744b4e6bdb8f06 324-330
+tests/integration/worktrees.rs
+  s_0f2bd4fcde2198::t_9f58952ed04e6b 596,697,763,820
+Cargo.lock
+  s_0f2bd4fcde2198::t_acc217a48508d4 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16-ep",
+  "base_commit_sha": "e2be00f3aefc4570eb559dd1e07d339d5a13ea68",
+  "prompts": {},
+  "sessions": {
+    "s_0f2bd4fcde2198": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc5a0-26cb-7a41-9c7f-26f18492573d",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}

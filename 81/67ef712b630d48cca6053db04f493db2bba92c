@@ -1,0 +1,41 @@
+tests/daemon_mode.rs
+  s_b3b7d3aa3e577a::t_e73feb2c8bc59b 3214,3216-3272
+  s_b3b7d3aa3e577a::t_9093f5afd92bc8 3215
+  s_b3b7d3aa3e577a::t_a929af118a76e4 3213
+src/daemon/ref_cursor.rs
+  s_b3b7d3aa3e577a::t_7d8169cfe4cb86 141-142,144-147,163-165,168-173,178-183,187-192,196,241-250,255,259-286,1850,1855-1869,1871-1872
+  s_b3b7d3aa3e577a::t_0ba16b8600337b 149-152,154-160
+  s_b3b7d3aa3e577a::t_8ceb4faafe69a6 148,161-162,1870,1873-1877,1880
+src/authorship/rewrite.rs
+  s_b3b7d3aa3e577a::t_bff1efde628266 1234-1235,1237-1241
+  s_b3b7d3aa3e577a::t_fb3aefb167e25d 462-471,491-501,524-534,845-866,873-877,888,893,899,904,910,920-932,936-953,997-1000,1009-1017,1031-1040,1151-1160,1166-1176,1185-1195,1232-1233,1236,1242-1261
+  s_b3b7d3aa3e577a::t_0ba16b8600337b 472-489,506-523,828-844,1018-1030,1208-1226
+  s_b3b7d3aa3e577a::t_485faf64860fe4 827
+src/daemon/family_actor.rs
+  s_b3b7d3aa3e577a::t_fcb5cd096973a9 113-116,128-152
+src/daemon.rs
+  s_b3b7d3aa3e577a::t_fcb5cd096973a9 78,80-82
+  s_b3b7d3aa3e577a::t_aa6dbf91baa63c 5734-5742
+  s_b3b7d3aa3e577a::t_9093f5afd92bc8 79
+  s_b3b7d3aa3e577a::t_66de2d02e41794 4675-4678,4697-4714
+  s_b3b7d3aa3e577a::t_abb80c2674a52e 5347,5350-5361,5376-5388,5415-5424,5482-5493,5525-5535,5541-5551,5560-5572
+src/daemon/trace_normalizer.rs
+  s_b3b7d3aa3e577a::t_fcb5cd096973a9 744-756,758-762
+  s_b3b7d3aa3e577a::t_66de2d02e41794 757
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20-ep",
+  "base_commit_sha": "8167ef712b630d48cca6053db04f493db2bba92c",
+  "prompts": {},
+  "sessions": {
+    "s_b3b7d3aa3e577a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fd49f-49bd-7983-ad94-b876e236e7b3",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}

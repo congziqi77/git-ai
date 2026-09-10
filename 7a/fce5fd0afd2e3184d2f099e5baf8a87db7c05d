@@ -1,0 +1,41 @@
+src/daemon/analyzers/history.rs
+  s_50ffc357b44672::t_dfd7b6158845cf 32-42,44-47,69-74,89-95,180-190,204
+  s_50ffc357b44672::t_aa93a34ab7d870 205
+Cargo.toml
+  s_2c1f2c86837828::t_98ca499d20667f 3
+Cargo.lock
+  ai_agent 1197
+src/daemon/trace_normalizer.rs
+  s_50ffc357b44672::t_628b5a5565909d 370,1126
+  s_50ffc357b44672::t_a2be626c3a6cc0 138-145,165-168,371-379,381-384,526-532,539-542,546-549,554-555,718-721,724-727,738-741,846-848,853,1095,1098-1102,1111-1113
+  s_50ffc357b44672::t_a402ff41b000bc 550-553,849-852,1103-1110
+flake.nix
+  s_2c1f2c86837828::t_98ca499d20667f 39
+src/daemon.rs
+  s_50ffc357b44672::t_1132ce5c81ef77 6980-6992,7466-7473
+  s_50ffc357b44672::t_b136dd4c086fd7 7474
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3-ep",
+  "base_commit_sha": "7afce5fd0afd2e3184d2f099e5baf8a87db7c05d",
+  "prompts": {},
+  "sessions": {
+    "s_2c1f2c86837828": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea4f4-2f41-74b1-9f63-7e35d4775f24",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_50ffc357b44672": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ea4d0-3949-7602-8103-63e9cedfcf85",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}

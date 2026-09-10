@@ -1,0 +1,31 @@
+.github/workflows/release-s3.yml
+  s_d7e4433d0b9829::t_dd686239be3401 78-79,106,109
+Cargo.toml
+  s_ceca6faa0b5504::t_4046901e5f5ef4 3
+flake.nix
+  s_ceca6faa0b5504::t_60b452fd7d017b 39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "b6c2c0217034ae35ce20537f7123c492f598134f",
+  "prompts": {},
+  "sessions": {
+    "s_ceca6faa0b5504": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee43205d-3939-42fd-b980-9be5648e9308",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    },
+    "s_d7e4433d0b9829": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e80ee-a835-7c83-9422-033d986ed735",
+        "model": "gpt-5.5"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}

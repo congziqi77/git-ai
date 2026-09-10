@@ -1,0 +1,20 @@
+tests/daemon_mode.rs
+  s_0785f5df64ce7b::t_bf756affcf47d0 3233-3288
+  s_0785f5df64ce7b::t_0310ad46141ee8 3232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23-ep",
+  "base_commit_sha": "dc0d7fbc924b314becd5a2dd54904e3ac8c46f60",
+  "prompts": {},
+  "sessions": {
+    "s_0785f5df64ce7b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffdc9-9e54-7623-8486-8fe0f919d5cc",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+Cargo.toml
+  s_ceca6faa0b5504::t_4046901e5f5ef4 3
+flake.nix
+  s_ceca6faa0b5504::t_60b452fd7d017b 39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.9",
+  "base_commit_sha": "b8275ab90a630dee1007951aa43625e2c4406d9f",
+  "prompts": {},
+  "sessions": {
+    "s_ceca6faa0b5504": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee43205d-3939-42fd-b980-9be5648e9308",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}

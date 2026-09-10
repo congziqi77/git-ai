@@ -1,0 +1,23 @@
+.gitignore
+  s_ceca6faa0b5504::t_7f6dbec76df88e 44-45
+flake.nix
+  s_ceca6faa0b5504::t_60b452fd7d017b 39
+Cargo.toml
+  s_ceca6faa0b5504::t_4046901e5f5ef4 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3-ep",
+  "base_commit_sha": "4e436481bb74de490eb019f3adf0fd1db6bbd6f2",
+  "prompts": {},
+  "sessions": {
+    "s_ceca6faa0b5504": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee43205d-3939-42fd-b980-9be5648e9308",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": null
+    }
+  }
+}

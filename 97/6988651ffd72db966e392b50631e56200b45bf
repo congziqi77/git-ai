@@ -1,0 +1,28 @@
+tests/integration/stats.rs
+  s_ed24eb2129653d::t_bba74a6e8e3d53 96-100,102-106,108-109,111-112
+  s_ed24eb2129653d::t_841b75f827ab8f 101,107,110
+  s_ed24eb2129653d::t_4381b874725eb2 95
+src/authorship/range_authorship.rs
+  s_ed24eb2129653d::t_bc3753d85b3483 413,417-421
+src/authorship/stats.rs
+  s_ed24eb2129653d::t_581bc73789c977 601
+  s_ed24eb2129653d::t_bf9d66dbdf8c1d 7,534,540-550,553-554,556-564,566-571,573-584,586-598,602-625,632-640
+  s_ed24eb2129653d::t_bba74a6e8e3d53 809-858
+  s_ed24eb2129653d::t_d26d355b96e750 641-645,859-860
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5-ep",
+  "base_commit_sha": "976988651ffd72db966e392b50631e56200b45bf",
+  "prompts": {},
+  "sessions": {
+    "s_ed24eb2129653d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8882-242f-7ea3-8a0d-d4d7811775c0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
