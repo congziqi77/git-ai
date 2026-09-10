@@ -215,16 +215,25 @@ impl MockApiServer {
         let stop_thread = Arc::clone(&stop);
 
         let thread = thread::spawn(move || {
+            let mut connections = Vec::new();
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_http_connection(stream, &tx);
+                        let tx = tx.clone();
+                        connections.push(thread::spawn(move || {
+                            handle_http_connection(stream, &tx);
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("mock API accept failed: {}", error),
                 }
+            }
+            for connection in connections {
+                connection
+                    .join()
+                    .expect("mock API connection handler panicked");
             }
         });
 
@@ -8664,7 +8673,11 @@ fn reingest_command_redelivers_bounded_and_all_metrics_through_daemon() {
         .expect("daemon should deliver the bounded reingestion");
 
     let bounded_uploads = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(bounded_uploads.contains("inside-window"));
+    assert!(
+        bounded_uploads.contains("inside-window"),
+        "bounded uploads: {bounded_uploads}\ndaemon stderr: {}",
+        repo.daemon_stderr_contents()
+    );
     assert!(!bounded_uploads.contains("before-window"));
     assert!(!bounded_uploads.contains("after-window"));
 
@@ -8676,7 +8689,11 @@ fn reingest_command_redelivers_bounded_and_all_metrics_through_daemon() {
         .expect("daemon should deliver the all-time reingestion");
 
     let all_uploads = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(all_uploads.contains("before-window"));
+    assert!(
+        all_uploads.contains("before-window"),
+        "all uploads: {all_uploads}\ndaemon stderr: {}",
+        repo.daemon_stderr_contents()
+    );
     assert!(all_uploads.contains("inside-window"));
     assert!(all_uploads.contains("after-window"));
     assert_eq!(
