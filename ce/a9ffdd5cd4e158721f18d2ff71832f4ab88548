@@ -1,0 +1,25 @@
+docs/superpowers/plans/2026-09-10-sync-origin-main-1.7.6-ep.md
+  s_52aa7eecea50d4::t_0e07812fb13c74 22,45
+Cargo.toml
+  s_52aa7eecea50d4::t_0e07812fb13c74 3
+flake.nix
+  s_52aa7eecea50d4::t_0e07812fb13c74 39
+Cargo.lock
+  s_52aa7eecea50d4::t_3dce854232a095 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24-ep",
+  "base_commit_sha": "cea9ffdd5cd4e158721f18d2ff71832f4ab88548",
+  "prompts": {},
+  "sessions": {
+    "s_52aa7eecea50d4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08909-3416-74b1-b029-992bbddc2ae4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
