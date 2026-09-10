@@ -20,7 +20,7 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - [x] Review critical-path auto-merges in rewrite and trace2 code.
 - [x] Run focused post-merge regression tests.
 - [x] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
-- [ ] Run format, lint, build, version, and full test verification.
+- [x] Run format, lint, build, version, and full test verification.
 - [ ] Push the integration branch and fast-forward `fork/main` after verification.
 - [ ] Create and push annotated tag `v1.7.6-ep` at the verified release commit.
 - [ ] Build and verify four GitHub Actions release artifacts.
@@ -43,3 +43,5 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - 2026-09-10: Reviewed fork-only deltas against `origin/main`; no new git work was introduced on ingestion paths.
 - 2026-09-10: Post-merge diagnostics, recovery, file-statistics, and update-ref stdin regression tests passed.
 - 2026-09-10: Created the separate EP version change for `1.7.6-ep` in all three version sources.
+- 2026-09-10: `task fmt`, `task lint`, `task build`, the debug version check, the remaining standalone test binaries, and doc tests passed.
+- 2026-09-10: The complete integration target finished with 3,377 passed, 89 ignored, and two checked-out `update-ref` timing failures. Both failures reproduce unchanged on a clean `origin/main` baseline under the local Homebrew Git 2.48.0 environment, so they are not merge regressions; hosted CI remains the release gate.
