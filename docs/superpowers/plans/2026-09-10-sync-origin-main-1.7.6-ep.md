@@ -21,10 +21,10 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - [x] Run focused post-merge regression tests.
 - [x] Bump `Cargo.toml`, `Cargo.lock`, and `flake.nix` to `1.7.6-ep`.
 - [x] Run format, lint, build, version, and full test verification.
-- [ ] Push the integration branch and fast-forward `fork/main` after verification.
-- [ ] Create and push annotated tag `v1.7.6-ep` at the verified release commit.
-- [ ] Build and verify four GitHub Actions release artifacts.
-- [ ] Dry-run packaging, upload to S3, update `rebasefix`, and reinstall to verify.
+- [x] Push the integration branch and fast-forward `fork/main` after verification.
+- [x] Create and push annotated tag `v1.7.6-ep` at the verified release commit.
+- [x] Build and verify four GitHub Actions release artifacts.
+- [x] Dry-run packaging, upload to S3, update `rebasefix`, and reinstall to verify.
 
 ## Conflict policy
 
@@ -48,3 +48,8 @@ Make `fork/main` the maintained EP mainline, merge the current `origin/main`, pr
 - 2026-09-10: The first hosted macOS core run exposed a fork-only interaction: rewrite diagnostics were enabled by default and interfered with metrics reingestion. Changed diagnostics to explicit opt-in, kept the diagnostics test enabled through a scoped daemon environment, and verified both regression tests plus lint locally.
 - 2026-09-10: Hosted run `34434606490` exposed a separate macOS test-fixture race: the mock API serialized connections while metrics and fire-and-forget daemon-log uploads are intentionally concurrent. Updated the mock to serve connections concurrently; the reingest regression passed 10 consecutive runs and the complete 117-test `daemon_mode` target passed locally.
 - 2026-09-10: Hosted Test run `34435793053` passed all 17 jobs on source commit `e5b0778a7c4b74558b3d89214e3775cc67068363`, including Ubuntu, macOS, and Windows core/integration shards.
+- 2026-09-10: Fast-forwarded `fork/main` and pushed the integration branch through documentation commit `f1ed32dd682c77f6bd5f3d6c318ee3c3fb02ba94`; pushed annotated tag `v1.7.6-ep`, which peels to that verified release commit.
+- 2026-09-10: S3 Release Build run `34438108023` passed all platform jobs on `f1ed32dd682c77f6bd5f3d6c318ee3c3fb02ba94`. The aggregate artifact and four independently downloaded artifacts matched byte-for-byte, and the workflow-provided `SHA256SUMS` verified every binary and installer.
+- 2026-09-10: Verified release binary SHA-256 values: Linux ARM64 `c7c3e1aa17ec94e82cb99e6bbc7d3f61dcb3bea0c6203f6e0c5629144791c541`, Linux x64 `71b3dc4a35cf6ad9a18b231c2f60ab138ff1aaf4942b08ef020cffd2769bee18`, macOS ARM64 `99550aa8ab05f21061a73d7a263359715cec8ccf646e051b856917a8a10fb94a`, and macOS x64 `345768fd894bed0802e32cd888bc579e89e1cecf8729b278fa18087d2dfe2c4d`.
+- 2026-09-10: Dry-run packaging verified both immutable-release and channel checksums and confirmed both installers pin `v1.7.6-ep`. Uploaded `v1.7.6-ep/` and refreshed `channels/rebasefix/` in `ep-zadig-prod`, then read both manifests back through the public endpoint.
+- 2026-09-10: Installed from the public `rebasefix` channel. `/Users/congziqi/.git-ai/bin/git-ai`, `/Users/congziqi/.local/bin/git-ai`, the active `git-ai`, and the running daemon all verified as healthy version `1.7.6-ep`.
