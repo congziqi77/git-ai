@@ -1,0 +1,20 @@
+docs/superpowers/plans/2026-09-10-sync-origin-main-1.7.6-ep.md
+  s_52aa7eecea50d4::t_b374e74b497d6c 1-16,18-40
+  s_52aa7eecea50d4::t_a42165675857f7 17,41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24-ep",
+  "base_commit_sha": "9f1822739185dbb4ef5e8ecb0306cab2c244955d",
+  "prompts": {},
+  "sessions": {
+    "s_52aa7eecea50d4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08909-3416-74b1-b029-992bbddc2ae4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "congziqi <congziqi@lixiang.com>"
+    }
+  }
+}
