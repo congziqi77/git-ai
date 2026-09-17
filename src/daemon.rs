@@ -7610,8 +7610,8 @@ impl ActorDaemonCoordinator {
             let mut handled_revert_commits = false;
             for event in events {
                 match event {
-                    crate::daemon::domain::SemanticEvent::CloneCompleted { .. } => {
-                        apply_clone_notes_sync_side_effect(&worktree)?;
+                    crate::daemon::domain::SemanticEvent::CloneCompleted { target } => {
+                        apply_clone_notes_sync_side_effect(&target.to_string_lossy())?;
                     }
                     crate::daemon::domain::SemanticEvent::PullCompleted { .. } => {
                         apply_pull_notes_sync_side_effect(

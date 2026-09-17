@@ -374,6 +374,13 @@ impl<B: GitBackend> TraceNormalizer<B> {
         _sid: &str,
         root_sid: &str,
     ) -> Result<Option<NormalizedCommand>, GitAiError> {
+        let prefer_def_repo_target = self
+            .state
+            .pending
+            .get(root_sid)
+            .and_then(|pending| argv_primary_command(&pending.raw_argv))
+            .is_some_and(|command| matches!(command.as_str(), "clone" | "init"));
+
         // Trace2 numbers a process's repositories: the primary repo is 1;
         // higher indices are secondary repos git merely peeked into (e.g. an
         // embedded subrepo opened for a gitlink dirtiness check during
@@ -387,7 +394,14 @@ impl<B: GitBackend> TraceNormalizer<B> {
             }
             return Ok(None);
         }
-        let payload_worktree = payload_worktree(payload);
+        // A clone target nested inside another repository may not have a complete
+        // `.git/HEAD` when def_repo arrives. Preserve Git's exact target so
+        // filesystem discovery cannot collapse it to the enclosing worktree.
+        let payload_worktree = if prefer_def_repo_target {
+            payload_reported_worktree(payload)
+        } else {
+            payload_worktree(payload)
+        };
         let payload_repo = payload
             .get("repo")
             .and_then(Value::as_str)
@@ -400,13 +414,6 @@ impl<B: GitBackend> TraceNormalizer<B> {
             .pending
             .get(root_sid)
             .and_then(|pending| pending.worktree.clone());
-        let prefer_def_repo_target = self
-            .state
-            .pending
-            .get(root_sid)
-            .and_then(|pending| argv_primary_command(&pending.raw_argv))
-            .is_some_and(|command| matches!(command.as_str(), "clone" | "init"));
-
         // For clone/init the root process's def_repo carries the newly created
         // repo path.  Child processes (remote-https, index-pack, rev-list, …)
         // inherit the parent CWD and their def_repo reports that CWD — not the
@@ -438,7 +445,11 @@ impl<B: GitBackend> TraceNormalizer<B> {
                 .or(payload_repo)
                 .ok_or_else(|| GitAiError::Generic("def_repo missing repo path".to_string()))?
         };
-        let repo = worktree_root_for_path(&repo).unwrap_or(repo);
+        let repo = if prefer_def_repo_target {
+            repo
+        } else {
+            worktree_root_for_path(&repo).unwrap_or(repo)
+        };
 
         self.state
             .sid_to_worktree
@@ -839,12 +850,15 @@ pub(crate) fn def_repo_is_secondary(payload: &Value) -> bool {
 }
 
 fn payload_worktree(payload: &Value) -> Option<PathBuf> {
+    payload_reported_worktree(payload).map(|path| worktree_root_for_path(&path).unwrap_or(path))
+}
+
+fn payload_reported_worktree(payload: &Value) -> Option<PathBuf> {
     payload
         .get("worktree")
         .or_else(|| payload.get("repo_working_dir"))
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .map(|path| worktree_root_for_path(&path).unwrap_or(path))
 }
 
 fn payload_cwd(payload: &Value) -> Option<PathBuf> {
@@ -2063,6 +2077,61 @@ mod tests {
             cmd.worktree.as_ref(),
             Some(&clone_dest),
             "clone worktree should be the destination, not the parent CWD"
+        );
+    }
+
+    #[test]
+    fn clone_root_def_repo_preserves_target_before_git_dir_is_complete() {
+        let backend = Arc::new(MockBackend::default());
+        let mut normalizer = TraceNormalizer::new(backend);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let source_repo = temp.path().join("source-repo");
+        let clone_dest = source_repo.join("nested").join("cloned-repo");
+        create_git_dir(&source_repo);
+        fs::create_dir_all(&clone_dest).expect("create clone destination");
+
+        let root_sid = "20260917T000000.000000Z-Hdeadbeef-P00010000";
+        let start = serde_json::json!({
+            "event": "start",
+            "sid": root_sid,
+            "ts": 1,
+            "argv": [
+                "git",
+                "clone",
+                "https://example.com/org/repo.git",
+                "nested/cloned-repo"
+            ],
+            "worktree": source_repo
+        });
+        let root_def_repo = serde_json::json!({
+            "event": "def_repo",
+            "sid": root_sid,
+            "ts": 2,
+            "worktree": clone_dest
+        });
+        let exit = serde_json::json!({
+            "event": "exit",
+            "sid": root_sid,
+            "ts": 3,
+            "code": 0
+        });
+        let atexit = atexit_payload(root_sid, 4);
+
+        assert!(normalizer.ingest_payload(&start).unwrap().is_none());
+        assert!(normalizer.ingest_payload(&root_def_repo).unwrap().is_none());
+        create_git_dir(&clone_dest);
+        assert!(normalizer.ingest_payload(&exit).unwrap().is_none());
+        let cmd = normalizer.ingest_payload(&atexit).unwrap().unwrap();
+
+        assert_eq!(cmd.primary_command.as_deref(), Some("clone"));
+        assert_eq!(cmd.worktree.as_ref(), Some(&clone_dest));
+        let expected_family = clone_dest
+            .join(".git")
+            .canonicalize()
+            .unwrap_or_else(|_| clone_dest.join(".git"));
+        assert_eq!(
+            cmd.family_key.as_ref().map(|family| family.0.as_str()),
+            Some(expected_family.to_string_lossy().as_ref())
         );
     }
 

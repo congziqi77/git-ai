@@ -3,7 +3,6 @@ use crate::daemon::domain::{
     AnalysisResult, CommandClass, Confidence, NormalizedCommand, PullStrategy, SemanticEvent,
 };
 use crate::error::GitAiError;
-use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct TransportAnalyzer;
@@ -30,9 +29,12 @@ impl CommandAnalyzer for TransportAnalyzer {
                 remote: first_positional(&args),
             }),
             "clone" => events.push(SemanticEvent::CloneCompleted {
-                target: infer_clone_target(&args)
-                    .or_else(|| cmd.worktree.clone())
-                    .unwrap_or_else(|| PathBuf::from(".")),
+                target: cmd.worktree.clone().ok_or_else(|| {
+                    GitAiError::Generic(format!(
+                        "successful clone missing resolved target sid={}",
+                        cmd.root_sid
+                    ))
+                })?,
             }),
             "ls-remote" => events.push(SemanticEvent::LsRemoteCompleted),
             _ => unreachable!("registry should not route '{}' to TransportAnalyzer", name),
@@ -95,29 +97,6 @@ fn infer_pull_strategy_from_args(args: &[String]) -> Option<PullStrategy> {
         return Some(PullStrategy::Rebase);
     }
     None
-}
-
-fn infer_clone_target(args: &[String]) -> Option<PathBuf> {
-    if args.is_empty() {
-        return None;
-    }
-    let mut filtered = Vec::new();
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg == "-C" || arg == "--origin" || arg == "--template" {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with('-') {
-            continue;
-        }
-        filtered.push(arg.clone());
-    }
-    filtered.last().map(PathBuf::from)
 }
 
 #[cfg(test)]
