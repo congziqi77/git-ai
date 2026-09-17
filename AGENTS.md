@@ -1,3 +1,10 @@
+## Branch Baseline
+
+- Every development branch and development worktree must be created from the latest `fork/main`.
+- Fetch `fork/main` and verify its commit and package version before creating a development branch or worktree.
+- The `origin` remote is reserved for synchronizing upstream changes into the fork. Do not create development branches or worktrees from `origin/*` refs.
+- Push development branches and create pull requests only in the fork repository.
+
 ## Non-Negotiable Rules
 
 These are hard constraints. Violating any of them will get a PR rejected outright.

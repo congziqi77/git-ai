@@ -108,6 +108,74 @@ worktree_test_wrappers! {
 }
 
 worktree_test_wrappers! {
+    fn notes_sync_clone_from_existing_repo_fetches_notes_into_clone_target() {
+        let (source, upstream) = TestRepo::new_with_remote();
+
+        fs::write(source.path().join("nested-clone-seed.txt"), "seed\n")
+            .expect("failed to write nested clone seed file");
+        source
+            .git_og(&["add", "nested-clone-seed.txt"])
+            .expect("add should succeed");
+        source
+            .git_og(&["commit", "-m", "nested clone seed commit"])
+            .expect("seed commit should succeed");
+        let seed_sha = source
+            .git_og(&["rev-parse", "HEAD"])
+            .expect("rev-parse should succeed")
+            .trim()
+            .to_string();
+        source
+            .git_og(&[
+                "notes",
+                "--ref=ai",
+                "add",
+                "-m",
+                "nested-clone-seed-note",
+                seed_sha.as_str(),
+            ])
+            .expect("adding notes should succeed");
+        source
+            .git_og(&["push", "-u", "origin", "HEAD"])
+            .expect("pushing branch should succeed");
+        source
+            .git_og(&["push", "origin", "refs/notes/ai"])
+            .expect("pushing notes should succeed");
+
+        let parent = TestRepo::new();
+        assert!(
+            parent
+                .git_og(&["remote"])
+                .expect("listing parent remotes should succeed")
+                .trim()
+                .is_empty(),
+            "parent repository should have no remote"
+        );
+        let relative_target = "workspaces/project/cloned-repo";
+        let clone_dir = parent.path().join(relative_target);
+        fs::create_dir_all(clone_dir.parent().expect("clone target parent"))
+            .expect("failed to create clone target parent");
+        let upstream_str = upstream.path().to_string_lossy().to_string();
+
+        parent
+            .git_from_working_dir(
+                parent.path(),
+                &["clone", upstream_str.as_str(), relative_target],
+            )
+            .expect("clone from existing repository should succeed");
+
+        assert_eq!(
+            read_note_from_worktree(&clone_dir, &seed_sha).as_deref(),
+            Some("nested-clone-seed-note\n"),
+            "clone target should fetch authorship notes from its origin"
+        );
+        assert!(
+            parent.read_authorship_note(&seed_sha).is_none(),
+            "parent repository should not receive the clone target's authorship note"
+        );
+    }
+}
+
+worktree_test_wrappers! {
     fn notes_sync_clone_reports_local_note_update_failure() {
         let (local, upstream) = TestRepo::new_with_remote();
 
