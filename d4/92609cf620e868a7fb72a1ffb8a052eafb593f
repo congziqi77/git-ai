@@ -1,0 +1,37 @@
+src/daemon.rs
+  s_bb8e002792e4d8::t_9c73e0ec6b20fe 7613-7614
+src/daemon/trace_normalizer.rs
+  s_bb8e002792e4d8::t_723d36c600f453 2085-2090,2092-2108,2110-2114,2116-2117,2119-2120,2123-2135
+  s_bb8e002792e4d8::t_3b460039bfeab0 853,2121
+  s_bb8e002792e4d8::t_d06488fc2be136 400-404,854-856
+  s_bb8e002792e4d8::t_9c73e0ec6b20fe 377-383
+  s_bb8e002792e4d8::t_4939909734359e 2091,2122
+  s_bb8e002792e4d8::t_fedb9e1709a896 397-399
+  s_bb8e002792e4d8::t_92fc142e5ea0c3 448-452
+  s_bb8e002792e4d8::t_6783ca685f6805 2084,2109,2115,2118
+  s_bb8e002792e4d8::t_e4f70cd511285b 2081-2083
+AGENTS.md
+  s_bb8e002792e4d8::t_72d5329336c812 1-7
+tests/notes_sync_regression.rs
+  s_bb8e002792e4d8::t_723d36c600f453 111-167,169-177
+  s_bb8e002792e4d8::t_b7de5b91cd3470 168
+  s_bb8e002792e4d8::t_3722a2d33c46a2 110
+src/daemon/analyzers/transport.rs
+  s_bb8e002792e4d8::t_9c73e0ec6b20fe 32-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6-ep",
+  "base_commit_sha": "d492609cf620e868a7fb72a1ffb8a052eafb593f",
+  "prompts": {},
+  "sessions": {
+    "s_bb8e002792e4d8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ace2-6a14-7a81-9873-4b3ab64dbd65",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
