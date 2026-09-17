@@ -72,6 +72,16 @@ pub fn stats_command(
     json: bool,
     ignore_patterns: &[String],
 ) -> Result<(), GitAiError> {
+    stats_command_with_note_requirement(repo, commit_sha, json, ignore_patterns, false)
+}
+
+pub fn stats_command_with_note_requirement(
+    repo: &Repository,
+    commit_sha: Option<&str>,
+    json: bool,
+    ignore_patterns: &[String],
+    require_note: bool,
+) -> Result<(), GitAiError> {
     let (target, refname) = if let Some(sha) = commit_sha {
         // Validate that the commit exists using revparse_single
         match repo.revparse_single(sha) {
@@ -99,7 +109,11 @@ pub fn stats_command(
         refname
     );
 
-    let authorship_log = wait_for_recent_authorship(repo, &target)?;
+    let authorship_log = if require_note {
+        Some(crate::git::notes_api::read_authorship_v3(repo, &target)?)
+    } else {
+        wait_for_recent_authorship(repo, &target)?
+    };
     if json {
         let stats = stats_for_commit_detailed_with_authorship(
             repo,

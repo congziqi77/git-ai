@@ -1,7 +1,7 @@
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
-use crate::authorship::stats::stats_command;
+use crate::authorship::stats::stats_command_with_note_requirement;
 use crate::commands;
 use crate::config;
 use crate::git::find_repository;
@@ -347,6 +347,7 @@ fn print_help() {
     );
     eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!("    --require-note         Fail if the single commit has no valid authorship note");
     eprintln!("  usage              Show local AI usage statistics");
     eprintln!("    --period <1d|3d|7d|30d>  Time window (default: 30d)");
     eprintln!("    --json                 Output in JSON format");
@@ -707,11 +708,15 @@ struct BlameAnalysisRequest {
 #[serde(deny_unknown_fields)]
 struct AuthorshipRemoteRequest {
     remote_name: String,
+    #[serde(default)]
+    commits: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct FetchAuthorshipNotesResponse {
     notes_existence: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    commits: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -839,6 +844,29 @@ pub(crate) fn handle_fetch_authorship_notes_internal(args: &[String]) {
 
     let response = FetchAuthorshipNotesResponse {
         notes_existence: notes_existence_label(notes_existence).to_string(),
+        commits: {
+            use crate::authorship::authorship_log_serialization::AuthorshipLog;
+            let notes = crate::git::notes_api::read_notes_batch(&repo, &request.commits)
+                .unwrap_or_else(|error| {
+                    emit_machine_json_error(format!("notes read failed: {error}"))
+                });
+            request
+                .commits
+                .iter()
+                .map(|sha| {
+                    let state = match notes.get(sha) {
+                        None => "note_missing",
+                        Some(content)
+                            if AuthorshipLog::deserialize_from_string(content).is_ok() =>
+                        {
+                            "ready"
+                        }
+                        Some(_) => "note_parse_failed",
+                    };
+                    (sha.clone(), state.to_string())
+                })
+                .collect()
+        },
     };
     let response_value = serde_json::to_value(response).unwrap_or_else(|e| {
         emit_machine_json_error(format!("Failed to serialize command response: {}", e))
@@ -980,11 +1008,16 @@ fn handle_stats(args: &[String]) {
     let mut json_output = false;
     let mut commit_sha = None;
     let mut commit_range: Option<CommitRange> = None;
+    let mut require_note = false;
     let mut ignore_patterns: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--require-note" => {
+                require_note = true;
+                i += 1;
+            }
             "--json" => {
                 json_output = true;
                 i += 1;
@@ -1059,6 +1092,10 @@ fn handle_stats(args: &[String]) {
 
     // Handle commit range if detected
     if let Some(range) = commit_range {
+        if require_note {
+            eprintln!("--require-note supports a single commit only");
+            std::process::exit(1);
+        }
         match range_authorship::range_authorship(range, false, &effective_patterns, None) {
             Ok(stats) => {
                 if json_output {
@@ -1076,11 +1113,12 @@ fn handle_stats(args: &[String]) {
         return;
     }
 
-    if let Err(e) = stats_command(
+    if let Err(e) = stats_command_with_note_requirement(
         &repo,
         commit_sha.as_deref(),
         json_output,
         &effective_patterns,
+        require_note,
     ) {
         match e {
             crate::error::GitAiError::Generic(msg) if msg.starts_with("No commit found:") => {

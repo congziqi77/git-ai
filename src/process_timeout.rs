@@ -91,6 +91,11 @@ pub(crate) fn run_command_with_timeout_and_env(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let mut child = command
         .spawn()
@@ -127,6 +132,15 @@ pub(crate) fn run_command_with_timeout_and_env(
                 return Ok(output.finish(status.code(), false, None));
             }
             Ok(None) if start.elapsed() >= timeout => {
+                // 超时后终止整个进程组，避免 SSH 或 upload-pack 继续占用资源。
+                #[cfg(unix)]
+                let kill_result = if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                };
+                #[cfg(not(unix))]
                 let kill_result = child.kill();
                 match &kill_result {
                     Ok(()) => output

@@ -1,7 +1,6 @@
 use crate::config::NotesBackendKind;
 use crate::error::GitAiError;
 use crate::git::find_repository;
-use crate::git::sync_authorship::{NotesExistence, fetch_authorship_notes};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -16,11 +15,15 @@ struct FetchNotesJsonOutput {
 pub fn handle_fetch_notes(args: &[String]) {
     let mut remote: Option<String> = None;
     let mut json_output = false;
+    let mut synchronized = false;
+    let mut commits_stdin = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json_output = true,
+            "--synchronized" => synchronized = true,
+            "--commits-stdin" => commits_stdin = true,
             "--remote" => {
                 i += 1;
                 if i >= args.len() {
@@ -86,6 +89,70 @@ pub fn handle_fetch_notes(args: &[String]) {
         },
     };
 
+    if commits_stdin && !synchronized {
+        eprintln!("--commits-stdin requires --synchronized");
+        std::process::exit(1);
+    }
+    if synchronized
+        || crate::config::Config::get().notes_backend_kind() == NotesBackendKind::GitNotes
+    {
+        let result = (|| -> Result<serde_json::Value, GitAiError> {
+            let commits: Vec<String> = if commits_stdin {
+                serde_json::from_reader(std::io::stdin())?
+            } else {
+                Vec::new()
+            };
+            if commits.iter().any(|sha| {
+                !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+            }) {
+                return Err(GitAiError::Generic("expected full commit OIDs".into()));
+            }
+            let config =
+                crate::commands::daemon::ensure_daemon_running(std::time::Duration::from_secs(5))
+                    .map_err(GitAiError::Generic)?;
+            let response = crate::daemon::send_control_request(
+                &config.control_socket_path,
+                &crate::daemon::control_api::ControlRequest::FetchNotes {
+                    repo_working_dir: repo.workdir()?.to_string_lossy().into_owned(),
+                    remote: remote_name.clone(),
+                    commits,
+                },
+            )?;
+            if !response.ok {
+                return Err(GitAiError::Generic(
+                    response.error.unwrap_or_else(|| "notes sync failed".into()),
+                ));
+            }
+            response
+                .data
+                .ok_or_else(|| GitAiError::Generic("missing notes sync response".into()))
+        })();
+        match result {
+            Ok(data) => {
+                if json_output {
+                    println!("{}", data);
+                } else if data["status"] == "not_found" {
+                    eprintln!("no notes found on remote");
+                } else {
+                    eprintln!("done");
+                }
+            }
+            Err(error) => {
+                let status = if error.to_string().contains("notes_sync_timeout") {
+                    "notes_sync_timeout"
+                } else {
+                    "fetch_failed"
+                };
+                if json_output {
+                    print_json_error(status, &error.to_string(), Some(&remote_name));
+                } else {
+                    eprintln!("Error: {error}");
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if !json_output {
         eprint!("Fetching authorship notes from '{}'...", remote_name);
     }
@@ -111,7 +178,6 @@ pub fn handle_fetch_notes(args: &[String]) {
                 } else {
                     eprintln!(" cache warmed ({:.2}s).", elapsed.as_secs_f64());
                 }
-                return;
             }
             Err(e) => {
                 if json_output {
@@ -122,45 +188,6 @@ pub fn handle_fetch_notes(args: &[String]) {
                 }
                 std::process::exit(1);
             }
-        }
-    }
-
-    match fetch_authorship_notes(&repo, &remote_name) {
-        Ok(notes_existence) => {
-            let elapsed = start.elapsed();
-            if json_output {
-                let status = match notes_existence {
-                    NotesExistence::Found => "found".to_string(),
-                    NotesExistence::NotFound => "not_found".to_string(),
-                };
-                let output = FetchNotesJsonOutput {
-                    remote: remote_name,
-                    status,
-                    error: None,
-                };
-                println!(
-                    "{}",
-                    serde_json::to_string(&output).expect("failed to serialize JSON")
-                );
-            } else {
-                match notes_existence {
-                    NotesExistence::Found => {
-                        eprintln!(" done ({:.2}s).", elapsed.as_secs_f64());
-                    }
-                    NotesExistence::NotFound => {
-                        eprintln!(" no notes found on remote ({:.2}s).", elapsed.as_secs_f64());
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if json_output {
-                print_json_error("fetch_failed", &e.to_string(), Some(&remote_name));
-            } else {
-                eprintln!(" failed.");
-                eprintln!("Error: {}", e);
-            }
-            std::process::exit(1);
         }
     }
 }
@@ -199,6 +226,10 @@ fn print_fetch_notes_help() {
     eprintln!("  <remote>           Remote to fetch from (default: upstream or origin)");
     eprintln!("  --remote <name>    Explicit remote name");
     eprintln!("  --json             Output result as JSON");
+    eprintln!("  --synchronized     Serialize Git notes fetch with daemon attribution writes");
+    eprintln!(
+        "  --commits-stdin    Read a JSON array of full commit OIDs and report note readiness"
+    );
     eprintln!("  -h, --help         Show this help message");
     eprintln!();
     eprintln!("Examples:");

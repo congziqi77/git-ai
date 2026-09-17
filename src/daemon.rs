@@ -8594,9 +8594,85 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    async fn fetch_notes_for_hook(
+        self: &Arc<Self>,
+        repo_working_dir: String,
+        remote: String,
+        commits: Vec<String>,
+    ) -> Result<serde_json::Value, GitAiError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        tracing::info!(%repo_working_dir, %remote, "notes sync requested");
+        let family = self.backend.resolve_family(Path::new(&repo_working_dir))?;
+        let lock = self.side_effect_exec_lock(&family.0)?;
+        // 当前 push 尚未结束，直接保护 notes 操作，不等待该 push 的队列项。
+        let guard = tokio::time::timeout_at(deadline, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                GitAiError::Generic("notes_sync_timeout: waiting for notes writer".into())
+            })?;
+        let coordinator = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let _effect = coordinator.begin_family_effect_guarded(&family.0);
+            if crate::config::Config::fresh().notes_backend_kind()
+                != crate::config::NotesBackendKind::GitNotes
+            {
+                return Err(GitAiError::Generic(
+                    "synchronized fetch requires the Git notes backend".into(),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(GitAiError::Generic("notes_sync_timeout".into()));
+            }
+            let executable = std::env::current_exe()?;
+            let request = json!({"remote_name": remote, "commits": commits}).to_string();
+            let output = crate::process_timeout::run_command_with_timeout_and_env(
+                executable
+                    .to_str()
+                    .ok_or_else(|| GitAiError::Generic("invalid executable path".into()))?,
+                &["fetch-authorship-notes", "--json", &request],
+                Some(Path::new(&repo_working_dir)),
+                remaining,
+                Duration::from_millis(20),
+                &["GIT_TRACE2_PARENT_SID", "GIT_TRACE2_PARENT_NAME"],
+                &[
+                    ("GIT_TRACE2", "0"),
+                    ("GIT_TRACE2_EVENT", "0"),
+                    ("GIT_TRACE2_PERF", "0"),
+                    ("GIT_TERMINAL_PROMPT", "0"),
+                ],
+            )
+            .map_err(GitAiError::Generic)?;
+            if output.timed_out {
+                return Err(GitAiError::Generic("notes_sync_timeout".into()));
+            }
+            if output.status != Some(0) || output.wait_error.is_some() {
+                return Err(GitAiError::Generic(format!(
+                    "notes sync failed: {}",
+                    output.stderr
+                )));
+            }
+            let data: serde_json::Value = serde_json::from_str(&output.stdout)?;
+            Ok(json!({"remote": remote, "synchronized": true,
+                "status": data["notes_existence"],
+                "commits": data.get("commits").cloned().unwrap_or_else(|| json!({}))}))
+        })
+        .await
+        .map_err(|error| GitAiError::Generic(format!("notes sync worker failed: {error}")))?
+    }
+
     async fn handle_control_request(self: &Arc<Self>, request: ControlRequest) -> ControlResponse {
         let result = match request {
             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
+            ControlRequest::FetchNotes {
+                repo_working_dir,
+                remote,
+                commits,
+            } => self
+                .fetch_notes_for_hook(repo_working_dir, remote, commits)
+                .await
+                .map(|data| ControlResponse::ok(None, Some(data))),
             ControlRequest::StatusDaemon => {
                 serde_json::to_value(crate::daemon::health::DaemonHealthSnapshot::capture(self))
                     .map(|v| ControlResponse::ok(None, Some(v)))
@@ -11123,6 +11199,7 @@ fn checkpoint_control_response_timeout(
             Duration::from_secs(timeout_secs.saturating_add(5))
         }
         ControlRequest::ReingestMetrics { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
+        ControlRequest::FetchNotes { .. } => Duration::from_secs(35),
         ControlRequest::Shutdown => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     }

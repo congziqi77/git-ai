@@ -14,6 +14,12 @@ pub enum ControlRequest {
     CheckpointRun { body_bytes: u64 },
     #[serde(rename = "sync.family")]
     SyncFamily { repo_working_dir: String },
+    #[serde(rename = "notes.fetch")]
+    FetchNotes {
+        repo_working_dir: String,
+        remote: String,
+        commits: Vec<String>,
+    },
     #[serde(rename = "status.family")]
     StatusFamily { repo_working_dir: String },
     #[serde(rename = "telemetry.submit")]
