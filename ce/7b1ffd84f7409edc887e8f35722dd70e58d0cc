@@ -1,0 +1,31 @@
+flake.nix
+  s_bb8e002792e4d8::t_6c86e16cb0a6db 39
+Cargo.toml
+  s_bb8e002792e4d8::t_6c86e16cb0a6db 3
+Cargo.lock
+  s_3f003b4045a4cd::t_ff040f005a6d7c 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6-ep",
+  "base_commit_sha": "ce7b1ffd84f7409edc887e8f35722dd70e58d0cc",
+  "prompts": {},
+  "sessions": {
+    "s_3f003b4045a4cd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ad2f-cb4f-7341-9185-cd63a016a0f1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    },
+    "s_bb8e002792e4d8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0ace2-6a14-7a81-9873-4b3ab64dbd65",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
