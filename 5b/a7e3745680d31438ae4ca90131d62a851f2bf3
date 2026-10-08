@@ -1,0 +1,20 @@
+src/git/sync_authorship.rs
+  s_63d012c3e865ef::t_82ec5d6532bb76 798-800
+  s_63d012c3e865ef::t_224984a0ad2fce 801,803
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.62-ep",
+  "base_commit_sha": "5ba7e3745680d31438ae4ca90131d62a851f2bf3",
+  "prompts": {},
+  "sessions": {
+    "s_63d012c3e865ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a994-c4e2-7cb1-8f2b-c5970920beba",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
