@@ -961,7 +961,7 @@ fn list_all_notes(repo: &Repository, notes_ref: &str) -> Result<Vec<(String, Str
 }
 
 /// Parse a revision to its SHA
-fn rev_parse(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
+pub(crate) fn rev_parse(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.extend_from_slice(&["rev-parse".to_string(), rev.to_string()]);
     let output = exec_git(&args)?;

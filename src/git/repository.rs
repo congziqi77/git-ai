@@ -2830,9 +2830,22 @@ pub fn exec_git_with_profile(
     args: &[String],
     profile: InternalGitProfile,
 ) -> Result<Output, GitAiError> {
+    exec_git_with_profile_and_env(args, profile, &[])
+}
+
+/// Execute Git with explicit environment values, preserving the internal Git profile.
+pub fn exec_git_with_env(args: &[String], envs: &[(&str, &OsStr)]) -> Result<Output, GitAiError> {
+    exec_git_with_profile_and_env(args, InternalGitProfile::General, envs)
+}
+
+fn exec_git_with_profile_and_env(
+    args: &[String],
+    profile: InternalGitProfile,
+    envs: &[(&str, &OsStr)],
+) -> Result<Output, GitAiError> {
     let effective_args =
         args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
-    let output = exec_git_allow_nonzero_with_profile(args, profile)?;
+    let output = exec_git_allow_nonzero_with_profile_and_env(args, profile, envs)?;
 
     if !output.status.success() {
         let code = output.status.code();

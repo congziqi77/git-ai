@@ -1,11 +1,15 @@
 use crate::git::refs::{
     AI_AUTHORSHIP_PUSH_REFSPEC, copy_ref, fallback_merge_notes_ours, merge_notes_from_ref,
-    ref_exists, tracking_ref_for_remote,
+    ref_exists, rev_parse, tracking_ref_for_remote,
 };
 use crate::{
     error::GitAiError,
-    git::{cli_parser::ParsedGitInvocation, repository::exec_git},
+    git::{
+        cli_parser::ParsedGitInvocation,
+        repository::{exec_git, exec_git_with_env},
+    },
 };
+use std::ffi::OsStr;
 
 use super::repository::Repository;
 
@@ -221,6 +225,17 @@ pub fn fetch_authorship_notes(
     repository: &Repository,
     remote_name: &str,
 ) -> Result<NotesExistence, GitAiError> {
+    let existence = fetch_authorship_tracking_notes(repository, remote_name)?;
+    if existence == NotesExistence::Found {
+        merge_tracking_notes(repository, remote_name)?;
+    }
+    Ok(existence)
+}
+
+fn fetch_authorship_tracking_notes(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<NotesExistence, GitAiError> {
     // Generate tracking ref for this remote
     let tracking_ref = tracking_ref_for_remote(remote_name);
 
@@ -274,7 +289,11 @@ pub fn fetch_authorship_notes(
         }
     }
 
-    // After successful fetch, merge the tracking ref into refs/notes/ai
+    Ok(NotesExistence::Found)
+}
+
+fn merge_tracking_notes(repository: &Repository, remote_name: &str) -> Result<(), GitAiError> {
+    let tracking_ref = tracking_ref_for_remote(remote_name);
     let local_notes_ref = "refs/notes/ai";
 
     if crate::git::refs::ref_exists(repository, &tracking_ref) {
@@ -309,7 +328,7 @@ pub fn fetch_authorship_notes(
         tracing::debug!("tracking ref {} was not created after fetch", tracking_ref);
     }
 
-    Ok(NotesExistence::Found)
+    Ok(())
 }
 
 fn is_missing_remote_notes_ref_error(error: &GitAiError) -> bool {
@@ -338,6 +357,7 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
         return Ok(());
     }
 
+    let gerrit_mode = gerrit_notes_push_enabled(repository, remote_name)?;
     let mut last_error = None;
 
     for attempt in 0..PUSH_NOTES_MAX_ATTEMPTS {
@@ -349,10 +369,19 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
             );
         }
 
-        fetch_and_merge_tracking_notes(repository, remote_name);
+        let refspec = if gerrit_mode {
+            let Some(commit) = prepare_gerrit_notes_commit(repository, remote_name)? else {
+                return Ok(());
+            };
+            format!("{}:refs/notes/ai", commit)
+        } else {
+            fetch_and_merge_tracking_notes(repository, remote_name);
+            AI_AUTHORSHIP_PUSH_REFSPEC.to_string()
+        };
 
         // Push notes without force (requires fast-forward)
-        let push_args = build_authorship_push_args(repository.global_args_for_exec(), remote_name);
+        let push_args =
+            build_authorship_push_args(repository.global_args_for_exec(), remote_name, &refspec);
 
         tracing::debug!("pushing authorship refs (no force): {:?}", &push_args);
 
@@ -373,6 +402,108 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
 
     Err(last_error
         .unwrap_or_else(|| GitAiError::Generic("notes push exhausted retries".to_string())))
+}
+
+fn gerrit_notes_push_enabled(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<bool, GitAiError> {
+    let configured_remote = repository
+        .remotes_with_urls()?
+        .into_iter()
+        .find(|(name, url)| name == remote_name || url == remote_name)
+        .map(|(name, _)| name);
+    let Some(configured_remote) = configured_remote else {
+        return Ok(false);
+    };
+    let key = format!("remote.{}.git-ai-notes-push", configured_remote);
+    match repository.config_get_str(&key)?.as_deref() {
+        None | Some("standard") => Ok(false),
+        Some("gerrit") => Ok(true),
+        Some(value) => Err(GitAiError::Generic(format!(
+            "unsupported {} value: {}",
+            key, value
+        ))),
+    }
+}
+
+fn prepare_gerrit_notes_commit(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<Option<String>, GitAiError> {
+    let existence = fetch_authorship_tracking_notes(repository, remote_name)?;
+    let remote_tip = if existence == NotesExistence::Found {
+        Some(rev_parse(
+            repository,
+            &tracking_ref_for_remote(remote_name),
+        )?)
+    } else {
+        None
+    };
+    let remote_tree = remote_tip
+        .as_ref()
+        .map(|tip| rev_parse(repository, &format!("{}^{{tree}}", tip)))
+        .transpose()?;
+
+    if let Some(remote_tree) = remote_tree.as_deref()
+        && ref_exists(repository, "refs/notes/ai")
+        && rev_parse(repository, "refs/notes/ai^{tree}")? == remote_tree
+    {
+        return Ok(None);
+    }
+
+    if existence == NotesExistence::Found {
+        merge_tracking_notes(repository, remote_name)?;
+    }
+    if !ref_exists(repository, "refs/notes/ai") {
+        return Ok(None);
+    }
+    let local_tree = rev_parse(repository, "refs/notes/ai^{tree}")?;
+    if remote_tree.as_deref() == Some(local_tree.as_str()) {
+        return Ok(None);
+    }
+
+    let identity = repository.git_author_identity();
+    let name = identity
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let email = identity
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (Some(name), Some(email)) = (name, email) else {
+        return Err(GitAiError::Generic(
+            "Gerrit notes push requires a Git user.name and user.email registered to the pushing account"
+                .to_string(),
+        ));
+    };
+    if name.chars().any(char::is_control) || email.chars().any(char::is_control) {
+        return Err(GitAiError::Generic(
+            "Gerrit notes push identity contains a control character".to_string(),
+        ));
+    }
+
+    let mut args = repository.global_args_for_exec();
+    args.extend_from_slice(&["commit-tree".to_string(), local_tree]);
+    if let Some(remote_tip) = remote_tip {
+        args.push("-p".to_string());
+        args.push(remote_tip);
+    }
+    args.push("-m".to_string());
+    args.push("git-ai authorship notes".to_string());
+    let name = OsStr::new(name);
+    let email = OsStr::new(email);
+    let envs = [
+        ("GIT_AUTHOR_NAME", name),
+        ("GIT_AUTHOR_EMAIL", email),
+        ("GIT_COMMITTER_NAME", name),
+        ("GIT_COMMITTER_EMAIL", email),
+    ];
+    let output = exec_git_with_env(&args, &envs)?;
+    Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
 }
 
 /// Fetch remote notes into a tracking ref and merge into local refs/notes/ai.
@@ -510,7 +641,11 @@ fn build_authorship_fetch_args(
     args
 }
 
-fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Vec<String> {
+fn build_authorship_push_args(
+    global_args: Vec<String>,
+    remote_name: &str,
+    refspec: &str,
+) -> Vec<String> {
     let mut args = with_disabled_hooks(global_args);
     args.push("push".to_string());
     args.push("--quiet".to_string());
@@ -518,7 +653,7 @@ fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Ve
     args.push("--no-verify".to_string());
     args.push("--no-signed".to_string());
     args.push(remote_name.to_string());
-    args.push(AI_AUTHORSHIP_PUSH_REFSPEC.to_string());
+    args.push(refspec.to_string());
     args
 }
 
@@ -660,8 +795,11 @@ mod tests {
     #[test]
     fn authorship_push_args_always_disable_hooks() {
         let disabled_hooks = disabled_hooks_config();
-        let args =
-            build_authorship_push_args(vec!["-C".to_string(), "/tmp/repo".to_string()], "origin");
+        let args = build_authorship_push_args(
+            vec!["-C".to_string(), "/tmp/repo".to_string()],
+            "origin",
+            AI_AUTHORSHIP_PUSH_REFSPEC,
+        );
 
         assert!(
             args.windows(2)
