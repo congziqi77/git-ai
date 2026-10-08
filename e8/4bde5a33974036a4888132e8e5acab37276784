@@ -1,0 +1,51 @@
+Cargo.toml
+  s_63d012c3e865ef::t_c6156612d0618b 3
+docs/gerrit-notes-push.md
+  s_63d012c3e865ef::t_872d957bf7fa4e 1-31
+src/git/refs.rs
+  s_63d012c3e865ef::t_7980c9a248686b 964
+src/git/repository.rs
+  s_63d012c3e865ef::t_7980c9a248686b 2833-2844,2848
+  s_63d012c3e865ef::t_e44ffa8487e230 2832
+tests/integration/gerrit_notes_push.rs
+  s_63d012c3e865ef::t_60b85ee4e277fb 1,15-17,62-64,66-68,103-105,161-163,166-171,234-239,243-245
+  s_63d012c3e865ef::t_777253d8e3e254 2-14,18-61,65,69-102,106-116
+  s_63d012c3e865ef::t_6c5bd4345fe9f8 117-118,153-160,164-165,172-233,240-242,246-253
+  s_63d012c3e865ef::t_7973891b53ddb6 254-267,269-289
+  s_63d012c3e865ef::t_d48d82f9c86e0c 268
+  s_63d012c3e865ef::t_c6773b5cec7abc 119-152
+src/git/sync_authorship.rs
+  s_63d012c3e865ef::t_a6dd38d2366c18 3,7-9,372-380,383-384,407-491,493,644
+  s_63d012c3e865ef::t_2c6347b6d36e02 227-237,292-293,497
+  s_63d012c3e865ef::t_da0663e8a831af 10,12,294-296,331,360,492,494-496,498-508,645-648,656,798-802
+flake.nix
+  s_63d012c3e865ef::t_c6156612d0618b 39
+tests/integration/main.rs
+  s_63d012c3e865ef::t_5c14ba001a8dbb 70
+Cargo.lock
+  s_7bb37d5de940ef::t_f224c20ac6dd7e 1069
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.61-ep",
+  "base_commit_sha": "e84bde5a33974036a4888132e8e5acab37276784",
+  "prompts": {},
+  "sessions": {
+    "s_63d012c3e865ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a994-c4e2-7cb1-8f2b-c5970920beba",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    },
+    "s_7bb37d5de940ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a11926-6cfd-7432-ae37-3d278e574f9b",
+        "model": "unknown"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
