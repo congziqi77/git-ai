@@ -795,8 +795,12 @@ mod tests {
     #[test]
     fn authorship_push_args_always_disable_hooks() {
         let disabled_hooks = disabled_hooks_config();
+        let repo_path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let args = build_authorship_push_args(
-            vec!["-C".to_string(), "/tmp/repo".to_string()],
+            vec!["-C".to_string(), repo_path],
             "origin",
             AI_AUTHORSHIP_PUSH_REFSPEC,
         );
