@@ -67,6 +67,7 @@ mod firebender;
 mod formatting_non_substantial_ai_attribution;
 mod fuzzer;
 mod gemini;
+mod gerrit_notes_push;
 mod git_alias_resolution;
 mod git_cli_arg_parsing;
 mod git_repository_comprehensive;
