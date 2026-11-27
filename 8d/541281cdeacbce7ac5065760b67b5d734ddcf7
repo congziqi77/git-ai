@@ -1,0 +1,73 @@
+.github/workflows/git-core-compat.yml
+  s_d043600425d009::t_d35e37b19fa475 111-126,130-139,144-145
+.github/workflows/nightly-agent-integration.yml
+  s_d043600425d009::t_11908c78deac8f 404-405
+.github/workflows/opencode-type-check.yml
+  s_d043600425d009::t_4f4dbeb9e973b3 41-43
+agent-support/opencode/git-ai.ts
+  s_d043600425d009::t_216764a8ffcf14 5-12,23,26,34-38,86-100,104,166-170,174-175,232-238,240-246,252-258,260-267,271-280,282,284-288,292-295,301-313,316-354,478-489,491,493-506,508-510,512-518,520-532,534-538,540-544,548-564,566-582,585-625,627-636,638-643,645-647,649-657,659-673,677-682
+agent-support/opencode/package-lock.json
+  s_d043600425d009::t_c82e26a8d9deed 12,21,30-550,558,572,586,600,614,628,635-640,642-646,648-649,652-657,659-697,700-703,705-1884,1889-3222,3224-3243,3245-3264,3267,3270-3564,3566-3625,3627-3644,3646-3647,3650-3654,3657-3662,3665-3669,3672-3674,3677,3680-3685,3687-3709,3711-3713,3715,3718-3734,3736-3750,3752-3760,3762-3773,3775-3779,3782-3786,3789,3791-3792,3794-3795,3798-3803,3806,3808-3809,3812-3816,3822-3837,3839-3843,3846-3847,3850-3853,3856,3858-3861,3863,3866-3877,3879-3883,3885,3902-3911,3919-3950,3952-3953,3960,3972-4026,4029,4032-4112,4119
+agent-support/opencode/package.json
+  s_d043600425d009::t_b52ce3667419bc 8-9,12
+agent-support/opencode/plugin.test.mjs
+  s_d043600425d009::t_a7a402687de98c 1-335
+src/commands/blame.rs
+  s_d043600425d009::t_d734fcb1ff4d2c 16,57-61,441-444,447-459,461,465-472,474-501,504-535,546-563,565-567,773-774,845-852,906-907,968-969,1780,1783-1787,1801-1816,1818-1819
+src/commands/checkpoint_agent/presets/mod.rs
+  s_d043600425d009::t_025c3aa771e805 144
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_d043600425d009::t_48cfe7a92d25e9 157-161,163,172-175,177,179-186,325-357
+src/mdm/agents/opencode.rs
+  s_d043600425d009::t_0c45aa2fcb3348 302-310
+src/streams/agents/opencode.rs
+  s_d043600425d009::t_2437eea619f0cc 6,12-16,48-61,65,67-69,71-112,114-196,202,208-220,228,255-258,266-269,271-272,274-278,280-284,290-295,301-305,313,322-323,329,347-355,392,394-402,404,407-408,410,412-413,415-420,422-424,427,429,432,435,439-453,457-459,461,474,502,506-518,531-542,629-634,660-788,937-1032,1038-1041,1051-1116
+src/streams/db.rs
+  s_d043600425d009::t_5fe07014700fd8 121-134,359,362-363,365-366,653-705,807,1061-1123
+src/streams/model_extraction.rs
+  s_d043600425d009::t_a2f617f10411cc 991-1019,1493-1515
+src/streams/sweep.rs
+  s_d043600425d009::t_d39ecf85b7f90d 82
+src/streams/watermark.rs
+  s_d043600425d009::t_b52450013d5645 10-12,99-102,140-143,181-184,239-242,297-300
+tests/daemon_mode.rs
+  s_d043600425d009::t_1688ea2f54b1bf 8088-8105
+tests/fixtures/opencode-plugin-harness.mjs
+  s_d043600425d009::t_3d0b4902c1c421 1-120
+tests/integration/blame_comprehensive.rs
+  s_d043600425d009::t_ca8cff3e711343 1107,1113,1115-1116,1118-1119,1121
+tests/integration/blame_flags.rs
+  s_d043600425d009::t_1812936d2688ca 694,696-713,1114-1392
+tests/integration/debug_diagnostics.rs
+  s_d043600425d009::t_e16d83d1cd9ad8 7,14-17
+tests/integration/internal_spawn_safety.rs
+  s_d043600425d009::t_a914a99b4f93e1 100,125-128
+tests/integration/main.rs
+  s_d043600425d009::t_9fd83b99aedb4b 100
+tests/integration/opencode.rs
+  s_d043600425d009::t_e74aa6ac51d3f2 680-956
+tests/integration/opencode_v2.rs
+  s_d043600425d009::t_cc561635e52c34 1-744
+tests/integration/repos/test_file.rs
+  s_d043600425d009::t_00aa8122ff1703 16
+tests/integration/repos/test_repo.rs
+  s_d043600425d009::t_51d297e6b057ca 1317-1321
+tests/integration/worktrees.rs
+  s_d043600425d009::t_3b6baacfc4865a 171,175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.62-ep",
+  "base_commit_sha": "8d541281cdeacbce7ac5065760b67b5d734ddcf7",
+  "prompts": {},
+  "sessions": {
+    "s_d043600425d009": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2164c-aa54-70e3-a4f4-e0c5be2219d9",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "Git AI Debug <debug-self-check@git-ai.invalid>"
+    }
+  }
+}
