@@ -29,6 +29,21 @@ struct DebugOptions {
 }
 
 pub fn handle_debug(args: &[String]) {
+    if let [option, commit_sha] = args
+        && option == crate::diagnostics::VERIFY_SELF_CHECK_ATTRIBUTION
+    {
+        match crate::diagnostics::verify_self_check_attribution(commit_sha)
+            .and_then(|details| serde_json::to_string(&details).map_err(|e| e.to_string()))
+        {
+            Ok(json) => println!("{}", json),
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args
         .iter()
         .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
