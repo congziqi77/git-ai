@@ -71,3 +71,67 @@ fn attribution_self_checks_do_not_timeout() {
         );
     }
 }
+
+#[test]
+fn debug_self_checks_isolate_inherited_git_environment() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("example.txt");
+    file.set_contents(crate::lines!["Original line"]);
+    repo.stage_all_and_commit("Original commit").unwrap();
+    file.assert_committed_lines(crate::lines!["Original line"]);
+
+    let trace2_target =
+        DaemonConfig::trace2_event_target_for_path(&repo.daemon_trace_socket_path());
+    repo.git_og(&["config", "--global", "trace2.eventTarget", &trace2_target])
+        .unwrap();
+    repo.git_og(&["config", "--global", "trace2.eventNesting", "0"])
+        .unwrap();
+
+    let git_dir = repo.path().join(".git");
+    let config_before = fs::read(git_dir.join("config")).unwrap();
+    let index_before = fs::read(git_dir.join("index")).unwrap();
+    let refs_before = repo.git(&["show-ref"]).unwrap();
+    let config_override = repo.test_home_path().join("alternate.gitconfig");
+    let alternate_contents = "[user]\n\temail = outside@example.invalid\n";
+    fs::write(&config_override, alternate_contents).unwrap();
+
+    let report = repo
+        .git_ai_with_env(
+            &["debug"],
+            &[
+                ("GIT_DIR", git_dir.to_str().unwrap()),
+                ("GIT_WORK_TREE", repo.path().to_str().unwrap()),
+                ("GIT_INDEX_FILE", git_dir.join("index").to_str().unwrap()),
+                ("GIT_CONFIG", config_override.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(fs::read(git_dir.join("config")).unwrap(), config_before);
+    assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+    assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
+    assert_eq!(
+        fs::read_to_string(config_override).unwrap(),
+        alternate_contents
+    );
+    assert!(
+        report.contains("daemon is ready for debug self-checks"),
+        "{report}"
+    );
+    assert_eq!(
+        report.matches("Attribution self-check: passed").count(),
+        2,
+        "{report}"
+    );
+    assert_eq!(
+        report.matches("Trace2 file self-check: passed").count(),
+        2,
+        "{report}"
+    );
+    assert_eq!(
+        repo.git_og(&["config", "--global", "--get-all", "trace2.eventTarget"])
+            .unwrap()
+            .trim(),
+        trace2_target
+    );
+}

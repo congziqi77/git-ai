@@ -1,6 +1,7 @@
 use crate::authorship::working_log::CheckpointKind;
 use crate::commands::blame::{BlameAnalysisResult, GitAiBlameOptions};
 use crate::config::Config;
+use crate::daemon::GIT_ENV_VARS_TO_SANITIZE;
 use crate::daemon::control_api::{ControlRequest, FamilyStatus};
 use crate::diagnostic_sentinels::{
     DEBUG_SELF_CHECK_REMOTE_URL, debug_self_check_root, path_is_in_debug_self_check_root,
@@ -13,13 +14,29 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SELF_CHECK_FILE: &str = "git-ai-debug-self-check.txt";
+pub(crate) const VERIFY_SELF_CHECK_ATTRIBUTION: &str = "--verify-self-check-attribution";
 const SELF_CHECK_CONTENT_UNTRACKED: &str = "Untracked line\n";
 const SELF_CHECK_CONTENT_KNOWN_HUMAN: &str = "Untracked line\nKnown human line\n";
 const SELF_CHECK_CONTENT_AI: &str = "Untracked line\nKnown human line\nAI line\n";
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "0";
-const SELF_CHECK_TRACE_ENV_REMOVE: &[&str] = &[
+const SELF_CHECK_ENV_REMOVE: &[&str] = &[
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
     "GIT_TRACE2_PARENT_SID",
     "GIT_TRACE2_PARENT_NAME",
     "GIT_AI_WRAPPER_INVOCATION_ID",
@@ -349,18 +366,24 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
             &["init", "."],
             Some(&repo_path),
         )?;
-        run_required(
+        let git_dir = run_required(
             &mut commands,
             &target.program,
-            &["config", "user.name", "Git AI Debug"],
+            &["rev-parse", "--absolute-git-dir"],
             Some(&repo_path),
-        )?;
-        run_required(
-            &mut commands,
-            &target.program,
-            &["config", "user.email", "debug-self-check@git-ai.invalid"],
-            Some(&repo_path),
-        )?;
+        )?
+        .stdout;
+        let expected_git_dir = repo_path
+            .canonicalize()
+            .map_err(|e| format!("failed to resolve {}: {}", repo_path.display(), e))?
+            .join(".git");
+        if Path::new(git_dir.trim()).canonicalize().ok().as_ref() != Some(&expected_git_dir) {
+            return Err(format!(
+                "self-check Git directory {} does not match {}",
+                git_dir.trim(),
+                expected_git_dir.display()
+            ));
+        }
         run_required(
             &mut commands,
             &target.program,
@@ -392,7 +415,19 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
         run_required(
             &mut commands,
             &target.program,
-            &["commit", "-m", "git-ai debug self check"],
+            &[
+                "-c",
+                "author.name=Git AI Debug",
+                "-c",
+                "author.email=debug-self-check@git-ai.invalid",
+                "-c",
+                "committer.name=Git AI Debug",
+                "-c",
+                "committer.email=debug-self-check@git-ai.invalid",
+                "commit",
+                "-m",
+                "git-ai debug self check",
+            ],
             Some(&repo_path),
         )?;
 
@@ -406,11 +441,7 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
         .trim()
         .to_string();
 
-        // Attribution is produced asynchronously after the commit. Give that
-        // phase its own bounded budget instead of sharing the setup deadline.
-        let attribution_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
-        let mut details =
-            poll_self_check_attribution(&repo_path, &commit_sha, attribution_deadline)?;
+        let mut details = run_self_check_attribution_verifier(&repo_path, &commit_sha)?;
         details.insert(0, format!("repo: {}", repo_path.display()));
         details.insert(1, format!("commit: {}", commit_sha));
         details.insert(
@@ -698,14 +729,13 @@ fn run_logged_command_with_timeout(
 ) -> CommandRecord {
     let command = format_command(program, args);
     let cwd_display = cwd.map(|p| p.display().to_string());
-    match run_command_with_timeout(
-        program,
-        args,
-        cwd,
-        timeout,
-        POLL_INTERVAL,
-        SELF_CHECK_TRACE_ENV_REMOVE,
-    ) {
+    // Keep the user's global config location and Trace2 destination available to the probes.
+    let env_remove: Vec<_> = GIT_ENV_VARS_TO_SANITIZE
+        .iter()
+        .chain(SELF_CHECK_ENV_REMOVE)
+        .copied()
+        .collect();
+    match run_command_with_timeout(program, args, cwd, timeout, POLL_INTERVAL, &env_remove) {
         Ok(output) => {
             let stderr = format_logged_stderr(
                 output.timed_out,
@@ -818,13 +848,43 @@ fn read_checkpoint_count(repo_path: &Path) -> Result<usize, String> {
         .map_err(|e| e.to_string())
 }
 
-fn poll_self_check_attribution(
+fn run_self_check_attribution_verifier(
     repo_path: &Path,
     commit_sha: &str,
-    deadline: Instant,
 ) -> Result<Vec<String>, String> {
+    let git_ai = std::env::current_exe()
+        .map_err(|e| format!("failed to resolve git-ai binary path: {}", e))?;
+    // Blame and the notes backend can spawn Git internally. Run the entire
+    // verifier with the same environment as the other self-check commands.
+    let record = run_logged_command_with_timeout(
+        &git_ai.to_string_lossy(),
+        &["debug", VERIFY_SELF_CHECK_ATTRIBUTION, commit_sha],
+        Some(repo_path),
+        DEBUG_CHECK_TIMEOUT + Duration::from_secs(1),
+    );
+    if !record.success() {
+        return Err(format!(
+            "self-check attribution verifier failed: {}",
+            record.stderr
+        ));
+    }
+    serde_json::from_str(&record.stdout).map_err(|e| {
+        format!(
+            "failed to parse self-check attribution verifier output: {}",
+            e
+        )
+    })
+}
+
+pub(crate) fn verify_self_check_attribution(commit_sha: &str) -> Result<Vec<String>, String> {
+    let repo_path = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve self-check working directory: {}", e))?;
+    if !path_is_in_debug_self_check_root(&repo_path) {
+        return Err("attribution verification requires a debug self-check repository".to_string());
+    }
     let start = Instant::now();
-    let repo = discover_repository_in_path_no_git_exec(repo_path).map_err(|e| e.to_string())?;
+    let deadline = start + DEBUG_CHECK_TIMEOUT;
+    let repo = discover_repository_in_path_no_git_exec(&repo_path).map_err(|e| e.to_string())?;
     let notes_backend = Config::get().notes_backend_kind();
     let mut last_error = None;
 
